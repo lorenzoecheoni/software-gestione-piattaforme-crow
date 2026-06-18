@@ -1,0 +1,9435 @@
+#!/usr/bin/env python3
+import cgi
+import html
+import json
+import mimetypes
+import re
+import shutil
+import sqlite3
+import sys
+import uuid
+from datetime import date, datetime, timedelta
+from pathlib import Path
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from urllib.parse import parse_qs, quote, urlencode, urlparse
+
+
+BASE_DIR = Path(__file__).resolve().parent
+DATA_DIR = BASE_DIR / "data"
+UPLOAD_DIR = BASE_DIR / "uploads"
+STATIC_DIR = BASE_DIR / "static"
+TEMPLATE_DIR = BASE_DIR / "templates" / "official"
+DB_PATH = DATA_DIR / "ecsp_suite.db"
+
+ROLE_LABELS = {
+    "compliance": "Compliance officer",
+    "legal": "Legale",
+    "technical_committee": "Comitato Tecnico",
+    "covi": "Advisory Committee",
+    "covi_opinion": "Advisory Committee",
+    "board": "CdA",
+    "operator": "Operatore",
+}
+
+PHASES = [
+    ("appena_caricato", "Appena caricato"),
+    ("istruttoria_documentazione", "Istruttoria documentazione"),
+    ("verifiche", "Verifiche"),
+    ("comitato_tecnico", "Comitato Tecnico"),
+    ("covi", "Advisory Committee"),
+    ("cda", "CdA"),
+    ("integrazione_documenti", "Integrazione documenti"),
+    ("contratto", "Contratto"),
+    ("pre_pubblicazione", "Pre-pubblicazione"),
+    ("pubblicato", "Pubblicato"),
+    ("raccolta_in_corso", "Raccolta in corso"),
+    ("concluso", "Concluso"),
+    ("respinta", "Respinta"),
+    ("archiviato", "Archiviato"),
+]
+
+PHASE_LABELS = dict(PHASES)
+PHASE_INDEX = {key: idx for idx, (key, _) in enumerate(PHASES)}
+
+REQUIREMENT_SEED = [
+    ("Documentazione", "Visura camerale aggiornata", 1),
+    ("Documentazione", "Bilanci ultimi due esercizi", 1),
+    ("Documentazione", "Business plan e piano finanziario", 1),
+    ("KYC", "KYC proponente e titolari effettivi", 1),
+    ("KIIS", "Bozza KIIS iniziale", 1),
+]
+
+VERIFICATION_SEED = [
+    "Onorabilita esponenti - art. 5",
+    "Requisiti del proponente",
+    "Conflitti d'interesse",
+    "Completezza informativa",
+]
+
+OFFICIAL_TEMPLATES = [
+    {
+        "title": "Guida operativa domanda autorizzazione ECSP",
+        "authority": "CONSOB / Banca d'Italia",
+        "filename": "CONSOB-BDI-guida-operativa-crowdfunding-aprile-2025.pdf",
+        "source_url": "https://www.consob.it/documents/d/asset-library-1912910/guida_operativa_crowdfunding_consob_bi_aprile_2025",
+        "status": "Scaricato",
+        "note": "Guida congiunta del 4 aprile 2025 per la compilazione della domanda.",
+    },
+    {
+        "title": "Template domanda autorizzazione servizi crowdfunding",
+        "authority": "CONSOB",
+        "filename": "CONSOB-template-domanda-autorizzazione-servizi-crowdfunding.docx",
+        "source_url": "https://www.consob.it/documents/1912911/1950567/Template_domanda_autorizzazione_servizi_crowdfunding.docx",
+        "status": "Scaricato",
+        "note": "DOCX operativo per domanda o estensione autorizzativa.",
+    },
+    {
+        "title": "Delibera obblighi comunicazione CSP",
+        "authority": "CONSOB",
+        "filename": "CONSOB-delibera-23656-2025-obblighi-comunicazione-crowdfunding.pdf",
+        "source_url": "https://www.consob.it/documents/d/asset-library-1912910/del_consob_2025_23656",
+        "status": "Scaricato",
+        "note": "Delibera n. 23656/2025, in vigore dal 29 settembre 2025.",
+    },
+    {
+        "title": "Regolamento crowdfunding",
+        "authority": "CONSOB",
+        "filename": "CONSOB-regolamento-22720-2023-crowdfunding.pdf",
+        "source_url": "https://www.consob.it/documents/1912911/1950567/reg_consob_2023_22720.pdf/24669272-bb2b-bde0-cb3a-257e5812eed2",
+        "status": "Scaricato",
+        "note": "Regolamento n. 22720/2023.",
+    },
+    {
+        "title": "Provvedimento attuazione TUF per CSP",
+        "authority": "Banca d'Italia",
+        "filename": "BDI-provvedimento-2024-05-06-crowdfunding.pdf",
+        "source_url": "https://www.consob.it/documents/1912911/1919711/bi_20240506.pdf/65182d9b-766c-4cb8-2321-47fbb043eef3",
+        "status": "Scaricato",
+        "note": "Disposizioni Banca d'Italia del 6 maggio 2024.",
+    },
+    {
+        "title": "Segnalazione esternalizzazioni",
+        "authority": "Banca d'Italia",
+        "filename": "BDI-provvedimento-2023-05-31-esternalizzazioni.pdf",
+        "source_url": "https://www.consob.it/documents/1912911/1919711/bi_31_maggio_2023.pdf/a0443dcf-2fe9-02d8-649d-3fd00e948ec3",
+        "status": "Scaricato",
+        "note": "Provvedimento Banca d'Italia del 31 maggio 2023.",
+    },
+    {
+        "title": "AIEC per Regolamento 1503",
+        "authority": "CONSOB",
+        "filename": "CONSOB-AIEC-Regolamento-1503.pdf",
+        "source_url": "https://www.consob.it/documents/11973/7117490/AIEC.pdf/d84f1c63-fdfd-4072-5e07-6ecbebdca07c?version=1.0&t=1728639402735null&download=true",
+        "status": "Scaricato",
+        "note": "Documento CONSOB di chiarimento/istruzioni su AIEC.",
+    },
+    {
+        "title": "Consultazione obblighi informativi crowdfunding",
+        "authority": "CONSOB",
+        "filename": "CONSOB-consultazione-crowdfunding-2025-01-17.pdf",
+        "source_url": "https://www.consob.it/documents/11973/5638890/consultazione_crowdfunding_20250117.pdf/d1eac78e-ec4b-1387-4a77-7ba583c165f1",
+        "status": "Scaricato",
+        "note": "Documento di consultazione del 17 gennaio 2025.",
+    },
+]
+
+COMMUNICATION_CATALOG = [
+    {
+        "title": "Domanda di autorizzazione o estensione ECSP",
+        "recipient": "CONSOB o Banca d'Italia, secondo il tipo di soggetto",
+        "trigger": "Prima di prestare servizi di crowdfunding o per estendere servizi autorizzati",
+        "deadline": "Procedimento autorizzativo; integrazioni nei termini richiesti dall'Autorita",
+        "source": "Reg. UE 2020/1503 art. 12; Reg. delegato UE 2022/2112; Reg. CONSOB 22720/2023 art. 3",
+        "template": "CONSOB-template-domanda-autorizzazione-servizi-crowdfunding.docx",
+        "payload": "Programma attivita, governance, controlli, outsourcing, reclami, conflitti, KIIS, investitori, requisiti esponenti e partecipanti.",
+        "status": "Template scaricato",
+    },
+    {
+        "title": "Avvio, interruzione e riavvio dell'utilizzo dell'autorizzazione",
+        "recipient": "CONSOB e Banca d'Italia",
+        "trigger": "Avvio effettivo, interruzione o riavvio della fornitura dei servizi ECSP",
+        "deadline": "Senza indugio",
+        "source": "Reg. CONSOB 22720/2023 art. 7; BDI provvedimento 6 maggio 2024",
+        "template": "",
+        "payload": "Data evento, piattaforma interessata, servizi coinvolti, motivazione, impatti operativi e referente interno.",
+        "status": "Template pubblico non individuato",
+    },
+    {
+        "title": "Modifiche sostanziali delle condizioni di autorizzazione",
+        "recipient": "CONSOB e Banca d'Italia",
+        "trigger": "Variazioni rilevanti rispetto alle condizioni autorizzative",
+        "deadline": "Senza indugio",
+        "source": "Reg. UE 2020/1503 art. 15(3); Delibera CONSOB 23656/2025 tabella 1; BDI provvedimento 6 maggio 2024",
+        "template": "CONSOB-delibera-23656-2025-obblighi-comunicazione-crowdfunding.pdf",
+        "payload": "Denominazione, nomi commerciali, siti, sedi, statuto, CdA/controllo, personale, revisore, funzioni controllo, nuovi servizi, cross-border, marketing, selezione offerte, conflitti, reclami, KIIS, investor checks.",
+        "status": "Schema in provvedimento scaricato",
+    },
+    {
+        "title": "Operativita transfrontaliera / passaporto europeo",
+        "recipient": "Autorita home come single point of contact, ESMA e Autorita host tramite procedura",
+        "trigger": "Intenzione di fornire servizi in altro Stato membro",
+        "deadline": "Prima dell'avvio; operativita dal ricevimento comunicazione o al piu tardi 15 giorni dopo l'invio",
+        "source": "Reg. UE 2020/1503 art. 18; Delibera CONSOB 23656/2025 tabella 1 punto 13",
+        "template": "",
+        "payload": "Stati membri, responsabili locali, data inizio prevista, altre attivita non ECSP, impatti organizzativi e procedure.",
+        "status": "Template pubblico non individuato",
+    },
+    {
+        "title": "KIIS offerta art. 23",
+        "recipient": "Investitori; CONSOB tramite SICROWD",
+        "trigger": "Prima della messa a disposizione del KIIS ai potenziali investitori",
+        "deadline": "Contestuale alla trasmissione del KIIS; il Reg. UE consente eventuale notifica ex ante almeno 7 giorni lavorativi se richiesta dall'Autorita",
+        "source": "Reg. UE 2020/1503 art. 23; Reg. CONSOB 22720/2023 art. 6; Delibera CONSOB 23656/2025 tabella 2.1",
+        "template": "",
+        "payload": "Excel SICROWD con dati offerta, progetto, titolare, strumenti, costi, rischi e campi specifici loan/debt/equity/ICFP/other.",
+        "status": "Excel SICROWD non scaricabile pubblicamente",
+    },
+    {
+        "title": "KIIS a livello piattaforma art. 24",
+        "recipient": "Investitori; CONSOB tramite SICROWD",
+        "trigger": "Prestazione di gestione individuale di portafogli di prestiti",
+        "deadline": "Contestuale alla trasmissione del KIIS",
+        "source": "Reg. UE 2020/1503 art. 24; Delibera CONSOB 23656/2025 tabella 2.2",
+        "template": "",
+        "payload": "Excel SICROWD con descrizione gestione, tassi min/max, scadenze, costi, categorie di rischio, quote e tassi default.",
+        "status": "Excel SICROWD non scaricabile pubblicamente",
+    },
+    {
+        "title": "Reporting annuale progetti finanziati e dati offerte",
+        "recipient": "CONSOB o Banca d'Italia, secondo Autorita autorizzante",
+        "trigger": "Chiusura esercizio / anno di riferimento",
+        "deadline": "CONSOB: entro fine gennaio; Banca d'Italia: entro 25 gennaio per intermediari da essa autorizzati",
+        "source": "Reg. UE 2020/1503 art. 16; Reg. esecuzione UE 2022/2120; Reg. CONSOB 22720/2023 art. 7; BDI provvedimento 6 maggio 2024; Delibera CONSOB 23656/2025 tabella 3",
+        "template": "CONSOB-delibera-23656-2025-obblighi-comunicazione-crowdfunding.pdf",
+        "payload": "Progetti finanziati, titolare, importo raccolto, strumento, residenza fiscale investitori, sofisticati/non sofisticati, offerte concluse e dati investitori.",
+        "status": "Schema in provvedimento scaricato; Excel SICROWD non pubblico",
+    },
+    {
+        "title": "Variazioni accordi di esternalizzazione",
+        "recipient": "Banca d'Italia",
+        "trigger": "Variazioni intervenute rispetto agli accordi di esternalizzazione in essere",
+        "deadline": "Entro 30 aprile di ogni anno; se nessuna variazione, comunicare tale circostanza",
+        "source": "BDI provvedimento 6 maggio 2024; campo 15 allegato Reg. delegato UE 2022/2112",
+        "template": "BDI-provvedimento-2024-05-06-crowdfunding.pdf",
+        "payload": "Accordi outsourcing, funzioni operative, fornitori, impatti e variazioni rispetto all'autorizzazione.",
+        "status": "Schema in provvedimento scaricato",
+    },
+    {
+        "title": "Segnalazione annuale esternalizzazioni",
+        "recipient": "Banca d'Italia",
+        "trigger": "Rilevazione contratti di esternalizzazione al 31 dicembre",
+        "deadline": "Entro 30 aprile dell'anno successivo",
+        "source": "BDI provvedimento 31 maggio 2023",
+        "template": "BDI-provvedimento-2023-05-31-esternalizzazioni.pdf",
+        "payload": "Contratti, firmatari/utilizzatori, fornitori/subfornitori, categoria funzione, FEI/FOI, cloud, paesi di erogazione e memorizzazione dati.",
+        "status": "Provvedimento scaricato; allegati tecnici BDI da recuperare dalla pagina segnalazione",
+    },
+    {
+        "title": "Partecipazioni qualificate nel fornitore specializzato",
+        "recipient": "Banca d'Italia",
+        "trigger": "Acquisizione/incremento sopra 20% o controllo; riduzione sotto soglia",
+        "deadline": "Entro 10 giorni dall'evento o dalla conoscenza",
+        "source": "BDI provvedimento 6 maggio 2024; Reg. UE 2020/1503; Reg. delegato UE 2022/2112 campo 12",
+        "template": "BDI-provvedimento-2024-05-06-crowdfunding.pdf",
+        "payload": "Operazione, soggetti, soglie, requisiti, nota con informazioni del campo 12 e ogni dato utile.",
+        "status": "Schema in provvedimento scaricato",
+    },
+    {
+        "title": "Valutazione idoneita esponenti aziendali",
+        "recipient": "Banca d'Italia",
+        "trigger": "Nomina o variazione di amministratori, controllo, direzione effettiva",
+        "deadline": "Secondo procedura fit & proper applicabile",
+        "source": "BDI provvedimento 6 maggio 2024; Provvedimento BDI 4 maggio 2021; Reg. delegato UE 2022/2112 campo 13",
+        "template": "BDI-provvedimento-2024-05-06-crowdfunding.pdf",
+        "payload": "Verbale valutazione, informazioni campo 13, CV/info ruolo, requisiti onorabilita, competenza, esperienza e disponibilita di tempo.",
+        "status": "Schema in provvedimento scaricato",
+    },
+    {
+        "title": "Reclami clienti",
+        "recipient": "Clienti; registro interno; Autorita su richiesta o flussi specifici",
+        "trigger": "Ricezione reclamo",
+        "deadline": "Gestione tempestiva e comunicazione esito entro periodo ragionevole",
+        "source": "Reg. UE 2020/1503 art. 7; Reg. delegato UE 2022/2117 su complaint handling; Delibera CONSOB 23656/2025 tabella 1 punto 17",
+        "template": "",
+        "payload": "Template reclamo gratuito al cliente, registro reclami, misure adottate, variazioni procedure reclami come modifica sostanziale.",
+        "status": "Template cliente da predisporre internamente",
+    },
+    {
+        "title": "Comunicazioni di marketing",
+        "recipient": "Pubblico/investitori; vigilanza CONSOB",
+        "trigger": "Ogni campagna o comunicazione marketing ECSP",
+        "deadline": "Nessuna notifica/approvazione ex ante richiesta; controllo continuo",
+        "source": "Reg. UE 2020/1503 art. 27; Reg. CONSOB 22720/2023 artt. 8-11; Delibera CONSOB 23656/2025 tabella 1 punto 14",
+        "template": "",
+        "payload": "Identificazione come marketing, coerenza con KIIS, lingua ammessa, avvertenza 'prima dell'adesione leggere la scheda...', variazioni significative strategia marketing come modifica sostanziale.",
+        "status": "Nessun template; serve workflow approvativo interno",
+    },
+]
+
+COMMUNICATION_WORKFLOWS = [
+    {
+        "id": "bdi-cf1",
+        "title": "Patrimonio di vigilanza e requisiti prudenziali (CF1)",
+        "authority": "Banca d'Italia",
+        "channel": "INFOSTAT - Data entry",
+        "frequency": "Semestrale",
+        "deadline": "25 gennaio / 25 luglio",
+        "reference": "30 giugno / 30 dicembre",
+        "source": "Provvedimento Banca d'Italia 6 maggio 2024; disposizioni di vigilanza e canale INFOSTAT",
+        "template": "BDI-provvedimento-2024-05-06-crowdfunding.pdf",
+        "output": "Scheda CF1 + fascicolo evidenze bilancio/polizza",
+        "required_docs": ["Situazione contabile", "Bilancio", "Polizza assicurativa", "Prospetto requisiti prudenziali"],
+        "prefill": ["Dati piattaforma", "Bilanci/situazioni contabili caricati in Compagine", "Polizza assicurativa da documenti", "Capitale e patrimonio netto da bilancio"],
+        "fields": [
+            ("Periodo di riferimento", "text", "es. 30/06/2026"),
+            ("Patrimonio netto", "number", "valore da bilancio"),
+            ("Requisito prudenziale applicabile", "number", "calcolo interno"),
+            ("Copertura assicurativa", "text", "compagnia, massimale, scadenza"),
+            ("Note di quadratura", "textarea", "scostamenti, warning, rettifiche"),
+        ],
+    },
+    {
+        "id": "bdi-vig12",
+        "title": "Rilevazione statistica crowdfunding (VIG 12)",
+        "authority": "Banca d'Italia",
+        "channel": "INFOSTAT - Upload file",
+        "frequency": "Semestrale",
+        "deadline": "25 febbraio / 25 agosto",
+        "reference": "30 giugno / 30 dicembre",
+        "source": "Provvedimento Banca d'Italia 6 maggio 2024; disposizioni di vigilanza e canale INFOSTAT",
+        "template": "BDI-provvedimento-2024-05-06-crowdfunding.pdf",
+        "output": "File statistico VIG12 + log dati campagne",
+        "required_docs": ["Situazione contabile", "Ultima segnalazione VIG12", "Dati campagne", "Registro offerte"],
+        "prefill": ["Deal e raccolte", "Investitori sofisticati/non sofisticati", "Stato offerte", "Documenti proposta"],
+        "fields": [
+            ("Periodo di riferimento", "text", "es. 30/06/2026"),
+            ("Numero offerte pubblicate", "number", "da deal"),
+            ("Importo raccolto", "number", "da investimenti/API"),
+            ("Numero investitori", "number", "da investitori/API"),
+            ("Note controlli statistici", "textarea", "coerenze con periodo precedente"),
+        ],
+    },
+    {
+        "id": "consob-report-annuale",
+        "title": "Reporting annuale progetti finanziati e dati offerte",
+        "authority": "CONSOB",
+        "channel": "SICROWD - Excel",
+        "frequency": "Annuale",
+        "deadline": "Entro fine gennaio",
+        "reference": "Anno solare precedente",
+        "source": "Reg. UE 2020/1503 art. 16; Delibera CONSOB 23656/2025 tabella 3",
+        "template": "CONSOB-delibera-23656-2025-obblighi-comunicazione-crowdfunding.pdf",
+        "output": "Excel SICROWD + fascicolo progetto/offerta/investitori",
+        "required_docs": ["Registro offerte", "KIIS", "Dati investitori", "Esiti campagne", "Ricevute invio"],
+        "prefill": ["Deal conclusi", "Proponenti", "Investimenti via API", "Residenza e classificazione investitori"],
+        "fields": [
+            ("Anno di riferimento", "text", "es. 2026"),
+            ("Offerte concluse", "number", "da deal"),
+            ("Totale raccolto", "number", "da investimenti"),
+            ("Investitori sofisticati", "number", "da CRM investitori"),
+            ("Investitori non sofisticati", "number", "da CRM investitori"),
+            ("Note di riconciliazione", "textarea", "anomalie o dati manuali"),
+        ],
+    },
+    {
+        "id": "consob-kiis-art23",
+        "title": "KIIS offerta art. 23",
+        "authority": "CONSOB",
+        "channel": "SICROWD - Excel + KIIS",
+        "frequency": "Per offerta",
+        "deadline": "Prima/con contestuale messa a disposizione agli investitori",
+        "reference": "Singola offerta",
+        "source": "Reg. UE 2020/1503 art. 23; Delibera CONSOB 23656/2025 tabella 2.1",
+        "template": "CONSOB-delibera-23656-2025-obblighi-comunicazione-crowdfunding.pdf",
+        "output": "Pacchetto KIIS offerta + dati SICROWD",
+        "required_docs": ["KIIS", "Business plan", "Delibera CdA", "Due diligence", "Contratto proponente"],
+        "prefill": ["Anagrafica deal", "Anagrafica proponente", "Documenti proposta", "Costi e rischi da documenti"],
+        "fields": [
+            ("Deal / offerta", "text", "selezione offerta"),
+            ("Titolare progetto", "text", "da proponente"),
+            ("Importo obiettivo", "number", "da deal"),
+            ("Strumento offerto", "text", "equity/debito/altro"),
+            ("Warning e rischi specifici", "textarea", "da KIIS e due diligence"),
+        ],
+    },
+    {
+        "id": "consob-modifiche",
+        "title": "Modifiche sostanziali condizioni di autorizzazione",
+        "authority": "CONSOB / Banca d'Italia",
+        "channel": "PEC / canale autorita",
+        "frequency": "Event-driven",
+        "deadline": "Senza indugio",
+        "reference": "Evento rilevante",
+        "source": "Reg. UE 2020/1503 art. 15(3); Delibera CONSOB 23656/2025 tabella 1",
+        "template": "CONSOB-delibera-23656-2025-obblighi-comunicazione-crowdfunding.pdf",
+        "output": "Lettera comunicazione + allegati evidenza variazione",
+        "required_docs": ["Statuto", "Verbale CdA", "Organigramma", "Contratti outsourcing", "Procedure aggiornate"],
+        "prefill": ["Compagine", "Governance", "Fornitori", "Documenti societari", "Procedure"],
+        "fields": [
+            ("Tipo modifica", "text", "es. sede, CdA, servizi, outsourcing, reclami"),
+            ("Data efficacia", "date", ""),
+            ("Descrizione modifica", "textarea", "cosa cambia e perche"),
+            ("Impatto su autorizzazione", "textarea", "servizi, controlli, rischi, investor protection"),
+            ("Allegati da trasmettere", "textarea", "elenco documenti"),
+        ],
+    },
+    {
+        "id": "bdi-outs",
+        "title": "Segnalazione annuale esternalizzazioni (OUTS)",
+        "authority": "Banca d'Italia",
+        "channel": "INFOSTAT - Data entry",
+        "frequency": "Annuale",
+        "deadline": "30 aprile",
+        "reference": "31 dicembre",
+        "source": "Provvedimento Banca d'Italia 31 maggio 2023 sulle segnalazioni in materia di esternalizzazione",
+        "template": "BDI-provvedimento-2023-05-31-esternalizzazioni.pdf",
+        "output": "Registro outsourcing INFOSTAT + contratti fornitori",
+        "required_docs": ["Contratti fornitori", "SLA", "DPA", "Exit plan", "Registro esternalizzazioni"],
+        "prefill": ["Fornitori e contratti da Compagine", "Scadenze contratti", "Aree servizio", "Paesi/cloud da contratto"],
+        "fields": [
+            ("Data riferimento", "text", "31/12/anno"),
+            ("Numero contratti outsourcing", "number", "da fornitori"),
+            ("Funzioni essenziali/importanti", "textarea", "classificazione FEI/FOI"),
+            ("Cloud e subfornitori", "textarea", "modello, paese, dati"),
+            ("Variazioni rispetto all'anno precedente", "textarea", "nuovi, cessati, invariati"),
+        ],
+    },
+    {
+        "id": "bdi-ls",
+        "title": "Libro soci (LS)",
+        "authority": "Banca d'Italia",
+        "channel": "INFOSTAT - Data entry",
+        "frequency": "Annuale",
+        "deadline": "31 maggio",
+        "reference": "31 dicembre",
+        "source": "Provvedimento Banca d'Italia 6 maggio 2024; disposizioni di vigilanza e canale INFOSTAT",
+        "template": "BDI-provvedimento-2024-05-06-crowdfunding.pdf",
+        "output": "Segnalazione libro soci + visura",
+        "required_docs": ["Visura", "Libro soci", "Partecipogramma", "Patti parasociali"],
+        "prefill": ["Partecipanti qualificati in Compagine", "Accordi persona", "Documenti societari"],
+        "fields": [
+            ("Data riferimento", "text", "31/12/anno"),
+            ("Numero soci", "number", "da libro soci"),
+            ("Partecipanti qualificati", "textarea", "nome, quota, controllo"),
+            ("Variazioni intervenute", "textarea", "ingressi, uscite, soglie"),
+        ],
+    },
+    {
+        "id": "bdi-ict-risk",
+        "title": "Autovalutazione rischi ICT",
+        "authority": "Banca d'Italia",
+        "channel": "PEC Supervisione_rischio_ICT",
+        "frequency": "Su richiesta / periodica",
+        "deadline": "Scadenza indicata nella richiesta",
+        "reference": "Perimetro ICT/DORA",
+        "source": "Regolamento (UE) 2022/2554 DORA; istruzioni Banca d'Italia per rischi ICT",
+        "template": "",
+        "output": "Questionario ICT + allegati procedure e contratti",
+        "required_docs": ["Allegati autorizzazione 8.1/11", "Contratti IT", "Procedure ICT", "Registro incidenti"],
+        "prefill": ["Fornitori IT", "Contratti outsourcing", "Documenti autorizzativi", "Incidenti registrati"],
+        "fields": [
+            ("Data richiesta autorita", "date", ""),
+            ("Perimetro sistemi critici", "textarea", "piattaforma, KYC, pagamenti, conservazione"),
+            ("Misure di controllo", "textarea", "sicurezza, BCP, monitoraggio"),
+            ("Contratti ICT rilevanti", "textarea", "fornitori e SLA"),
+        ],
+    },
+    {
+        "id": "dora-incident",
+        "title": "DORA - incidenti gravi ICT",
+        "authority": "Banca d'Italia",
+        "channel": "INFOSTAT - DORAI",
+        "frequency": "Event-driven",
+        "deadline": "Secondo tempistiche DORA applicabili",
+        "reference": "Incidente ICT grave",
+        "source": "Regolamento (UE) 2022/2554 DORA; canale Banca d'Italia per incidenti ICT",
+        "template": "",
+        "output": "Notifica incidente + timeline + remediation",
+        "required_docs": ["Registro incidenti", "Report tecnico", "Comunicazioni utenti", "Piano remediation"],
+        "prefill": ["Fornitori ICT", "Contratti SLA", "Log incidente", "Funzioni impattate"],
+        "fields": [
+            ("Data/ora incidente", "text", "timestamp"),
+            ("Servizi impattati", "textarea", "piattaforma, pagamenti, KYC"),
+            ("Causa e stato", "textarea", "diagnosi e contenimento"),
+            ("Impatto clienti/investitori", "textarea", "numero soggetti e rischi"),
+            ("Azioni correttive", "textarea", "remediation e owner"),
+        ],
+    },
+]
+
+COMMUNICATION_SCHEDULE = [
+    {
+        "workflow_id": "bdi-cf1",
+        "period": "1 semestre 2026",
+        "due_date": "2026-07-25",
+        "status": "Da fare",
+        "owner": "Compliance",
+        "note": "Preparare dati patrimoniali, situazione contabile e polizza.",
+    },
+    {
+        "workflow_id": "bdi-vig12",
+        "period": "1 semestre 2026",
+        "due_date": "2026-08-25",
+        "status": "Da fare",
+        "owner": "Operations",
+        "note": "Riconciliare offerte, raccolta e dati investitori.",
+    },
+    {
+        "workflow_id": "consob-kiis-art23",
+        "period": "Offerte in pubblicazione",
+        "due_date": "",
+        "status": "Da fare",
+        "owner": "Deal team",
+        "note": "Da aprire per ogni nuova offerta prima della messa a disposizione del KIIS.",
+    },
+    {
+        "workflow_id": "consob-modifiche",
+        "period": "Eventi societari o autorizzativi",
+        "due_date": "",
+        "status": "Da fare",
+        "owner": "Compliance",
+        "note": "Da attivare quando cambia un elemento sostanziale dell'autorizzazione.",
+    },
+    {
+        "workflow_id": "bdi-ict-risk",
+        "period": "Perimetro ICT 2026",
+        "due_date": "2026-09-30",
+        "status": "Da fare",
+        "owner": "Risk / IT",
+        "note": "Raccogliere contratti ICT, procedure e controlli DORA.",
+    },
+    {
+        "workflow_id": "consob-report-annuale",
+        "period": "Anno 2025",
+        "due_date": "2026-01-31",
+        "status": "Conclusa",
+        "owner": "Compliance",
+        "note": "Archiviata nel fascicolo annuale.",
+    },
+    {
+        "workflow_id": "bdi-outs",
+        "period": "Rilevazione 31/12/2025",
+        "due_date": "2026-04-30",
+        "status": "Approvata",
+        "owner": "Operations",
+        "note": "Registro esternalizzazioni validato.",
+    },
+    {
+        "workflow_id": "bdi-ls",
+        "period": "Libro soci 31/12/2025",
+        "due_date": "2026-05-31",
+        "status": "Inviata",
+        "owner": "Corporate",
+        "note": "In attesa di chiusura interna/ricevuta definitiva.",
+    },
+    {
+        "workflow_id": "dora-incident",
+        "period": "Eventi ICT",
+        "due_date": "",
+        "status": "Da fare",
+        "owner": "Risk / IT",
+        "note": "Da attivare solo in caso di incidente ICT grave.",
+    },
+]
+
+
+def esc(value):
+    return html.escape("" if value is None else str(value), quote=True)
+
+
+def money(value):
+    try:
+        return f"EUR {float(value):,.0f}".replace(",", ".")
+    except (TypeError, ValueError):
+        return "EUR 0"
+
+
+def today_iso():
+    return date.today().isoformat()
+
+
+def now_iso():
+    return datetime.now().isoformat(timespec="seconds")
+
+
+def nice_date(value):
+    if not value:
+        return "-"
+    return str(value)[:10]
+
+
+def status_for_phase(phase):
+    if phase in {"appena_caricato", "istruttoria_documentazione", "verifiche"}:
+        return "Onboarding"
+    if phase in {"comitato_tecnico", "covi", "cda", "contratto", "pre_pubblicazione"}:
+        return "In approvazione"
+    if phase == "integrazione_documenti":
+        return "Integrazione documenti"
+    if phase in {"pubblicato", "raccolta_in_corso"}:
+        return "In corso"
+    if phase == "concluso":
+        return "Conclusa"
+    if phase == "respinta":
+        return "Respinta"
+    if phase == "archiviato":
+        return "Archiviata"
+    return "Da lavorare"
+
+
+def badge_class(value):
+    normalized = (value or "").lower()
+    if any(token in normalized for token in ["scad", "issue", "ko", "rifiut", "chiuso", "respint"]):
+        return "danger"
+    if any(token in normalized for token in ["approv", "ok", "complet", "pubblic", "corso"]):
+        return "success"
+    if any(token in normalized for token in ["immin", "integraz", "pre-", "attesa"]):
+        return "warning"
+    return "neutral"
+
+
+def phase_label(phase):
+    return PHASE_LABELS.get(phase, phase.replace("_", " ").title())
+
+
+def deal_theme(title, proponent_name="", notes=""):
+    text = f"{title} {proponent_name} {notes}".lower()
+    if any(token in text for token in ["medtech", "diagnost", "health", "medical"]):
+        return "MedTech"
+    if any(token in text for token in ["green", "sosten", "energia", "manifatt", "robot"]):
+        return "Industria sostenibile"
+    if any(token in text for token in ["food", "spreco", "benefit"]):
+        return "Food / Impact"
+    if any(token in text for token in ["tech", "piattaforma", "software"]):
+        return "Tecnologia"
+    return "Generalist"
+
+
+def sanitize_filename(name):
+    base = Path(name or "documento").name
+    base = re.sub(r"[^A-Za-z0-9._-]+", "-", base).strip("-._")
+    return base or "documento"
+
+
+def connect():
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA foreign_keys = ON")
+    return conn
+
+
+def rows(sql, params=()):
+    with connect() as conn:
+        return conn.execute(sql, params).fetchall()
+
+
+def row(sql, params=()):
+    with connect() as conn:
+        return conn.execute(sql, params).fetchone()
+
+
+def execute(sql, params=()):
+    with connect() as conn:
+        cur = conn.execute(sql, params)
+        conn.commit()
+        return cur.lastrowid
+
+
+def ensure_column(conn, table, column, definition):
+    existing = {r["name"] for r in conn.execute(f"PRAGMA table_info({table})").fetchall()}
+    if column not in existing:
+        conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {definition}")
+
+
+def init_db():
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
+    UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
+    (UPLOAD_DIR / "generated").mkdir(parents=True, exist_ok=True)
+    with connect() as conn:
+        conn.executescript(
+            """
+            CREATE TABLE IF NOT EXISTS platforms (
+                id INTEGER PRIMARY KEY,
+                code TEXT NOT NULL UNIQUE,
+                name TEXT NOT NULL,
+                regulator_profile TEXT NOT NULL DEFAULT ''
+            );
+
+            CREATE TABLE IF NOT EXISTS users (
+                id INTEGER PRIMARY KEY,
+                name TEXT NOT NULL,
+                email TEXT NOT NULL UNIQUE,
+                role TEXT NOT NULL,
+                active INTEGER NOT NULL DEFAULT 1
+            );
+
+            CREATE TABLE IF NOT EXISTS committee_members (
+                id INTEGER PRIMARY KEY,
+                platform_id INTEGER NOT NULL REFERENCES platforms(id),
+                committee TEXT NOT NULL,
+                name TEXT NOT NULL,
+                role TEXT NOT NULL,
+                email TEXT NOT NULL,
+                active INTEGER NOT NULL DEFAULT 1
+            );
+
+            CREATE TABLE IF NOT EXISTS shareholders (
+                id INTEGER PRIMARY KEY,
+                platform_id INTEGER NOT NULL REFERENCES platforms(id),
+                name TEXT NOT NULL,
+                subject_type TEXT NOT NULL DEFAULT 'Societa / ente',
+                legal_form TEXT NOT NULL DEFAULT '',
+                tax_id TEXT NOT NULL DEFAULT '',
+                contact_email TEXT NOT NULL DEFAULT '',
+                phone TEXT NOT NULL DEFAULT '',
+                address TEXT NOT NULL DEFAULT '',
+                stake_percent REAL NOT NULL DEFAULT 0,
+                beneficial_owners TEXT NOT NULL DEFAULT '',
+                requisites_status TEXT NOT NULL DEFAULT 'Da verificare',
+                status TEXT NOT NULL DEFAULT 'Attivo',
+                notes TEXT NOT NULL DEFAULT ''
+            );
+
+            CREATE TABLE IF NOT EXISTS proponents (
+                id INTEGER PRIMARY KEY,
+                platform_id INTEGER NOT NULL REFERENCES platforms(id),
+                name TEXT NOT NULL,
+                legal_form TEXT NOT NULL DEFAULT '',
+                tax_id TEXT NOT NULL DEFAULT '',
+                contact_email TEXT NOT NULL DEFAULT '',
+                phone TEXT NOT NULL DEFAULT '',
+                website TEXT NOT NULL DEFAULT '',
+                sector TEXT NOT NULL DEFAULT '',
+                beneficial_owners TEXT NOT NULL DEFAULT '',
+                exposure REAL NOT NULL DEFAULT 0,
+                internal_score TEXT NOT NULL DEFAULT 'Da valutare',
+                crm_status TEXT NOT NULL DEFAULT 'In istruttoria',
+                onboarding_status TEXT NOT NULL DEFAULT 'Documenti da raccogliere',
+                owner_name TEXT NOT NULL DEFAULT '',
+                source_system TEXT NOT NULL DEFAULT 'Manuale',
+                external_proponent_id TEXT NOT NULL DEFAULT '',
+                last_synced_at TEXT NOT NULL DEFAULT '',
+                manual_override_notes TEXT NOT NULL DEFAULT '',
+                next_action TEXT NOT NULL DEFAULT '',
+                notes TEXT NOT NULL DEFAULT '',
+                created_at TEXT NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS deals (
+                id INTEGER PRIMARY KEY,
+                platform_id INTEGER NOT NULL REFERENCES platforms(id),
+                proponent_id INTEGER NOT NULL REFERENCES proponents(id),
+                title TEXT NOT NULL,
+                funding_target REAL NOT NULL DEFAULT 0,
+                platform_fee_percent REAL NOT NULL DEFAULT 5,
+                phase TEXT NOT NULL,
+                technical_reviewer_id INTEGER REFERENCES committee_members(id),
+                covi_reviewer_id INTEGER REFERENCES committee_members(id),
+                contract_required INTEGER NOT NULL DEFAULT 1,
+                kiis_state TEXT NOT NULL DEFAULT 'Bozza',
+                external_offer_id TEXT NOT NULL DEFAULT '',
+                created_by INTEGER REFERENCES users(id),
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS deal_requirements (
+                id INTEGER PRIMARY KEY,
+                deal_id INTEGER NOT NULL REFERENCES deals(id) ON DELETE CASCADE,
+                kind TEXT NOT NULL,
+                category TEXT NOT NULL,
+                label TEXT NOT NULL,
+                required INTEGER NOT NULL DEFAULT 1,
+                completed INTEGER NOT NULL DEFAULT 0,
+                due_date TEXT NOT NULL DEFAULT '',
+                completed_at TEXT NOT NULL DEFAULT '',
+                completed_by INTEGER REFERENCES users(id)
+            );
+
+            CREATE TABLE IF NOT EXISTS verifications (
+                id INTEGER PRIMARY KEY,
+                deal_id INTEGER NOT NULL REFERENCES deals(id) ON DELETE CASCADE,
+                area TEXT NOT NULL,
+                status TEXT NOT NULL DEFAULT 'pending',
+                result TEXT NOT NULL DEFAULT '',
+                owner_user_id INTEGER REFERENCES users(id),
+                completed_at TEXT NOT NULL DEFAULT ''
+            );
+
+            CREATE TABLE IF NOT EXISTS documents (
+                id INTEGER PRIMARY KEY,
+                platform_id INTEGER NOT NULL REFERENCES platforms(id),
+                deal_id INTEGER REFERENCES deals(id) ON DELETE SET NULL,
+                proponent_id INTEGER REFERENCES proponents(id) ON DELETE SET NULL,
+                origin TEXT NOT NULL,
+                category TEXT NOT NULL,
+                title TEXT NOT NULL,
+                filename TEXT NOT NULL,
+                storage_path TEXT NOT NULL,
+                generated INTEGER NOT NULL DEFAULT 0,
+                created_by INTEGER REFERENCES users(id),
+                created_at TEXT NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS committee_opinions (
+                id INTEGER PRIMARY KEY,
+                deal_id INTEGER NOT NULL REFERENCES deals(id) ON DELETE CASCADE,
+                committee TEXT NOT NULL,
+                reviewer_member_id INTEGER REFERENCES committee_members(id),
+                outcome TEXT NOT NULL,
+                summary TEXT NOT NULL,
+                generated_document_id INTEGER REFERENCES documents(id),
+                created_by INTEGER REFERENCES users(id),
+                created_at TEXT NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS board_decisions (
+                id INTEGER PRIMARY KEY,
+                deal_id INTEGER NOT NULL REFERENCES deals(id) ON DELETE CASCADE,
+                outcome TEXT NOT NULL,
+                notes TEXT NOT NULL,
+                integration_required INTEGER NOT NULL DEFAULT 0,
+                generated_document_id INTEGER REFERENCES documents(id),
+                created_by INTEGER REFERENCES users(id),
+                created_at TEXT NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS compliance_tasks (
+                id INTEGER PRIMARY KEY,
+                platform_id INTEGER NOT NULL REFERENCES platforms(id),
+                area TEXT NOT NULL,
+                title TEXT NOT NULL,
+                due_date TEXT NOT NULL,
+                status TEXT NOT NULL,
+                owner_role TEXT NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS platform_metrics (
+                id INTEGER PRIMARY KEY,
+                platform_id INTEGER NOT NULL REFERENCES platforms(id),
+                published_offers INTEGER NOT NULL DEFAULT 0,
+                active_offers INTEGER NOT NULL DEFAULT 0,
+                investors INTEGER NOT NULL DEFAULT 0,
+                raised_amount REAL NOT NULL DEFAULT 0,
+                source TEXT NOT NULL DEFAULT '',
+                updated_at TEXT NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS person_agreements (
+                id INTEGER PRIMARY KEY,
+                platform_id INTEGER NOT NULL REFERENCES platforms(id),
+                person_name TEXT NOT NULL,
+                role TEXT NOT NULL DEFAULT '',
+                agreement_type TEXT NOT NULL,
+                scope TEXT NOT NULL DEFAULT '',
+                status TEXT NOT NULL DEFAULT 'Attivo',
+                signed_at TEXT NOT NULL DEFAULT '',
+                expires_at TEXT NOT NULL DEFAULT ''
+            );
+
+            CREATE TABLE IF NOT EXISTS person_documents (
+                id INTEGER PRIMARY KEY,
+                platform_id INTEGER NOT NULL REFERENCES platforms(id),
+                person_name TEXT NOT NULL,
+                role TEXT NOT NULL DEFAULT '',
+                document_type TEXT NOT NULL,
+                counterparty TEXT NOT NULL DEFAULT '',
+                title TEXT NOT NULL,
+                notes TEXT NOT NULL DEFAULT '',
+                signed_at TEXT NOT NULL DEFAULT '',
+                expires_at TEXT NOT NULL DEFAULT '',
+                document_id INTEGER REFERENCES documents(id) ON DELETE SET NULL,
+                created_by INTEGER REFERENCES users(id),
+                created_at TEXT NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS org_functions (
+                id INTEGER PRIMARY KEY,
+                platform_id INTEGER NOT NULL REFERENCES platforms(id),
+                area TEXT NOT NULL,
+                function_name TEXT NOT NULL,
+                kind TEXT NOT NULL DEFAULT 'function',
+                note TEXT NOT NULL DEFAULT '',
+                active INTEGER NOT NULL DEFAULT 1,
+                created_by INTEGER REFERENCES users(id),
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS org_assignments (
+                id INTEGER PRIMARY KEY,
+                platform_id INTEGER NOT NULL REFERENCES platforms(id),
+                subject_name TEXT NOT NULL,
+                subject_type TEXT NOT NULL DEFAULT 'Persona fisica',
+                function_name TEXT NOT NULL,
+                area TEXT NOT NULL DEFAULT '',
+                role TEXT NOT NULL DEFAULT '',
+                start_date TEXT NOT NULL DEFAULT '',
+                end_date TEXT NOT NULL DEFAULT '',
+                linked_document_title TEXT NOT NULL DEFAULT '',
+                document_id INTEGER REFERENCES documents(id) ON DELETE SET NULL,
+                status TEXT NOT NULL DEFAULT 'Attivo',
+                notes TEXT NOT NULL DEFAULT '',
+                created_by INTEGER REFERENCES users(id),
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS shareholder_documents (
+                id INTEGER PRIMARY KEY,
+                platform_id INTEGER NOT NULL REFERENCES platforms(id),
+                shareholder_id INTEGER NOT NULL REFERENCES shareholders(id) ON DELETE CASCADE,
+                document_type TEXT NOT NULL,
+                title TEXT NOT NULL,
+                notes TEXT NOT NULL DEFAULT '',
+                issued_at TEXT NOT NULL DEFAULT '',
+                expires_at TEXT NOT NULL DEFAULT '',
+                document_id INTEGER REFERENCES documents(id) ON DELETE SET NULL,
+                created_by INTEGER REFERENCES users(id),
+                created_at TEXT NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS suppliers (
+                id INTEGER PRIMARY KEY,
+                platform_id INTEGER NOT NULL REFERENCES platforms(id),
+                name TEXT NOT NULL,
+                service_area TEXT NOT NULL DEFAULT '',
+                owner_role TEXT NOT NULL DEFAULT '',
+                status TEXT NOT NULL DEFAULT 'Attivo',
+                notes TEXT NOT NULL DEFAULT '',
+                created_at TEXT NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS supplier_contracts (
+                id INTEGER PRIMARY KEY,
+                platform_id INTEGER NOT NULL REFERENCES platforms(id),
+                supplier_id INTEGER NOT NULL REFERENCES suppliers(id) ON DELETE CASCADE,
+                contract_type TEXT NOT NULL,
+                title TEXT NOT NULL,
+                counterparty TEXT NOT NULL DEFAULT '',
+                value REAL NOT NULL DEFAULT 0,
+                start_date TEXT NOT NULL DEFAULT '',
+                end_date TEXT NOT NULL DEFAULT '',
+                renewal_notice TEXT NOT NULL DEFAULT '',
+                status TEXT NOT NULL DEFAULT 'Attivo',
+                document_id INTEGER REFERENCES documents(id) ON DELETE SET NULL,
+                created_by INTEGER REFERENCES users(id),
+                created_at TEXT NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS board_meetings (
+                id INTEGER PRIMARY KEY,
+                platform_id INTEGER NOT NULL REFERENCES platforms(id),
+                title TEXT NOT NULL,
+                meeting_date TEXT NOT NULL,
+                meeting_link TEXT NOT NULL DEFAULT '',
+                agenda TEXT NOT NULL DEFAULT '',
+                status TEXT NOT NULL DEFAULT 'Pianificata',
+                minutes_document_id INTEGER REFERENCES documents(id),
+                created_at TEXT NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS communication_outputs (
+                id INTEGER PRIMARY KEY,
+                platform_id INTEGER NOT NULL REFERENCES platforms(id),
+                workflow_id TEXT NOT NULL,
+                period TEXT NOT NULL DEFAULT '',
+                status TEXT NOT NULL DEFAULT 'Bozza generata',
+                document_id INTEGER REFERENCES documents(id) ON DELETE SET NULL,
+                reviewer TEXT NOT NULL DEFAULT '',
+                notes TEXT NOT NULL DEFAULT '',
+                payload_json TEXT NOT NULL DEFAULT '',
+                created_by INTEGER REFERENCES users(id),
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS finance_costs (
+                id INTEGER PRIMARY KEY,
+                platform_id INTEGER NOT NULL REFERENCES platforms(id),
+                title TEXT NOT NULL,
+                category TEXT NOT NULL DEFAULT 'Altro costo',
+                amount REAL NOT NULL DEFAULT 0,
+                periodicity TEXT NOT NULL DEFAULT 'Annuale',
+                due_date TEXT NOT NULL DEFAULT '',
+                status TEXT NOT NULL DEFAULT 'Attivo',
+                source TEXT NOT NULL DEFAULT 'Manuale',
+                notes TEXT NOT NULL DEFAULT '',
+                linked_contract_id INTEGER REFERENCES supplier_contracts(id) ON DELETE SET NULL,
+                created_by INTEGER REFERENCES users(id),
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS campaign_updates (
+                id INTEGER PRIMARY KEY,
+                platform_id INTEGER NOT NULL REFERENCES platforms(id),
+                deal_id INTEGER NOT NULL REFERENCES deals(id) ON DELETE CASCADE,
+                as_of_date TEXT NOT NULL,
+                raised_amount REAL NOT NULL DEFAULT 0,
+                investors_count INTEGER NOT NULL DEFAULT 0,
+                status TEXT NOT NULL DEFAULT 'Rilevazione',
+                source TEXT NOT NULL DEFAULT 'Manuale',
+                notes TEXT NOT NULL DEFAULT '',
+                created_by INTEGER REFERENCES users(id),
+                created_at TEXT NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS investors (
+                id INTEGER PRIMARY KEY,
+                platform_id INTEGER NOT NULL REFERENCES platforms(id),
+                name TEXT NOT NULL,
+                email TEXT NOT NULL,
+                phone TEXT NOT NULL DEFAULT '',
+                investor_type TEXT NOT NULL,
+                total_invested REAL NOT NULL DEFAULT 0,
+                onboarding_status TEXT NOT NULL DEFAULT 'Da completare',
+                entry_test_status TEXT NOT NULL DEFAULT 'Da completare',
+                loss_simulation_status TEXT NOT NULL DEFAULT 'Da completare',
+                threshold_status TEXT NOT NULL DEFAULT 'Da verificare',
+                reflection_status TEXT NOT NULL DEFAULT 'Non applicabile',
+                crm_status TEXT NOT NULL DEFAULT 'Attivo',
+                preferred_categories TEXT NOT NULL DEFAULT '',
+                risk_profile TEXT NOT NULL DEFAULT 'Da profilare',
+                preferred_ticket_min REAL NOT NULL DEFAULT 0,
+                preferred_ticket_max REAL NOT NULL DEFAULT 0,
+                preferred_channel TEXT NOT NULL DEFAULT 'Email',
+                recurrence_status TEXT NOT NULL DEFAULT 'Da valutare',
+                source_system TEXT NOT NULL DEFAULT 'Manuale',
+                external_investor_id TEXT NOT NULL DEFAULT '',
+                last_synced_at TEXT NOT NULL DEFAULT '',
+                manual_override_notes TEXT NOT NULL DEFAULT '',
+                crm_notes TEXT NOT NULL DEFAULT '',
+                created_at TEXT NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS investments (
+                id INTEGER PRIMARY KEY,
+                investor_id INTEGER NOT NULL REFERENCES investors(id) ON DELETE CASCADE,
+                deal_id INTEGER NOT NULL REFERENCES deals(id) ON DELETE CASCADE,
+                amount REAL NOT NULL DEFAULT 0,
+                invested_at TEXT NOT NULL,
+                status TEXT NOT NULL DEFAULT 'Confermato'
+            );
+
+            CREATE TABLE IF NOT EXISTS conflicts (
+                id INTEGER PRIMARY KEY,
+                platform_id INTEGER NOT NULL REFERENCES platforms(id),
+                subject TEXT NOT NULL,
+                related_party TEXT NOT NULL DEFAULT '',
+                deal_id INTEGER REFERENCES deals(id) ON DELETE SET NULL,
+                description TEXT NOT NULL DEFAULT '',
+                mitigation TEXT NOT NULL DEFAULT '',
+                status TEXT NOT NULL DEFAULT 'Aperto',
+                opened_at TEXT NOT NULL,
+                closed_at TEXT NOT NULL DEFAULT ''
+            );
+
+            CREATE TABLE IF NOT EXISTS complaints (
+                id INTEGER PRIMARY KEY,
+                platform_id INTEGER NOT NULL REFERENCES platforms(id),
+                received_at TEXT NOT NULL,
+                complainant TEXT NOT NULL,
+                channel TEXT NOT NULL,
+                object TEXT NOT NULL,
+                status TEXT NOT NULL DEFAULT 'Aperto',
+                outcome TEXT NOT NULL DEFAULT '',
+                owner_user_id INTEGER REFERENCES users(id)
+            );
+
+            CREATE TABLE IF NOT EXISTS audit_log (
+                id INTEGER PRIMARY KEY,
+                platform_id INTEGER NOT NULL REFERENCES platforms(id),
+                actor_id INTEGER REFERENCES users(id),
+                entity_type TEXT NOT NULL,
+                entity_id INTEGER NOT NULL,
+                action TEXT NOT NULL,
+                details TEXT NOT NULL DEFAULT '',
+                created_at TEXT NOT NULL
+            );
+            """
+        )
+        ensure_column(conn, "finance_costs", "linked_contract_id", "INTEGER REFERENCES supplier_contracts(id) ON DELETE SET NULL")
+        ensure_column(conn, "deals", "platform_fee_percent", "REAL NOT NULL DEFAULT 5")
+        if conn.execute("SELECT COUNT(*) FROM platforms").fetchone()[0] == 0:
+            seed(conn)
+        ensure_demo_extensions(conn)
+
+
+def seed(conn):
+    now = now_iso()
+    conn.executemany(
+        "INSERT INTO platforms(id, code, name, regulator_profile) VALUES (?, ?, ?, ?)",
+        [
+            (1, "PARITER", "Pariter Equity", "ECSP - CONSOB / Banca d'Italia"),
+            (2, "ISI", "ISI Crowd", "ECSP - CONSOB / Banca d'Italia"),
+        ],
+    )
+    conn.executemany(
+        "INSERT INTO users(id, name, email, role, active) VALUES (?, ?, ?, ?, 1)",
+        [
+            (1, "Alessia Ricci", "alessia.ricci@example.test", "compliance"),
+            (2, "Marco Bianchi", "marco.bianchi@example.test", "legal"),
+            (3, "Giulia Ferri", "giulia.ferri@example.test", "technical_committee"),
+            (4, "Paolo Conti", "paolo.conti@example.test", "covi"),
+            (5, "Elena Martini", "elena.martini@example.test", "board"),
+            (6, "Sara De Luca", "sara.deluca@example.test", "operator"),
+        ],
+    )
+    committee_rows = []
+    member_id = 1
+    for platform_id in (1, 2):
+        committee_rows.extend(
+            [
+                (member_id, platform_id, "Comitato Tecnico", "Giulia Ferri", "Relatore tecnico", "giulia.ferri@example.test", 1),
+                (member_id + 1, platform_id, "Comitato Tecnico", "Roberto Neri", "Membro", "roberto.neri@example.test", 1),
+                (member_id + 2, platform_id, "Advisory Committee", "Paolo Conti", "Relatore Advisory Committee", "paolo.conti@example.test", 1),
+                (member_id + 3, platform_id, "Advisory Committee", "Nadia Galli", "Membro", "nadia.galli@example.test", 1),
+                (member_id + 4, platform_id, "CdA", "Elena Martini", "Presidente CdA", "elena.martini@example.test", 1),
+                (member_id + 5, platform_id, "CdA", "Luca Serra", "Consigliere", "luca.serra@example.test", 1),
+            ]
+        )
+        member_id += 6
+    conn.executemany(
+        """
+        INSERT INTO committee_members(id, platform_id, committee, name, role, email, active)
+        VALUES (?, ?, ?, ?, ?, ?, ?)
+        """,
+        committee_rows,
+    )
+    conn.executemany(
+        "INSERT INTO shareholders(platform_id, name, stake_percent, notes) VALUES (?, ?, ?, ?)",
+        [
+            (1, "Holding Alfa S.r.l.", 38.5, "Socio qualificato"),
+            (1, "Fondatori Pariter", 22.0, "Patto parasociale in archivio"),
+            (2, "ISI Holding S.p.A.", 51.0, "Controllo diretto"),
+            (2, "Club Investitori", 18.5, "Accordo quadro"),
+        ],
+    )
+    conn.executemany(
+        """
+        INSERT INTO proponents(
+            id, platform_id, name, legal_form, tax_id, contact_email, beneficial_owners,
+            exposure, internal_score, notes, created_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        [
+            (1, 1, "GreenFab S.r.l.", "S.r.l.", "GFAB123456", "cfo@greenfab.example", "Laura Verde 62%; Marco Riva 18%", 320000, "A-", "PMI manifattura sostenibile", now),
+            (2, 1, "MedTech Aurora S.p.A.", "S.p.A.", "MTA987654", "finance@aurora.example", "Aurora Holding 55%; fondatori 20%", 140000, "B+", "Follow-on potenziale", now),
+            (3, 2, "FoodLoop Benefit S.r.l.", "S.r.l. benefit", "FLB456789", "admin@foodloop.example", "Elisa Mori 70%", 90000, "B", "Prima istruttoria su ISI Crowd", now),
+        ],
+    )
+    conn.executemany(
+        """
+        INSERT INTO deals(
+            id, platform_id, proponent_id, title, funding_target, phase, technical_reviewer_id,
+            covi_reviewer_id, contract_required, kiis_state, created_by, created_at, updated_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        [
+            (1, 1, 1, "GreenFab - linea robotizzata", 750000, "verifiche", 1, 3, 1, "Bozza", 1, now, now),
+            (2, 1, 2, "MedTech Aurora - dispositivo diagnostico", 1200000, "comitato_tecnico", 1, 3, 1, "Bozza", 1, now, now),
+            (3, 2, 3, "FoodLoop - piattaforma anti spreco", 450000, "istruttoria_documentazione", 7, 9, 0, "Bozza", 6, now, now),
+        ],
+    )
+    for deal_id in (1, 2, 3):
+        for category, label, required in REQUIREMENT_SEED:
+            completed = 1 if deal_id in (1, 2) and label != "Bozza KIIS iniziale" else 0
+            conn.execute(
+                """
+                INSERT INTO deal_requirements(deal_id, kind, category, label, required, completed, completed_at, completed_by)
+                VALUES (?, 'onboarding', ?, ?, ?, ?, ?, ?)
+                """,
+                (deal_id, category, label, required, completed, now if completed else "", 1 if completed else None),
+            )
+        for area in VERIFICATION_SEED:
+            status = "ok" if deal_id == 2 else "pending"
+            conn.execute(
+                """
+                INSERT INTO verifications(deal_id, area, status, result, owner_user_id, completed_at)
+                VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                (deal_id, area, status, "Verifica completata in seed demo." if status == "ok" else "", 1, now if status == "ok" else ""),
+            )
+    due_today = date.today()
+    conn.executemany(
+        """
+        INSERT INTO compliance_tasks(platform_id, area, title, due_date, status, owner_role)
+        VALUES (?, ?, ?, ?, ?, ?)
+        """,
+        [
+            (1, "Reclami", "Aggiornare registro reclami Q2", (due_today - timedelta(days=3)).isoformat(), "Scaduto", "compliance"),
+            (1, "Autorita", "Comunicazione periodica CONSOB", (due_today + timedelta(days=12)).isoformat(), "Imminente", "compliance"),
+            (1, "Governance", "Verifica composizione Advisory Committee", (due_today + timedelta(days=28)).isoformat(), "Pianificato", "legal"),
+            (2, "Autorita", "Flusso vigilanza trimestrale", (due_today + timedelta(days=9)).isoformat(), "Imminente", "compliance"),
+            (2, "Conflitti", "Riconciliazione registro conflitti", (due_today + timedelta(days=20)).isoformat(), "Pianificato", "legal"),
+        ],
+    )
+    conn.executemany(
+        """
+        INSERT INTO platform_metrics(platform_id, published_offers, active_offers, investors, raised_amount, source, updated_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?)
+        """,
+        [
+            (1, 18, 3, 4210, 12840000, "adapter:future-platform-api", now),
+            (2, 7, 1, 1160, 3160000, "adapter:future-platform-api", now),
+        ],
+    )
+    seed_doc = UPLOAD_DIR / "generated" / "seed-visura-greenfab.txt"
+    seed_doc.write_text("Documento demo: visura camerale GreenFab.\n", encoding="utf-8")
+    conn.execute(
+        """
+        INSERT INTO documents(platform_id, deal_id, proponent_id, origin, category, title, filename, storage_path, generated, created_by, created_at)
+        VALUES (1, 1, 1, 'Deal', 'Documentazione', 'Visura camerale GreenFab', 'seed-visura-greenfab.txt', ?, 0, 1, ?)
+        """,
+        (str(seed_doc.relative_to(BASE_DIR)), now),
+    )
+    conn.executemany(
+        """
+        INSERT INTO audit_log(platform_id, actor_id, entity_type, entity_id, action, details, created_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?)
+        """,
+        [
+            (1, 1, "deal", 1, "Creazione deal", "Deal creato e portato in verifiche con dati demo.", now),
+            (1, 1, "deal", 2, "Invio a Comitato Tecnico", "Verifiche completate, in attesa del parere tecnico.", now),
+            (2, 6, "deal", 3, "Avvio istruttoria", "Raccolta documentale in corso.", now),
+        ],
+    )
+    conn.commit()
+
+
+def ensure_demo_extensions(conn):
+    now = now_iso()
+    today = date.today()
+    investor_columns = [
+        ("phone", "TEXT NOT NULL DEFAULT ''"),
+        ("crm_status", "TEXT NOT NULL DEFAULT 'Attivo'"),
+        ("preferred_categories", "TEXT NOT NULL DEFAULT ''"),
+        ("risk_profile", "TEXT NOT NULL DEFAULT 'Da profilare'"),
+        ("preferred_ticket_min", "REAL NOT NULL DEFAULT 0"),
+        ("preferred_ticket_max", "REAL NOT NULL DEFAULT 0"),
+        ("preferred_channel", "TEXT NOT NULL DEFAULT 'Email'"),
+        ("recurrence_status", "TEXT NOT NULL DEFAULT 'Da valutare'"),
+        ("source_system", "TEXT NOT NULL DEFAULT 'Manuale'"),
+        ("external_investor_id", "TEXT NOT NULL DEFAULT ''"),
+        ("last_synced_at", "TEXT NOT NULL DEFAULT ''"),
+        ("manual_override_notes", "TEXT NOT NULL DEFAULT ''"),
+        ("crm_notes", "TEXT NOT NULL DEFAULT ''"),
+    ]
+    for column, definition in investor_columns:
+        ensure_column(conn, "investors", column, definition)
+    proponent_columns = [
+        ("phone", "TEXT NOT NULL DEFAULT ''"),
+        ("website", "TEXT NOT NULL DEFAULT ''"),
+        ("sector", "TEXT NOT NULL DEFAULT ''"),
+        ("crm_status", "TEXT NOT NULL DEFAULT 'In istruttoria'"),
+        ("onboarding_status", "TEXT NOT NULL DEFAULT 'Documenti da raccogliere'"),
+        ("owner_name", "TEXT NOT NULL DEFAULT ''"),
+        ("source_system", "TEXT NOT NULL DEFAULT 'Manuale'"),
+        ("external_proponent_id", "TEXT NOT NULL DEFAULT ''"),
+        ("last_synced_at", "TEXT NOT NULL DEFAULT ''"),
+        ("manual_override_notes", "TEXT NOT NULL DEFAULT ''"),
+        ("next_action", "TEXT NOT NULL DEFAULT ''"),
+    ]
+    for column, definition in proponent_columns:
+        ensure_column(conn, "proponents", column, definition)
+    shareholder_columns = [
+        ("subject_type", "TEXT NOT NULL DEFAULT 'Societa / ente'"),
+        ("legal_form", "TEXT NOT NULL DEFAULT ''"),
+        ("tax_id", "TEXT NOT NULL DEFAULT ''"),
+        ("contact_email", "TEXT NOT NULL DEFAULT ''"),
+        ("phone", "TEXT NOT NULL DEFAULT ''"),
+        ("address", "TEXT NOT NULL DEFAULT ''"),
+        ("beneficial_owners", "TEXT NOT NULL DEFAULT ''"),
+        ("requisites_status", "TEXT NOT NULL DEFAULT 'Da verificare'"),
+        ("status", "TEXT NOT NULL DEFAULT 'Attivo'"),
+    ]
+    for column, definition in shareholder_columns:
+        ensure_column(conn, "shareholders", column, definition)
+    ensure_column(conn, "communication_outputs", "payload_json", "TEXT NOT NULL DEFAULT ''")
+    conn.execute("UPDATE committee_members SET committee = 'Advisory Committee' WHERE committee = 'CoVi'")
+    conn.execute(
+        """
+        UPDATE committee_members
+        SET role = REPLACE(role, 'CoVi', 'Advisory Committee')
+        WHERE role LIKE '%CoVi%'
+        """
+    )
+    conn.execute(
+        """
+        UPDATE compliance_tasks
+        SET title = REPLACE(title, 'CoVi', 'Advisory Committee')
+        WHERE title LIKE '%CoVi%'
+        """
+    )
+    conn.execute(
+        """
+        UPDATE person_agreements
+        SET role = REPLACE(role, 'CoVi', 'Advisory Committee'),
+            scope = REPLACE(scope, 'CoVi', 'Advisory Committee')
+        WHERE role LIKE '%CoVi%' OR scope LIKE '%CoVi%'
+        """
+    )
+
+    dummy_isi_names = ("Giulia Ferri", "Roberto Neri", "Paolo Conti", "Nadia Galli", "Elena Martini", "Luca Serra")
+    conn.execute(
+        """
+        UPDATE deals
+        SET technical_reviewer_id = NULL
+        WHERE platform_id = 2
+        AND technical_reviewer_id IN (
+            SELECT id FROM committee_members
+            WHERE platform_id = 2 AND name IN (?, ?, ?, ?, ?, ?)
+        )
+        """,
+        dummy_isi_names,
+    )
+    conn.execute(
+        """
+        UPDATE deals
+        SET covi_reviewer_id = NULL
+        WHERE platform_id = 2
+        AND covi_reviewer_id IN (
+            SELECT id FROM committee_members
+            WHERE platform_id = 2 AND name IN (?, ?, ?, ?, ?, ?)
+        )
+        """,
+        dummy_isi_names,
+    )
+    conn.executemany(
+        "DELETE FROM committee_members WHERE platform_id = 2 AND name = ?",
+        [(name,) for name in dummy_isi_names],
+    )
+
+    def ensure_committee_member(platform_id, committee, name, role, email):
+        exists = conn.execute(
+            """
+            SELECT id FROM committee_members
+            WHERE platform_id = ? AND committee = ? AND name = ?
+            """,
+            (platform_id, committee, name),
+        ).fetchone()
+        if not exists:
+            conn.execute(
+                """
+                INSERT INTO committee_members(platform_id, committee, name, role, email, active)
+                VALUES (?, ?, ?, ?, ?, 1)
+                """,
+                (platform_id, committee, name, role, email),
+            )
+
+    def ensure_supplier(platform_id, name, service_area, owner_role, notes):
+        existing = conn.execute(
+            "SELECT id FROM suppliers WHERE platform_id = ? AND name = ?",
+            (platform_id, name),
+        ).fetchone()
+        if existing:
+            return existing["id"]
+        cur = conn.execute(
+            """
+            INSERT INTO suppliers(platform_id, name, service_area, owner_role, status, notes, created_at)
+            VALUES (?, ?, ?, ?, 'Attivo', ?, ?)
+            """,
+            (platform_id, name, service_area, owner_role, notes, now),
+        )
+        return cur.lastrowid
+
+    def ensure_supplier_contract(platform_id, supplier_id, contract_type, title, counterparty, value, start_date, end_date, renewal_notice, created_by):
+        exists = conn.execute(
+            """
+            SELECT id FROM supplier_contracts
+            WHERE platform_id = ? AND supplier_id = ? AND title = ?
+            """,
+            (platform_id, supplier_id, title),
+        ).fetchone()
+        if not exists:
+            conn.execute(
+                """
+                INSERT INTO supplier_contracts(
+                    platform_id, supplier_id, contract_type, title, counterparty, value,
+                    start_date, end_date, renewal_notice, status, created_by, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'Attivo', ?, ?)
+                """,
+                (platform_id, supplier_id, contract_type, title, counterparty, value, start_date, end_date, renewal_notice, created_by, now),
+            )
+
+    for committee, name, role, email in [
+        ("CdA", "Antonio Ottaiano", "Presidente", "antonio.ottaiano@isi-crowd.example.test"),
+        ("CdA", "Emma Venturelli", "Consigliere", "emma.venturelli@isi-crowd.example.test"),
+        ("CdA", "Salvatore Sannino", "Consigliere", "salvatore.sannino@isi-crowd.example.test"),
+        ("Comitato Tecnico", "Michele Russo", "Membro Comitato Tecnico", "michele.russo@isi-crowd.example.test"),
+        ("Comitato Tecnico", "Gabriele Morelli", "Membro Comitato Tecnico", "gabriele.morelli@isi-crowd.example.test"),
+        ("Comitato Tecnico", "Teresa Manzone", "Membro Comitato Tecnico", "teresa.manzone@isi-crowd.example.test"),
+    ]:
+        ensure_committee_member(2, committee, name, role, email)
+
+    for name, role in [
+        ("Paolo Conti", "Relatore Advisory Committee"),
+        ("Nadia Galli", "Membro Advisory Committee"),
+    ]:
+        ensure_committee_member(1, "Advisory Committee", name, role, f"{name.lower().replace(' ', '.')}@example.test")
+    isi_technical_reviewer = conn.execute(
+        """
+        SELECT id FROM committee_members
+        WHERE platform_id = 2 AND committee = 'Comitato Tecnico' AND name = 'Michele Russo'
+        """
+    ).fetchone()
+    if isi_technical_reviewer:
+        conn.execute(
+            """
+            UPDATE deals
+            SET technical_reviewer_id = ?
+            WHERE platform_id = 2
+            AND (
+                technical_reviewer_id IS NULL
+                OR technical_reviewer_id NOT IN (SELECT id FROM committee_members WHERE platform_id = 2)
+            )
+            """,
+            (isi_technical_reviewer["id"],),
+        )
+    conn.execute(
+        """
+        UPDATE deals
+        SET covi_reviewer_id = NULL
+        WHERE platform_id = 2
+        AND (
+            covi_reviewer_id IS NULL
+            OR covi_reviewer_id NOT IN (
+                SELECT id FROM committee_members
+                WHERE platform_id = 2 AND committee = 'Advisory Committee'
+            )
+        )
+        """
+    )
+
+    if conn.execute("SELECT COUNT(*) FROM person_agreements").fetchone()[0] == 0:
+        conn.executemany(
+            """
+            INSERT INTO person_agreements(platform_id, person_name, role, agreement_type, scope, status, signed_at, expires_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            [
+                (1, "Elena Martini", "Presidente CdA", "Incarico amministratore", "Mandato CdA e deleghe operative", "Attivo", "2025-04-18", "2028-04-18"),
+                (1, "Giulia Ferri", "Relatore tecnico", "NDA", "Accesso ai fascicoli deal e documentazione riservata", "Attivo", "2025-09-12", "2027-09-12"),
+                (1, "Paolo Conti", "Relatore Advisory Committee", "Lettera incarico", "Funzione di vigilanza interna offerte", "Attivo", "2025-06-01", "2027-06-01"),
+                (2, "Elena Martini", "Presidente CdA", "Incarico amministratore", "Mandato CdA ISI Crowd", "Attivo", "2025-05-09", "2028-05-09"),
+                (2, "Nadia Galli", "Membro Advisory Committee", "NDA", "Accesso a verifiche e pareri Advisory Committee", "In rinnovo", "2024-07-01", "2026-07-01"),
+            ],
+        )
+    if conn.execute("SELECT COUNT(*) FROM suppliers").fetchone()[0] == 0:
+        conn.executemany(
+            """
+            INSERT INTO suppliers(id, platform_id, name, service_area, owner_role, status, notes, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            [
+                (1, 1, "CloudSign S.r.l.", "Firma elettronica e conservazione", "legal", "Attivo", "Fornitore documentale critico", now),
+                (2, 1, "KYC Data Provider S.p.A.", "KYC / AML / verifiche", "compliance", "Attivo", "Provider dati per onboarding e controlli", now),
+                (3, 1, "Studio Legale Verdi", "Consulenza legale ECSP", "legal", "Attivo", "Supporto contratti e governance", now),
+                (4, 2, "ISI Cloud Operations", "Infrastruttura piattaforma", "operator", "Attivo", "Contratto operativo ISI Crowd", now),
+            ],
+        )
+    if conn.execute("SELECT COUNT(*) FROM supplier_contracts").fetchone()[0] == 0:
+        conn.executemany(
+            """
+            INSERT INTO supplier_contracts(
+                platform_id, supplier_id, contract_type, title, counterparty, value,
+                start_date, end_date, renewal_notice, status, created_by, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            [
+                (1, 1, "Contratto quadro", "Contratto conservazione e firma", "Pariter Equity", 18000, "2025-01-01", "2026-12-31", "Preavviso 90 giorni", "Attivo", 2, now),
+                (1, 2, "Data processing agreement", "Servizi KYC e AML", "Pariter Equity", 24000, "2025-03-15", "2027-03-14", "Rinnovo annuale", "Attivo", 1, now),
+                (1, 3, "Lettera incarico", "Consulenza continuativa ECSP", "Pariter Equity", 36000, "2025-05-01", "2026-04-30", "Revisione fee a scadenza", "In rinnovo", 2, now),
+                (2, 4, "Outsourcing operativo", "Gestione infrastruttura ISI", "ISI Crowd", 42000, "2025-02-01", "2027-01-31", "Exit plan richiesto", "Attivo", 6, now),
+            ],
+        )
+    for name, service_area, owner_role, notes, contract_type, title, value in [
+        ("Keliweb S.r.l.", "Fornitore servizi cloud", "operator", "Cloud e hosting piattaforma ISI Crowd", "Outsourcing ICT", "Servizi cloud e hosting", 18000),
+        ("Creditsafe Italia S.r.l.", "Merito creditizio", "compliance", "Provider dati per valutazione merito creditizio", "Servizio dati", "Verifiche merito creditizio", 12000),
+        ("Lemonway Sas", "Istituto di pagamento", "operator", "Servizi di pagamento collegati alla piattaforma", "Payment services agreement", "Servizi di pagamento", 24000),
+        ("012 Factory S.r.l.", "Contabilita", "operator", "Contabilita in outsourcing", "Outsourcing amministrativo", "Servizi contabilita", 10000),
+        ("Avvocati.net", "Compliance esterna", "legal", "Supporto compliance esterna ECSP", "Lettera incarico", "Compliance esterna", 16000),
+    ]:
+        supplier_id = ensure_supplier(2, name, service_area, owner_role, notes)
+        ensure_supplier_contract(2, supplier_id, contract_type, title, "ISI Crowd", value, "2025-01-01", "2027-12-31", "Rinnovo/exit plan da verificare", 1)
+    if conn.execute("SELECT COUNT(*) FROM board_meetings").fetchone()[0] == 0:
+        conn.executemany(
+            """
+            INSERT INTO board_meetings(platform_id, title, meeting_date, meeting_link, agenda, status, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+            """,
+            [
+                (
+                    1,
+                    "CdA Pariter - offerte in approvazione",
+                    (today + timedelta(days=7)).isoformat(),
+                    "https://meet.example/pariter-cda",
+                    "1. MedTech Aurora; 2. Integrazioni KIIS; 3. Aggiornamento reclami",
+                    "Convocata",
+                    now,
+                ),
+                (
+                    1,
+                    "CdA Pariter - verbale maggio",
+                    (today - timedelta(days=21)).isoformat(),
+                    "",
+                    "Delibere su pipeline Q2 e assetti comitati",
+                    "Verbale archiviato",
+                    now,
+                ),
+                (
+                    2,
+                    "CdA ISI Crowd - pipeline FoodLoop",
+                    (today + timedelta(days=12)).isoformat(),
+                    "https://meet.example/isi-cda",
+                    "1. Stato istruttoria FoodLoop; 2. Registro conflitti",
+                    "Pianificata",
+                    now,
+                ),
+            ],
+        )
+    if conn.execute("SELECT COUNT(*) FROM investors").fetchone()[0] == 0:
+        conn.executemany(
+            """
+            INSERT INTO investors(
+                id, platform_id, name, email, investor_type, total_invested, onboarding_status,
+                entry_test_status, loss_simulation_status, threshold_status, reflection_status, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            [
+                (1, 1, "Anna Colombo", "anna.colombo@example.test", "Non sofisticato", 18000, "Completo", "Superato", "Completata", "Sotto soglia", "Non applicabile", now),
+                (2, 1, "Club Beta Invest", "operations@clubbeta.example", "Sofisticato", 145000, "Completo", "Non richiesto", "Non richiesta", "Verificata", "Non applicabile", now),
+                (3, 1, "Lorenzo Villa", "lorenzo.villa@example.test", "Non sofisticato", 52000, "In revisione", "Superato", "Completata", "Soglia superata", "In corso", now),
+                (4, 2, "Maria Fontana", "maria.fontana@example.test", "Non sofisticato", 9000, "Da completare", "Da completare", "Da completare", "Da verificare", "Non applicabile", now),
+                (5, 2, "Holding Gamma S.r.l.", "investimenti@gamma.example", "Sofisticato", 220000, "Completo", "Non richiesto", "Non richiesta", "Verificata", "Non applicabile", now),
+            ],
+        )
+    demo_investor_profiles = [
+        (1, 1, "+39 333 010 1101", "Industria sostenibile, energia, PMI produttive", "Bilanciato", 8000, 25000, "Email", "Ricorrente", "adapter:future-platform-api", "PAR-INV-0001", now, "", "Preferisce aggiornamenti sintetici e follow-up a raccolta avviata."),
+        (2, 1, "+39 02 5550 2030", "MedTech, follow-on, club deal", "Professionale", 50000, 150000, "Email", "Ricorrente", "adapter:future-platform-api", "PAR-INV-0002", now, "Contatto operativo corretto manualmente dopo import API.", "Soggetto collettivo: verificare referente prima di sollecitazioni nominali."),
+        (3, 1, "+39 347 020 4402", "MedTech, impatto sociale, tecnologia", "Dinamico", 15000, 60000, "Telefono", "Ricorrente", "adapter:future-platform-api", "PAR-INV-0003", now, "", "Interessato a deal innovativi ma da gestire con attenzione per soglia e riflessione."),
+        (4, 2, "+39 349 888 1200", "Food, impact, sostenibilita", "Prudente", 2000, 12000, "Email", "Prospect", "adapter:future-platform-api", "ISI-INV-0001", now, "", "Onboarding da completare prima di qualunque campagna."),
+        (5, 2, "+39 02 4440 9000", "FoodTech, lending, operazioni istituzionali", "Professionale", 50000, 250000, "PEC", "Ricorrente", "adapter:future-platform-api", "ISI-INV-0002", now, "", "Investitore istituzionale: canale formale e materiali completi."),
+    ]
+    for profile in demo_investor_profiles:
+        (
+            investor_id,
+            platform_id,
+            phone,
+            preferred_categories,
+            risk_profile,
+            ticket_min,
+            ticket_max,
+            preferred_channel,
+            recurrence_status,
+            source_system,
+            external_id,
+            synced_at,
+            override_notes,
+            crm_notes,
+        ) = profile
+        conn.execute(
+            """
+            UPDATE investors
+            SET phone = CASE WHEN phone = '' THEN ? ELSE phone END,
+                preferred_categories = CASE WHEN preferred_categories = '' THEN ? ELSE preferred_categories END,
+                risk_profile = CASE WHEN risk_profile = '' OR risk_profile = 'Da profilare' THEN ? ELSE risk_profile END,
+                preferred_ticket_min = CASE WHEN preferred_ticket_min = 0 THEN ? ELSE preferred_ticket_min END,
+                preferred_ticket_max = CASE WHEN preferred_ticket_max = 0 THEN ? ELSE preferred_ticket_max END,
+                preferred_channel = CASE WHEN preferred_channel = '' OR preferred_channel = 'Email' THEN ? ELSE preferred_channel END,
+                recurrence_status = CASE WHEN recurrence_status = '' OR recurrence_status = 'Da valutare' THEN ? ELSE recurrence_status END,
+                source_system = CASE WHEN source_system = '' OR source_system = 'Manuale' THEN ? ELSE source_system END,
+                external_investor_id = CASE WHEN external_investor_id = '' THEN ? ELSE external_investor_id END,
+                last_synced_at = CASE WHEN last_synced_at = '' THEN ? ELSE last_synced_at END,
+                manual_override_notes = CASE WHEN manual_override_notes = '' THEN ? ELSE manual_override_notes END,
+                crm_notes = CASE WHEN crm_notes = '' THEN ? ELSE crm_notes END
+            WHERE id = ? AND platform_id = ?
+            """,
+            (
+                phone,
+                preferred_categories,
+                risk_profile,
+                ticket_min,
+                ticket_max,
+                preferred_channel,
+                recurrence_status,
+                source_system,
+                external_id,
+                synced_at,
+                override_notes,
+                crm_notes,
+                investor_id,
+                platform_id,
+            ),
+        )
+    demo_proponent_profiles = [
+        (1, 1, "+39 0522 010 500", "https://greenfab.example", "Industria sostenibile", "Attivo", "Documentazione in verifica", "Alessia Ricci", "adapter:future-platform-api", "PAR-PROP-0001", now, "", "Completare KIIS e verifica titolari effettivi."),
+        (2, 1, "+39 02 0202 9090", "https://aurora-medtech.example", "MedTech", "Prioritario", "Comitato tecnico", "Giulia Ferri", "adapter:future-platform-api", "PAR-PROP-0002", now, "Score aggiornato manualmente dopo call con il referente finance.", "Preparare parere tecnico e condizioni CdA."),
+        (3, 2, "+39 051 404 808", "https://foodloop.example", "Food / Impact", "In istruttoria", "Documenti da raccogliere", "Sara De Luca", "adapter:future-platform-api", "ISI-PROP-0001", now, "", "Richiedere integrazione business plan e contratti pilota."),
+    ]
+    for profile in demo_proponent_profiles:
+        (
+            proponent_id,
+            platform_id,
+            phone,
+            website,
+            sector,
+            crm_status,
+            onboarding_status,
+            owner_name,
+            source_system,
+            external_id,
+            synced_at,
+            override_notes,
+            next_action,
+        ) = profile
+        conn.execute(
+            """
+            UPDATE proponents
+            SET phone = CASE WHEN phone = '' THEN ? ELSE phone END,
+                website = CASE WHEN website = '' THEN ? ELSE website END,
+                sector = CASE WHEN sector = '' THEN ? ELSE sector END,
+                crm_status = CASE WHEN crm_status = '' OR crm_status = 'In istruttoria' THEN ? ELSE crm_status END,
+                onboarding_status = CASE WHEN onboarding_status = '' OR onboarding_status = 'Documenti da raccogliere' THEN ? ELSE onboarding_status END,
+                owner_name = CASE WHEN owner_name = '' THEN ? ELSE owner_name END,
+                source_system = CASE WHEN source_system = '' OR source_system = 'Manuale' THEN ? ELSE source_system END,
+                external_proponent_id = CASE WHEN external_proponent_id = '' THEN ? ELSE external_proponent_id END,
+                last_synced_at = CASE WHEN last_synced_at = '' THEN ? ELSE last_synced_at END,
+                manual_override_notes = CASE WHEN manual_override_notes = '' THEN ? ELSE manual_override_notes END,
+                next_action = CASE WHEN next_action = '' THEN ? ELSE next_action END
+            WHERE id = ? AND platform_id = ?
+            """,
+            (
+                phone,
+                website,
+                sector,
+                crm_status,
+                onboarding_status,
+                owner_name,
+                source_system,
+                external_id,
+                synced_at,
+                override_notes,
+                next_action,
+                proponent_id,
+                platform_id,
+            ),
+        )
+    if conn.execute("SELECT COUNT(*) FROM investments").fetchone()[0] == 0:
+        deal_ids = {r["id"] for r in conn.execute("SELECT id FROM deals").fetchall()}
+        investment_rows = []
+        if 1 in deal_ids:
+            investment_rows.extend([(1, 1, 12000, (today - timedelta(days=45)).isoformat(), "Confermato"), (3, 1, 18000, (today - timedelta(days=38)).isoformat(), "Confermato")])
+        if 2 in deal_ids:
+            investment_rows.extend([(2, 2, 85000, (today - timedelta(days=14)).isoformat(), "Impegno raccolto"), (3, 2, 34000, (today - timedelta(days=9)).isoformat(), "In attesa periodo riflessione")])
+        if 3 in deal_ids:
+            investment_rows.extend([(5, 3, 70000, (today - timedelta(days=11)).isoformat(), "Indicazione interesse")])
+        if investment_rows:
+            conn.executemany(
+                "INSERT INTO investments(investor_id, deal_id, amount, invested_at, status) VALUES (?, ?, ?, ?, ?)",
+                investment_rows,
+            )
+    if conn.execute("SELECT COUNT(*) FROM conflicts").fetchone()[0] == 0:
+        deal_ids = {r["id"] for r in conn.execute("SELECT id FROM deals").fetchall()}
+        conn.executemany(
+            """
+            INSERT INTO conflicts(platform_id, subject, related_party, deal_id, description, mitigation, status, opened_at, closed_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            [
+                (
+                    1,
+                    "Partecipazione indiretta in proponente",
+                    "Consigliere CdA / MedTech Aurora",
+                    2 if 2 in deal_ids else None,
+                    "Segnalata possibile relazione commerciale pregressa.",
+                    "Astensione del consigliere dalla delibera e disclosure nel fascicolo.",
+                    "Aperto",
+                    (today - timedelta(days=5)).isoformat(),
+                    "",
+                ),
+                (
+                    1,
+                    "Advisor comune",
+                    "Advisor legale / GreenFab",
+                    1 if 1 in deal_ids else None,
+                    "Advisor gia incaricato da societa collegata.",
+                    "Valutazione indipendenza completata e nota archiviata.",
+                    "Mitigato",
+                    (today - timedelta(days=34)).isoformat(),
+                    (today - timedelta(days=20)).isoformat(),
+                ),
+                (
+                    2,
+                    "Investitore rilevante collegato",
+                    "Holding Gamma / FoodLoop",
+                    3 if 3 in deal_ids else None,
+                    "Investitore sofisticato con rapporti commerciali col proponente.",
+                    "Disclosure e monitoraggio soglie prima della pubblicazione.",
+                    "In analisi",
+                    (today - timedelta(days=8)).isoformat(),
+                    "",
+                ),
+            ],
+        )
+    if conn.execute("SELECT COUNT(*) FROM complaints").fetchone()[0] == 0:
+        conn.executemany(
+            """
+            INSERT INTO complaints(platform_id, received_at, complainant, channel, object, status, outcome, owner_user_id)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            [
+                (1, (today - timedelta(days=18)).isoformat(), "Investitore privato", "Email", "Richiesta chiarimenti su periodo di riflessione", "In istruttoria", "Risposta legale in preparazione", 1),
+                (1, (today - timedelta(days=48)).isoformat(), "Anna Colombo", "Portale", "Errore visualizzazione importo sottoscritto", "Chiuso", "Rettifica confermata e comunicata", 6),
+                (2, (today - timedelta(days=9)).isoformat(), "Maria Fontana", "Email", "Test di ingresso non salvato", "Aperto", "Ticket tecnico aperto", 1),
+            ],
+        )
+    conn.commit()
+
+
+def log_audit(conn, platform_id, actor_id, entity_type, entity_id, action, details=""):
+    conn.execute(
+        """
+        INSERT INTO audit_log(platform_id, actor_id, entity_type, entity_id, action, details, created_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?)
+        """,
+        (platform_id, actor_id, entity_type, entity_id, action, details, now_iso()),
+    )
+
+
+def rel_url(path, ctx, extra=None):
+    params = {"platform": ctx["platform_id"], "user": ctx["user_id"]}
+    if extra:
+        params.update(extra)
+    return f"{path}?{urlencode(params)}"
+
+
+def hidden_ctx(ctx):
+    return f"""
+    <input type="hidden" name="platform" value="{ctx['platform_id']}">
+    <input type="hidden" name="user" value="{ctx['user_id']}">
+    """
+
+
+def option_rows(items, selected, value_key="id", label_key="name"):
+    chunks = []
+    for item in items:
+        value = item[value_key]
+        label = item[label_key]
+        sel = " selected" if str(value) == str(selected) else ""
+        chunks.append(f'<option value="{esc(value)}"{sel}>{esc(label)}</option>')
+    return "\n".join(chunks)
+
+
+def option_values(options, selected):
+    return "\n".join(
+        f'<option value="{esc(option)}"{" selected" if str(option) == str(selected) else ""}>{esc(option)}</option>'
+        for option in options
+    )
+
+
+def user_can(user, action):
+    role = user["role"]
+    permissions = {
+        "create_deal": {"compliance", "legal", "operator"},
+        "edit_requirement": {"compliance", "legal", "operator"},
+        "verify": {"compliance", "legal"},
+        "technical_opinion": {"technical_committee"},
+        "covi_opinion": {"covi"},
+        "board_decision": {"board"},
+        "finalize": {"compliance", "legal", "operator"},
+        "manage_compagine": {"compliance", "legal"},
+        "upload_document": {"compliance", "legal", "operator"},
+        "manage_governance": {"compliance", "legal", "board"},
+        "manage_investors": {"compliance", "legal", "operator"},
+        "manage_registers": {"compliance", "legal"},
+        "manage_proponents": {"compliance", "legal", "operator"},
+        "manage_finance": {"compliance", "legal", "operator"},
+    }
+    return role in permissions.get(action, set())
+
+
+def fetch_deal(deal_id):
+    return row(
+        """
+        SELECT d.*, p.name AS proponent_name, p.legal_form, p.contact_email,
+               tm.name AS technical_reviewer_name, cm.name AS covi_reviewer_name
+        FROM deals d
+        JOIN proponents p ON p.id = d.proponent_id
+        LEFT JOIN committee_members tm ON tm.id = d.technical_reviewer_id
+        LEFT JOIN committee_members cm ON cm.id = d.covi_reviewer_id
+        WHERE d.id = ?
+        """,
+        (deal_id,),
+    )
+
+
+def update_deal_phase(conn, deal, target_phase, actor_id, details):
+    conn.execute(
+        "UPDATE deals SET phase = ?, updated_at = ? WHERE id = ?",
+        (target_phase, now_iso(), deal["id"]),
+    )
+    log_audit(conn, deal["platform_id"], actor_id, "deal", deal["id"], f"Fase: {phase_label(target_phase)}", details)
+
+
+def generated_document(conn, platform_id, deal_id, proponent_id, origin, category, title, filename_hint, content, actor_id):
+    safe = sanitize_filename(filename_hint)
+    stamped = f"{datetime.now().strftime('%Y%m%d-%H%M%S')}-{uuid.uuid4().hex[:8]}-{safe}"
+    path = UPLOAD_DIR / "generated" / stamped
+    path.write_text(content, encoding="utf-8")
+    cur = conn.execute(
+        """
+        INSERT INTO documents(platform_id, deal_id, proponent_id, origin, category, title, filename, storage_path, generated, created_by, created_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?)
+        """,
+        (platform_id, deal_id, proponent_id, origin, category, title, stamped, str(path.relative_to(BASE_DIR)), actor_id, now_iso()),
+    )
+    return cur.lastrowid
+
+
+def save_uploaded_document(conn, file_item, platform_id, deal_id, proponent_id, origin, category, title, actor_id):
+    filename = sanitize_filename(file_item.filename)
+    folder = UPLOAD_DIR / datetime.now().strftime("%Y%m")
+    folder.mkdir(parents=True, exist_ok=True)
+    stored = f"{datetime.now().strftime('%Y%m%d-%H%M%S')}-{uuid.uuid4().hex[:8]}-{filename}"
+    path = folder / stored
+    file_item.file.seek(0)
+    with path.open("wb") as out:
+        shutil.copyfileobj(file_item.file, out)
+    cur = conn.execute(
+        """
+        INSERT INTO documents(platform_id, deal_id, proponent_id, origin, category, title, filename, storage_path, generated, created_by, created_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?)
+        """,
+        (
+            platform_id,
+            deal_id,
+            proponent_id,
+            origin,
+            category,
+            title or filename,
+            filename,
+            str(path.relative_to(BASE_DIR)),
+            actor_id,
+            now_iso(),
+        ),
+    )
+    return cur.lastrowid
+
+
+def build_opinion_html(deal, committee, reviewer, outcome, summary):
+    return f"""<!doctype html>
+<html lang="it">
+<head><meta charset="utf-8"><title>{esc(committee)} - {esc(deal['title'])}</title></head>
+<body>
+<h1>{esc(committee)}</h1>
+<h2>{esc(deal['title'])}</h2>
+<p><strong>Proponente:</strong> {esc(deal['proponent_name'])}</p>
+<p><strong>Relatore:</strong> {esc(reviewer['name'] if reviewer else 'Non indicato')}</p>
+<p><strong>Esito:</strong> {esc(outcome)}</p>
+<p><strong>Data generazione:</strong> {esc(now_iso())}</p>
+<h3>Valutazione</h3>
+<p>{esc(summary).replace(chr(10), '<br>')}</p>
+</body>
+</html>
+"""
+
+
+def build_board_html(deal, outcome, notes, integration_required):
+    return f"""<!doctype html>
+<html lang="it">
+<head><meta charset="utf-8"><title>Delibera CdA - {esc(deal['title'])}</title></head>
+<body>
+<h1>Delibera CdA</h1>
+<h2>{esc(deal['title'])}</h2>
+<p><strong>Proponente:</strong> {esc(deal['proponent_name'])}</p>
+<p><strong>Esito:</strong> {esc(outcome)}</p>
+<p><strong>Integrazione documenti:</strong> {'Richiesta' if integration_required else 'Non richiesta'}</p>
+<p><strong>Data:</strong> {esc(now_iso())}</p>
+<h3>Note</h3>
+<p>{esc(notes).replace(chr(10), '<br>')}</p>
+</body>
+</html>
+"""
+
+
+def build_iter_report(deal_id):
+    deal = fetch_deal(deal_id)
+    requirements = rows("SELECT * FROM deal_requirements WHERE deal_id = ? ORDER BY kind, category, id", (deal_id,))
+    verifications = rows("SELECT * FROM verifications WHERE deal_id = ? ORDER BY id", (deal_id,))
+    opinions = rows(
+        """
+        SELECT o.*, m.name AS reviewer_name, d.title AS document_title
+        FROM committee_opinions o
+        LEFT JOIN committee_members m ON m.id = o.reviewer_member_id
+        LEFT JOIN documents d ON d.id = o.generated_document_id
+        WHERE o.deal_id = ?
+        ORDER BY o.created_at
+        """,
+        (deal_id,),
+    )
+    decisions = rows("SELECT * FROM board_decisions WHERE deal_id = ? ORDER BY created_at", (deal_id,))
+    docs = rows("SELECT * FROM documents WHERE deal_id = ? ORDER BY created_at", (deal_id,))
+    audit = rows(
+        """
+        SELECT a.*, u.name AS actor_name
+        FROM audit_log a
+        LEFT JOIN users u ON u.id = a.actor_id
+        WHERE a.entity_type = 'deal' AND a.entity_id = ?
+        ORDER BY a.created_at
+        """,
+        (deal_id,),
+    )
+    req_rows = "".join(
+        f"<tr><td>{esc(r['category'])}</td><td>{esc(r['label'])}</td><td>{'Completato' if r['completed'] else 'Aperto'}</td></tr>"
+        for r in requirements
+    )
+    ver_rows = "".join(
+        f"<tr><td>{esc(v['area'])}</td><td>{esc(v['status'])}</td><td>{esc(v['result'])}</td></tr>"
+        for v in verifications
+    )
+    op_rows = "".join(
+        f"<tr><td>{esc(o['committee'])}</td><td>{esc(o['reviewer_name'])}</td><td>{esc(o['outcome'])}</td><td>{esc(o['document_title'])}</td></tr>"
+        for o in opinions
+    )
+    dec_rows = "".join(
+        f"<tr><td>{esc(d['created_at'])}</td><td>{esc(d['outcome'])}</td><td>{'Si' if d['integration_required'] else 'No'}</td><td>{esc(d['notes'])}</td></tr>"
+        for d in decisions
+    )
+    doc_rows = "".join(
+        f"<tr><td>{esc(d['created_at'])}</td><td>{esc(d['category'])}</td><td>{esc(d['title'])}</td><td>{'Generato' if d['generated'] else 'Caricato'}</td></tr>"
+        for d in docs
+    )
+    audit_rows = "".join(
+        f"<tr><td>{esc(a['created_at'])}</td><td>{esc(a['actor_name'])}</td><td>{esc(a['action'])}</td><td>{esc(a['details'])}</td></tr>"
+        for a in audit
+    )
+    return f"""<!doctype html>
+<html lang="it">
+<head>
+<meta charset="utf-8">
+<title>Report iter - {esc(deal['title'])}</title>
+<style>
+body {{ font-family: Arial, sans-serif; color: #1d2730; margin: 32px; }}
+h1, h2 {{ margin-bottom: 4px; }}
+table {{ border-collapse: collapse; width: 100%; margin: 16px 0 28px; }}
+th, td {{ border: 1px solid #d7dee5; padding: 8px; text-align: left; vertical-align: top; }}
+th {{ background: #edf3f2; }}
+.meta {{ color: #52616f; }}
+</style>
+</head>
+<body>
+<h1>Report iter deal</h1>
+<h2>{esc(deal['title'])}</h2>
+<p class="meta">Proponente: {esc(deal['proponent_name'])} - Fase: {esc(phase_label(deal['phase']))} - Stato: {esc(status_for_phase(deal['phase']))}</p>
+<h2>Documentazione e integrazioni</h2><table><tr><th>Categoria</th><th>Elemento</th><th>Stato</th></tr>{req_rows}</table>
+<h2>Verifiche</h2><table><tr><th>Area</th><th>Stato</th><th>Esito</th></tr>{ver_rows}</table>
+<h2>Pareri comitati</h2><table><tr><th>Comitato</th><th>Relatore</th><th>Esito</th><th>Documento</th></tr>{op_rows}</table>
+<h2>Delibere CdA</h2><table><tr><th>Data</th><th>Esito</th><th>Integrazione</th><th>Note</th></tr>{dec_rows}</table>
+<h2>Documenti del fascicolo</h2><table><tr><th>Data</th><th>Categoria</th><th>Titolo</th><th>Origine</th></tr>{doc_rows}</table>
+<h2>Audit trail</h2><table><tr><th>Quando</th><th>Chi</th><th>Azione</th><th>Dettagli</th></tr>{audit_rows}</table>
+</body>
+</html>
+"""
+
+
+class App(BaseHTTPRequestHandler):
+    server_version = "ECSPSuite/0.1"
+
+    def do_GET(self):
+        parsed = urlparse(self.path)
+        path = parsed.path
+        if path.startswith("/static/"):
+            self.serve_static(path)
+            return
+        if path == "/":
+            self.page_dashboard()
+        elif path == "/finance":
+            self.page_finance()
+        elif path == "/deals":
+            self.page_deals()
+        elif path == "/deals/new":
+            self.page_deal_new()
+        elif re.fullmatch(r"/deals/\d+", path):
+            self.page_deal_detail(int(path.rsplit("/", 1)[1]))
+        elif re.fullmatch(r"/deals/\d+/report", path):
+            self.page_deal_report(int(path.split("/")[2]))
+        elif path == "/compagine":
+            self.page_compagine()
+        elif path == "/governance":
+            self.page_governance()
+        elif path == "/proponents":
+            self.page_proponents()
+        elif path == "/proponents/new":
+            self.page_proponent_new()
+        elif re.fullmatch(r"/proponents/\d+", path):
+            self.page_proponent_detail(int(path.rsplit("/", 1)[1]))
+        elif path == "/investors":
+            self.page_investors()
+        elif re.fullmatch(r"/investors/\d+", path):
+            self.page_investor_detail(int(path.rsplit("/", 1)[1]))
+        elif path == "/conflicts":
+            self.page_conflicts()
+        elif path == "/complaints":
+            self.page_complaints()
+        elif path == "/documents":
+            self.page_documents()
+        elif path in {"/person-documents/upload", "/supplier-contracts/upload"}:
+            self.redirect("/compagine", self.get_ctx(), "Apri Compagine per collegare documenti a persone, fornitori e contratti.")
+        elif re.fullmatch(r"/documents/\d+/download", path):
+            self.download_document(int(path.split("/")[2]))
+        elif path == "/communications":
+            self.page_communications()
+        elif path.startswith("/official-templates/"):
+            self.download_official_template(path)
+        elif path == "/assistant":
+            self.page_assistant()
+        elif path == "/architecture":
+            self.page_architecture()
+        else:
+            self.not_found()
+
+    def do_POST(self):
+        parsed = urlparse(self.path)
+        path = parsed.path
+        form, files = self.parse_post()
+        try:
+            if path == "/deals/create":
+                self.post_deal_create(form)
+            elif re.fullmatch(r"/deals/\d+/requirement", path):
+                self.post_requirement(int(path.split("/")[2]), form)
+            elif re.fullmatch(r"/deals/\d+/verification", path):
+                self.post_verification(int(path.split("/")[2]), form)
+            elif re.fullmatch(r"/deals/\d+/opinion", path):
+                self.post_opinion(int(path.split("/")[2]), form)
+            elif re.fullmatch(r"/deals/\d+/board-decision", path):
+                self.post_board_decision(int(path.split("/")[2]), form)
+            elif re.fullmatch(r"/deals/\d+/transition", path):
+                self.post_transition(int(path.split("/")[2]), form)
+            elif re.fullmatch(r"/deals/\d+/upload", path):
+                self.post_deal_upload(int(path.split("/")[2]), form, files)
+            elif re.fullmatch(r"/deals/\d+/generate-report", path):
+                self.post_generate_report(int(path.split("/")[2]), form)
+            elif path == "/proponents/create":
+                self.post_proponent_create(form)
+            elif re.fullmatch(r"/proponents/\d+/update", path):
+                self.post_proponent_update(int(path.split("/")[2]), form)
+            elif path == "/committee/create":
+                self.post_committee_create(form)
+            elif path == "/shareholders/create":
+                self.post_shareholder_create(form)
+            elif re.fullmatch(r"/shareholders/\d+/update", path):
+                self.post_shareholder_update(int(path.split("/")[2]), form)
+            elif re.fullmatch(r"/shareholders/\d+/document-upload", path):
+                self.post_shareholder_document_upload(int(path.split("/")[2]), form, files)
+            elif path == "/compagine/function-save":
+                self.post_org_function_save(form)
+            elif path == "/compagine/assignment-save":
+                self.post_org_assignment_save(form, files)
+            elif path == "/compagine/assignment-delete":
+                self.post_org_assignment_delete(form)
+            elif path == "/governance/meeting-create":
+                self.post_board_meeting_create(form)
+            elif path == "/person-documents/upload":
+                self.post_person_document_upload(form, files)
+            elif path == "/supplier-contracts/upload":
+                self.post_supplier_contract_upload(form, files)
+            elif path == "/investors/create":
+                self.post_investor_create(form)
+            elif re.fullmatch(r"/investors/\d+/update", path):
+                self.post_investor_update(int(path.split("/")[2]), form)
+            elif path == "/conflicts/create":
+                self.post_conflict_create(form)
+            elif path == "/complaints/create":
+                self.post_complaint_create(form)
+            elif path == "/communications/generate":
+                self.post_communication_generate(form)
+            elif path == "/communications/output-status":
+                self.post_communication_output_status(form)
+            elif path == "/communications/output-delete":
+                self.post_communication_output_delete(form)
+            elif path == "/documents/upload":
+                self.post_document_upload(form, files)
+            elif path in {"/finance/cost-create", "/finance/cost-save"}:
+                self.post_finance_cost_save(form)
+            elif path == "/finance/contract-update":
+                self.post_finance_contract_update(form)
+            elif path == "/finance/contract-to-manual":
+                self.post_finance_contract_to_manual(form)
+            elif path == "/finance/campaign-update":
+                self.post_campaign_update(form)
+            else:
+                self.not_found()
+        except Exception as exc:  # keep prototype failures visible
+            self.error_page(exc)
+
+    def parse_post(self):
+        ctype = self.headers.get("Content-Type", "")
+        if ctype.startswith("multipart/form-data"):
+            fs = cgi.FieldStorage(
+                fp=self.rfile,
+                headers=self.headers,
+                environ={"REQUEST_METHOD": "POST", "CONTENT_TYPE": ctype},
+            )
+            form = {}
+            files = {}
+            keys = fs.keys() if hasattr(fs, "keys") else []
+            for key in keys:
+                item = fs[key]
+                if isinstance(item, list):
+                    item = item[0]
+                if getattr(item, "filename", None):
+                    files[key] = item
+                else:
+                    form[key] = item.value
+            return form, files
+        length = int(self.headers.get("Content-Length", "0") or "0")
+        raw = self.rfile.read(length).decode("utf-8")
+        parsed = parse_qs(raw, keep_blank_values=True)
+        return {key: values[-1] for key, values in parsed.items()}, {}
+
+    def get_ctx(self):
+        parsed = urlparse(self.path)
+        params = parse_qs(parsed.query)
+        platforms = rows("SELECT * FROM platforms ORDER BY id")
+        users = rows("SELECT * FROM users WHERE active = 1 ORDER BY id")
+        platform_id = int((params.get("platform") or [platforms[0]["id"]])[0])
+        user_id = int((params.get("user") or [users[0]["id"]])[0])
+        platform = row("SELECT * FROM platforms WHERE id = ?", (platform_id,)) or platforms[0]
+        user = row("SELECT * FROM users WHERE id = ?", (user_id,)) or users[0]
+        notice = (params.get("notice") or [""])[0]
+        return {
+            "platform_id": platform["id"],
+            "user_id": user["id"],
+            "platform": platform,
+            "user": user,
+            "platforms": platforms,
+            "users": users,
+            "notice": notice,
+            "path": parsed.path,
+        }
+
+    def ctx_from_form(self, form):
+        platform_id = int(form.get("platform") or 1)
+        user_id = int(form.get("user") or 1)
+        platform = row("SELECT * FROM platforms WHERE id = ?", (platform_id,))
+        user = row("SELECT * FROM users WHERE id = ?", (user_id,))
+        return {"platform_id": platform_id, "user_id": user_id, "platform": platform, "user": user}
+
+    def send_html(self, html_doc, status=200):
+        body = html_doc.encode("utf-8")
+        self.send_response(status)
+        self.send_header("Content-Type", "text/html; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def redirect(self, path, ctx, notice="", extra=None):
+        params = {"platform": ctx["platform_id"], "user": ctx["user_id"]}
+        if extra:
+            params.update(extra)
+        if notice:
+            params["notice"] = notice
+        self.send_response(303)
+        self.send_header("Location", f"{path}?{urlencode(params)}")
+        self.end_headers()
+
+    def serve_static(self, path):
+        rel = path.removeprefix("/static/").strip("/")
+        file_path = (STATIC_DIR / rel).resolve()
+        if not str(file_path).startswith(str(STATIC_DIR.resolve())) or not file_path.exists():
+            self.not_found()
+            return
+        data = file_path.read_bytes()
+        self.send_response(200)
+        self.send_header("Content-Type", mimetypes.guess_type(str(file_path))[0] or "application/octet-stream")
+        self.send_header("Content-Length", str(len(data)))
+        self.end_headers()
+        self.wfile.write(data)
+
+    def render(self, title, body, active):
+        ctx = self.get_ctx()
+        role_label = ROLE_LABELS.get(ctx["user"]["role"], ctx["user"]["role"])
+        nav_items = [
+            ("Dashboard", "/", "dashboard"),
+            ("Compagine", "/compagine", "compagine"),
+            ("Finance", "/finance", "finance"),
+            ("Governance", "/governance", "governance"),
+            ("Deal", "/deals", "deals"),
+            ("Proponenti", "/proponents", "proponents"),
+            ("Investitori", "/investors", "investors"),
+            ("Conflitti d'int.", "/conflicts", "conflicts"),
+            ("Reclami", "/complaints", "complaints"),
+            ("Comunicazioni", "/communications", "communications"),
+            ("Documenti", "/documents", "documents"),
+            ("Assistente IA", "/assistant", "assistant"),
+        ]
+        nav = "".join(
+            f'<a class="nav-link {"active" if key == active else ""}" href="{rel_url(href, ctx)}">{label}</a>'
+            for label, href, key in nav_items
+        )
+        platform_switch = "".join(
+            f'<a class="platform-tab {"active" if p["id"] == ctx["platform_id"] else ""}" href="{rel_url(ctx["path"], ctx, {"platform": p["id"]})}">{esc(p["name"])}</a>'
+            for p in ctx["platforms"]
+        )
+        user_opts = option_rows(ctx["users"], ctx["user_id"])
+        notice = f'<div class="notice">{esc(ctx["notice"])}</div>' if ctx["notice"] else ""
+        html_doc = f"""<!doctype html>
+<html lang="it">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>{esc(title)} - ECSP Suite</title>
+  <link rel="stylesheet" href="/static/styles.css">
+</head>
+<body>
+  <header class="app-header">
+    <div class="shell header-inner">
+      <div class="brand-copy">
+        <p class="eyebrow">Compliance suite - ECSP - Reg. (UE) 2020/1503</p>
+        <h1>Vigilanza Crowdfunding</h1>
+        <p>Compliance interna ed esterna - CONSOB - Banca d'Italia</p>
+      </div>
+      <div class="header-actions">
+        <div class="platform-switch">{platform_switch}</div>
+        <form class="user-menu" method="get" action="{esc(ctx['path'])}">
+          <input type="hidden" name="platform" value="{ctx['platform_id']}">
+          <label><span>Utente</span><select name="user" data-autosubmit>{user_opts}</select></label>
+          <span class="role-pill">{esc(role_label)}</span>
+          <button class="logout-button" type="button">Esci</button>
+        </form>
+      </div>
+    </div>
+    <nav class="top-nav"><div class="shell nav-row">{nav}</div></nav>
+  </header>
+  <main class="main">
+    <div class="shell">
+    <header class="topbar">
+      <div>
+        <p class="eyebrow">{esc(ctx['platform']['regulator_profile'])}</p>
+        <h1>{esc(title)}</h1>
+      </div>
+    </header>
+    {notice}
+    {body}
+    </div>
+  </main>
+  <script src="/static/app.js"></script>
+</body>
+</html>"""
+        self.send_html(html_doc)
+
+    def page_dashboard(self):
+        ctx = self.get_ctx()
+        pid = ctx["platform_id"]
+        metrics = row("SELECT * FROM platform_metrics WHERE platform_id = ?", (pid,))
+        cost_rows = rows(
+            """
+            SELECT sc.*, s.name AS supplier_name, s.service_area
+            FROM supplier_contracts sc
+            JOIN suppliers s ON s.id = sc.supplier_id
+            WHERE sc.platform_id = ?
+              AND sc.status IN ('Attivo', 'In rinnovo', 'Da firmare')
+            ORDER BY sc.end_date = '', sc.end_date, sc.title
+            """,
+            (pid,),
+        )
+        insurance_cost = sum(
+            float(c["value"] or 0)
+            for c in cost_rows
+            if "assic" in " ".join([c["title"] or "", c["contract_type"] or "", c["service_area"] or ""]).lower()
+        )
+        supplier_cost = sum(float(c["value"] or 0) for c in cost_rows) - insurance_cost
+        consob_fee = 0
+        people_cost = 0
+        known_structural_cost = supplier_cost + insurance_cost + consob_fee + people_cost
+        estimated_revenue = 0
+        break_even_gap = max(known_structural_cost - estimated_revenue, 0)
+        cost_detail_rows = "".join(
+            f"""<tr>
+                <td>{esc(c['title'])}<br><span class="muted">{esc(c['supplier_name'])}</span></td>
+                <td>{esc(c['service_area'] or c['contract_type'])}</td>
+                <td>{money(c['value'])}</td>
+                <td>{esc(c['end_date'] or 'senza scadenza')}</td>
+            </tr>"""
+            for c in cost_rows[:5]
+        ) or '<tr><td colspan="4" class="empty-state">Nessun contratto attivo censito.</td></tr>'
+        counts = {
+            "open_deals": row(
+                "SELECT COUNT(*) AS c FROM deals WHERE platform_id = ? AND phase NOT IN ('pubblicato','raccolta_in_corso','concluso','respinta','archiviato')",
+                (pid,),
+            )["c"],
+            "approval": row(
+                "SELECT COUNT(*) AS c FROM deals WHERE platform_id = ? AND phase IN ('comitato_tecnico','covi','cda','contratto','pre_pubblicazione')",
+                (pid,),
+            )["c"],
+            "published": row(
+                "SELECT COUNT(*) AS c FROM deals WHERE platform_id = ? AND phase IN ('pubblicato','raccolta_in_corso')",
+                (pid,),
+            )["c"],
+            "missing": row(
+                """
+                SELECT COUNT(*) AS c
+                FROM deal_requirements r
+                JOIN deals d ON d.id = r.deal_id
+                WHERE d.platform_id = ? AND r.required = 1 AND r.completed = 0
+                """,
+                (pid,),
+            )["c"],
+        }
+        task_rows = rows("SELECT * FROM compliance_tasks WHERE platform_id = ? ORDER BY due_date", (pid,))
+        deals = rows(
+            """
+            SELECT d.*, p.name AS proponent_name
+            FROM deals d JOIN proponents p ON p.id = d.proponent_id
+            WHERE d.platform_id = ?
+            ORDER BY d.updated_at DESC
+            """,
+            (pid,),
+        )
+        task_html = "".join(self.task_row(task) for task in task_rows)
+        deal_html = "".join(
+            f"""<tr>
+                <td><a href="{rel_url('/deals/' + str(d['id']), ctx)}">{esc(d['title'])}</a></td>
+                <td>{esc(d['proponent_name'])}</td>
+                <td><span class="badge {badge_class(status_for_phase(d['phase']))}">{esc(status_for_phase(d['phase']))}</span></td>
+                <td>{esc(phase_label(d['phase']))}</td>
+                <td>{money(d['funding_target'])}</td>
+            </tr>"""
+            for d in deals
+        )
+        body = f"""
+<section class="metric-grid">
+  <div class="metric"><span>Deal in preparazione</span><strong>{counts['open_deals']}</strong></div>
+  <div class="metric"><span>In approvazione</span><strong>{counts['approval']}</strong></div>
+  <div class="metric"><span>Offerte online</span><strong>{counts['published']}</strong></div>
+  <div class="metric"><span>Elementi mancanti</span><strong>{counts['missing']}</strong></div>
+</section>
+<section class="panel structural-cost-panel">
+  <div class="section-head">
+    <h2>Costi strutturali</h2>
+    <span class="source-chip">Break even operativo</span>
+  </div>
+  <div class="compact-metrics structural-cost-metrics">
+    <div><span>Tassa CONSOB</span><strong>{money(consob_fee)}</strong><small>Da collegare al tariffario applicabile</small></div>
+    <div><span>Fornitori e outsourcing</span><strong>{money(supplier_cost)}</strong><small>{len(cost_rows)} contratti attivi o da firmare</small></div>
+    <div><span>Assicurazione</span><strong>{money(insurance_cost)}</strong><small>Da contratti assicurativi collegati</small></div>
+    <div><span>Persone e funzioni</span><strong>{money(people_cost)}</strong><small>Da compensi / accordi organigramma</small></div>
+    <div><span>Costo strutturale annuo</span><strong>{money(known_structural_cost)}</strong><small>Totale parziale dei dati censiti</small></div>
+    <div><span>Gap break even</span><strong>{money(break_even_gap)}</strong><small>Ricavi annui impostati: {money(estimated_revenue)}</small></div>
+  </div>
+  <table class="data-table compact structural-cost-table">
+    <thead><tr><th>Voce collegata</th><th>Area</th><th>Costo annuo</th><th>Scadenza</th></tr></thead>
+    <tbody>{cost_detail_rows}</tbody>
+  </table>
+</section>
+<section class="workspace-grid">
+  <div class="panel">
+    <div class="section-head">
+      <h2>Metriche piattaforma</h2>
+      <span class="source-chip">{esc(metrics['source'] if metrics else 'adapter non collegato')}</span>
+    </div>
+    <div class="compact-metrics">
+      <div><span>Offerte pubblicate</span><strong>{metrics['published_offers'] if metrics else 0}</strong></div>
+      <div><span>Offerte in corso</span><strong>{metrics['active_offers'] if metrics else 0}</strong></div>
+      <div><span>Investitori</span><strong>{metrics['investors'] if metrics else 0}</strong></div>
+      <div><span>Raccolta</span><strong>{money(metrics['raised_amount'] if metrics else 0)}</strong></div>
+    </div>
+  </div>
+  <div class="panel">
+    <div class="section-head"><h2>Scadenze e adempimenti</h2></div>
+    <table class="data-table">
+      <thead><tr><th>Area</th><th>Attivita</th><th>Scadenza</th><th>Stato</th></tr></thead>
+      <tbody>{task_html}</tbody>
+    </table>
+  </div>
+</section>
+<section class="panel">
+  <div class="section-head">
+    <h2>Pipeline deal</h2>
+    <a class="button secondary" href="{rel_url('/deals', ctx)}">Apri lista</a>
+  </div>
+  <table class="data-table">
+    <thead><tr><th>Deal</th><th>Proponente</th><th>Stato</th><th>Fase</th><th>Target</th></tr></thead>
+    <tbody>{deal_html}</tbody>
+  </table>
+</section>
+"""
+        self.render("Cruscotto", body, "dashboard")
+
+    def task_row(self, task):
+        due = date.fromisoformat(task["due_date"])
+        days = (due - date.today()).days
+        state = task["status"]
+        if days < 0:
+            state = "Scaduto"
+        elif days <= 14 and state != "Scaduto":
+            state = "Imminente"
+        return f"""<tr>
+            <td>{esc(task['area'])}</td>
+            <td>{esc(task['title'])}</td>
+            <td>{esc(nice_date(task['due_date']))}</td>
+            <td><span class="badge {badge_class(state)}">{esc(state)}</span></td>
+        </tr>"""
+
+    def page_finance(self):
+        ctx = self.get_ctx()
+        pid = ctx["platform_id"]
+        params = parse_qs(urlparse(self.path).query)
+
+        def to_int(value, default=0):
+            try:
+                return int(value or default)
+            except (TypeError, ValueError):
+                return default
+
+        mode = (params.get("mode") or [""])[0]
+        selected_cost_id = to_int((params.get("cost_id") or ["0"])[0])
+        selected_contract_id = to_int((params.get("contract_id") or ["0"])[0])
+        selected_deal_id = to_int((params.get("deal_id") or ["0"])[0])
+        selected_update_id = to_int((params.get("update_id") or ["0"])[0])
+
+        def annualized(amount, periodicity):
+            value = float(amount or 0)
+            return value * {"Mensile": 12, "Trimestrale": 4, "Semestrale": 2, "Annuale": 1, "Una tantum": 1}.get(periodicity or "Annuale", 1)
+
+        def alert_class(due_date, status=""):
+            if status in {"Pagato", "Chiuso"}:
+                return "ok"
+            try:
+                days = (date.fromisoformat(due_date) - date.today()).days
+            except (TypeError, ValueError):
+                return "neutral"
+            if days < 0:
+                return "urgent"
+            if days <= 30:
+                return "soon"
+            return "ok"
+
+        def row_value(item, key, default=""):
+            if item and key in item.keys() and item[key] is not None:
+                return item[key]
+            return default
+
+        contract_costs = rows(
+            """
+            SELECT sc.*, s.name AS supplier_name, s.service_area, doc.title AS document_title
+            FROM supplier_contracts sc
+            JOIN suppliers s ON s.id = sc.supplier_id
+            LEFT JOIN documents doc ON doc.id = sc.document_id
+            WHERE sc.platform_id = ?
+              AND sc.status IN ('Attivo', 'In rinnovo', 'Da firmare', 'Scaduto')
+              AND sc.id NOT IN (
+                  SELECT linked_contract_id
+                  FROM finance_costs
+                  WHERE platform_id = ?
+                    AND linked_contract_id IS NOT NULL
+                    AND status != 'Archiviato'
+              )
+            ORDER BY sc.end_date = '', sc.end_date, s.name
+            """,
+            (pid, pid),
+        )
+        manual_costs = rows(
+            """
+            SELECT fc.*, sc.title AS linked_contract_title, sc.document_id AS linked_document_id
+            FROM finance_costs fc
+            LEFT JOIN supplier_contracts sc ON sc.id = fc.linked_contract_id
+            WHERE fc.platform_id = ?
+            ORDER BY fc.due_date = '', fc.due_date, fc.category, fc.title
+            """,
+            (pid,),
+        )
+        campaigns = rows(
+            """
+            SELECT d.*, p.name AS proponent_name,
+                   COALESCE(SUM(i.amount), 0) AS tracked_raised,
+                   COUNT(DISTINCT i.investor_id) AS tracked_investors
+            FROM deals d
+            JOIN proponents p ON p.id = d.proponent_id
+            LEFT JOIN investments i ON i.deal_id = d.id
+            WHERE d.platform_id = ?
+            GROUP BY d.id
+            ORDER BY d.updated_at DESC
+            """,
+            (pid,),
+        )
+        updates = rows(
+            "SELECT * FROM campaign_updates WHERE platform_id = ? ORDER BY as_of_date DESC, created_at DESC",
+            (pid,),
+        )
+        update_history = rows(
+            """
+            SELECT cu.*, d.title AS deal_title
+            FROM campaign_updates cu
+            JOIN deals d ON d.id = cu.deal_id
+            WHERE cu.platform_id = ?
+            ORDER BY cu.as_of_date DESC, cu.created_at DESC
+            LIMIT 12
+            """,
+            (pid,),
+        )
+        selected_cost = row(
+            "SELECT * FROM finance_costs WHERE id = ? AND platform_id = ?",
+            (selected_cost_id, pid),
+        ) if selected_cost_id else None
+        selected_contract = row(
+            """
+            SELECT sc.*, s.name AS supplier_name, s.service_area, doc.title AS document_title
+            FROM supplier_contracts sc
+            JOIN suppliers s ON s.id = sc.supplier_id
+            LEFT JOIN documents doc ON doc.id = sc.document_id
+            WHERE sc.id = ? AND sc.platform_id = ?
+            """,
+            (selected_contract_id, pid),
+        ) if selected_contract_id else None
+        selected_update = row(
+            """
+            SELECT cu.*, d.title AS deal_title, d.funding_target, d.platform_fee_percent
+            FROM campaign_updates cu
+            JOIN deals d ON d.id = cu.deal_id
+            WHERE cu.id = ? AND cu.platform_id = ?
+            """,
+            (selected_update_id, pid),
+        ) if selected_update_id else None
+        if selected_update:
+            selected_deal_id = selected_update["deal_id"]
+        latest_update = {}
+        for update in updates:
+            latest_update.setdefault(update["deal_id"], update)
+
+        contract_total = sum(float(c["value"] or 0) for c in contract_costs)
+        manual_total = sum(annualized(c["amount"], c["periodicity"]) for c in manual_costs if c["status"] != "Archiviato")
+        structural_total = contract_total + manual_total
+        campaign_total = 0
+        estimated_revenue = 0
+        campaign_rows = []
+        for deal in campaigns:
+            latest = latest_update.get(deal["id"])
+            raised = float(latest["raised_amount"] if latest and latest["raised_amount"] else deal["tracked_raised"] or 0)
+            investors_count = int(latest["investors_count"] if latest and latest["investors_count"] else deal["tracked_investors"] or 0)
+            target = float(deal["funding_target"] or 0)
+            fee_percent = float(deal["platform_fee_percent"] if deal["platform_fee_percent"] is not None else 5)
+            fee_amount = raised * fee_percent / 100
+            progress = min(100, (raised / target) * 100) if target else 0
+            progress_label = f"{progress:.1f}".rstrip("0").rstrip(".")
+            campaign_total += raised
+            estimated_revenue += fee_amount
+            campaign_link_extra = {"mode": "campaign", "deal_id": deal["id"]}
+            if latest:
+                campaign_link_extra["update_id"] = latest["id"]
+            campaign_rows.append(
+                f"""<tr>
+                  <td><a href="{rel_url('/deals/' + str(deal['id']), ctx)}"><strong>{esc(deal['title'])}</strong></a><br><span class="muted">{esc(deal['proponent_name'])}</span></td>
+                  <td>{money(target)}</td>
+                  <td>{money(raised)}<br><span class="muted">Avanzamento {progress_label}%</span><div class="finance-progress"><span style="width:{progress}%"></span></div></td>
+                  <td>{fee_percent:.2f}%</td>
+                  <td>{money(fee_amount)}</td>
+                  <td>{investors_count}</td>
+                  <td><span class="badge {badge_class(status_for_phase(deal['phase']))}">{esc(status_for_phase(deal['phase']))}</span><br><span class="muted">{esc(phase_label(deal['phase']))}</span></td>
+                  <td>{esc(nice_date(latest['as_of_date']) if latest else 'investimenti/API')}</td>
+                  <td><a class="button ghost" href="{rel_url('/finance', ctx, campaign_link_extra)}">Modifica</a></td>
+                </tr>"""
+            )
+        break_even_gap = max(structural_total - estimated_revenue, 0)
+
+        def contract_document_url(item):
+            if item["document_id"]:
+                return rel_url("/documents/" + str(item["document_id"]) + "/download", ctx)
+            return rel_url("/documents", ctx, {"origin": "Contratto fornitore"})
+
+        def manual_source_cell(item):
+            if item["linked_contract_id"]:
+                label = item["linked_contract_title"] or "contratto collegato"
+                href = (
+                    rel_url("/documents/" + str(item["linked_document_id"]) + "/download", ctx)
+                    if item["linked_document_id"]
+                    else rel_url("/finance", ctx, {"mode": "contract", "contract_id": item["linked_contract_id"]})
+                )
+                return f'<a href="{href}">Manuale</a><br><span class="muted">da {esc(label)}</span>'
+            return esc(item["source"])
+
+        contract_rows = "".join(
+            f"""<tr>
+              <td><strong>{esc(c['title'])}</strong><br><span class="muted">{esc(c['supplier_name'])}</span></td>
+              <td>{esc(c['service_area'] or c['contract_type'])}</td>
+              <td>{money(c['value'])}</td>
+              <td><span class="deadline-dot {alert_class(c['end_date'], c['status'])}"></span>{esc(nice_date(c['end_date']) or 'senza scadenza')}</td>
+              <td><span class="badge {badge_class(c['status'])}">{esc(c['status'])}</span></td>
+              <td><a href="{contract_document_url(c)}">Contratto</a><br><span class="muted">{esc(c['document_title'] or 'documento da collegare')}</span></td>
+              <td><div class="inline-actions">
+                <a class="button ghost" href="{rel_url('/finance', ctx, {'mode': 'contract', 'contract_id': c['id']})}">Modifica</a>
+                <form class="inline-action-form" method="post" action="/finance/contract-to-manual">
+                  {hidden_ctx(ctx)}
+                  <input type="hidden" name="contract_id" value="{c['id']}">
+                  <button class="button secondary" type="submit">Manuale</button>
+                </form>
+              </div></td>
+            </tr>"""
+            for c in contract_costs
+        )
+        manual_rows = "".join(
+            f"""<tr>
+              <td><strong>{esc(c['title'])}</strong><br><span class="muted">{esc(c['notes'])}</span></td>
+              <td>{esc(c['category'])}</td>
+              <td>{money(c['amount'])}<br><span class="muted">{esc(c['periodicity'])} / annuo {money(annualized(c['amount'], c['periodicity']))}</span></td>
+              <td><span class="deadline-dot {alert_class(c['due_date'], c['status'])}"></span>{esc(nice_date(c['due_date']) or 'senza scadenza')}</td>
+              <td><span class="badge {badge_class(c['status'])}">{esc(c['status'])}</span></td>
+              <td>{manual_source_cell(c)}</td>
+              <td><a class="button ghost" href="{rel_url('/finance', ctx, {'mode': 'cost', 'cost_id': c['id']})}">Modifica</a></td>
+            </tr>"""
+            for c in manual_costs
+        )
+        all_cost_rows = contract_rows + manual_rows or '<tr><td colspan="7" class="empty-row">Nessun costo censito.</td></tr>'
+        history_rows = "".join(
+            f"""<tr>
+              <td>{esc(nice_date(u['as_of_date']))}</td>
+              <td><strong>{esc(u['deal_title'])}</strong></td>
+              <td>{money(u['raised_amount'])}</td>
+              <td>{esc(u['investors_count'])}</td>
+              <td><span class="badge {badge_class(u['status'])}">{esc(u['status'])}</span></td>
+              <td>{esc(u['source'])}</td>
+              <td>{esc(u['notes'])}</td>
+              <td><a class="button ghost" href="{rel_url('/finance', ctx, {'mode': 'campaign', 'update_id': u['id']})}">Modifica</a></td>
+            </tr>"""
+            for u in update_history
+        ) or '<tr><td colspan="8" class="empty-row">Nessuna rilevazione manuale registrata.</td></tr>'
+        selected_campaign = next((d for d in campaigns if d["id"] == selected_deal_id), None)
+        if not selected_campaign and campaigns and mode == "campaign":
+            selected_campaign = campaigns[0]
+            selected_deal_id = selected_campaign["id"]
+        deal_options = "".join(
+            f'<option value="{d["id"]}" data-target="{esc(d["funding_target"])}" data-fee="{esc(d["platform_fee_percent"] if d["platform_fee_percent"] is not None else 5)}"{" selected" if d["id"] == selected_deal_id else ""}>{esc(d["title"])}</option>'
+            for d in campaigns
+        )
+        close_url = rel_url("/finance", ctx)
+        cost_modal = ""
+        if mode == "cost":
+            cost_title = row_value(selected_cost, "title")
+            cost_modal = f"""
+<div class="modal-backdrop">
+  <section class="person-modal entity-modal finance-modal">
+    <div class="section-head">
+      <h2>{'Modifica costo' if selected_cost else 'Nuovo costo'}</h2>
+      <a class="modal-close" href="{close_url}">x</a>
+    </div>
+    <form class="form-grid" method="post" action="/finance/cost-save">
+      {hidden_ctx(ctx)}
+      <input type="hidden" name="cost_id" value="{esc(selected_cost_id if selected_cost else '')}">
+      <label>Titolo<input name="title" required value="{esc(cost_title)}" placeholder="es. Tassa CONSOB, assicurazione, advisor"></label>
+      <label>Categoria<select name="category">{option_values(['Tassa autorita', 'Fornitore', 'Assicurazione', 'Personale / incarichi', 'Marketing', 'Altro costo'], row_value(selected_cost, 'category', 'Altro costo'))}</select></label>
+      <label>Importo<input type="number" step="0.01" min="0" name="amount" required value="{esc(row_value(selected_cost, 'amount', ''))}"></label>
+      <label>Periodicita<select name="periodicity">{option_values(['Annuale', 'Mensile', 'Trimestrale', 'Semestrale', 'Una tantum'], row_value(selected_cost, 'periodicity', 'Annuale'))}</select></label>
+      <label>Scadenza<input type="date" name="due_date" value="{esc(row_value(selected_cost, 'due_date'))}"></label>
+      <label>Stato<select name="status">{option_values(['Attivo', 'Da pagare', 'Pagato', 'Stimato', 'Archiviato'], row_value(selected_cost, 'status', 'Attivo'))}</select></label>
+      <label class="full-span">Note<textarea name="notes" rows="3" placeholder="Fonte, contratto collegato, criterio di stima, rinnovo">{esc(row_value(selected_cost, 'notes'))}</textarea></label>
+      <div class="form-actions left full-span"><button class="button primary" type="submit">Salva costo</button><a class="button secondary" href="{close_url}">Annulla</a></div>
+    </form>
+  </section>
+</div>"""
+        contract_modal = ""
+        if mode == "contract" and selected_contract:
+            contract_modal = f"""
+<div class="modal-backdrop">
+  <section class="person-modal entity-modal finance-modal">
+    <div class="section-head">
+      <h2>Modifica costo da contratto</h2>
+      <a class="modal-close" href="{close_url}">x</a>
+    </div>
+    <p class="page-copy"><a href="{contract_document_url(selected_contract)}">Apri contratto</a> - {esc(selected_contract['document_title'] or 'documento non collegato, apri archivio contratti')}</p>
+    <form class="form-grid" method="post" action="/finance/contract-update">
+      {hidden_ctx(ctx)}
+      <input type="hidden" name="contract_id" value="{esc(selected_contract['id'])}">
+      <label>Titolo contratto<input name="title" required value="{esc(selected_contract['title'])}"></label>
+      <label>Fornitore<input value="{esc(selected_contract['supplier_name'])}" readonly></label>
+      <label>Area servizio<input name="service_area" value="{esc(selected_contract['service_area'])}"></label>
+      <label>Tipo contratto<input name="contract_type" value="{esc(selected_contract['contract_type'])}"></label>
+      <label>Costo annuo<input type="number" step="0.01" min="0" name="value" value="{esc(selected_contract['value'])}"></label>
+      <label>Data inizio<input type="date" name="start_date" value="{esc(selected_contract['start_date'])}"></label>
+      <label>Scadenza<input type="date" name="end_date" value="{esc(selected_contract['end_date'])}"></label>
+      <label>Stato<select name="status">{option_values(['Attivo', 'In rinnovo', 'Da firmare', 'Scaduto', 'Chiuso', 'Archiviato'], selected_contract['status'])}</select></label>
+      <label class="full-span">Preavviso / rinnovo / exit<textarea name="renewal_notice" rows="3">{esc(selected_contract['renewal_notice'])}</textarea></label>
+      <div class="form-actions left full-span"><button class="button primary" type="submit">Salva contratto</button><a class="button secondary" href="{close_url}">Annulla</a></div>
+    </form>
+  </section>
+</div>"""
+        campaign_modal = ""
+        if mode == "campaign" and selected_campaign:
+            selected_latest = latest_update.get(selected_campaign["id"])
+            campaign_target = float(row_value(selected_campaign, "funding_target", 0) or 0)
+            campaign_raised = float(row_value(selected_update, "raised_amount", row_value(selected_latest, "raised_amount", row_value(selected_campaign, "tracked_raised", 0))) or 0)
+            campaign_investors = int(row_value(selected_update, "investors_count", row_value(selected_latest, "investors_count", row_value(selected_campaign, "tracked_investors", 0))) or 0)
+            campaign_date = row_value(selected_update, "as_of_date", today_iso())
+            campaign_status = row_value(selected_update, "status", "Rilevazione")
+            campaign_notes = row_value(selected_update, "notes", "")
+            campaign_fee_percent = float(row_value(selected_campaign, "platform_fee_percent", 5) or 5)
+            campaign_modal = f"""
+<div class="modal-backdrop">
+  <section class="person-modal entity-modal finance-modal">
+    <div class="section-head">
+      <h2>{'Modifica rilevazione campagna' if selected_update else 'Aggiorna campagna'}</h2>
+      <a class="modal-close" href="{close_url}">x</a>
+    </div>
+    <form class="form-grid" method="post" action="/finance/campaign-update" data-campaign-form>
+      {hidden_ctx(ctx)}
+      <input type="hidden" name="update_id" value="{esc(selected_update_id if selected_update else '')}">
+      <label class="full-span">Campagna / deal<select name="deal_id" required data-deal-select>{deal_options}</select></label>
+      <label>Target campagna<input type="number" step="0.01" min="0" name="funding_target" value="{campaign_target:.2f}" data-campaign-target></label>
+      <label>Raccolta aggiornata<input type="number" step="0.01" min="0" name="raised_amount" value="{campaign_raised:.2f}" data-campaign-raised></label>
+      <label>Fee trattenuta %<input type="number" step="0.01" min="0" max="100" name="platform_fee_percent" value="{campaign_fee_percent:.2f}" data-campaign-fee></label>
+      <label>Investitori<input type="number" min="0" name="investors_count" value="{campaign_investors}"></label>
+      <label>Data rilevazione<input type="date" name="as_of_date" value="{esc(campaign_date)}"></label>
+      <label>Stato<select name="status">{option_values(['Rilevazione', 'In crescita', 'Sotto target', 'Target raggiunto', 'Chiusa'], campaign_status)}</select></label>
+      <label class="full-span">Note<textarea name="notes" rows="3" placeholder="Fonte API, aggiornamento manuale, osservazioni andamento">{esc(campaign_notes)}</textarea></label>
+      <div class="form-actions left full-span"><button class="button primary" type="submit">Salva campagna</button><a class="button secondary" href="{close_url}">Annulla</a></div>
+    </form>
+  </section>
+</div>"""
+        sync_script = """
+<script>
+document.querySelectorAll('[data-campaign-form]').forEach((form) => {
+  const target = form.querySelector('[data-campaign-target]');
+  const fee = form.querySelector('[data-campaign-fee]');
+  const dealSelect = form.querySelector('[data-deal-select]');
+  if (dealSelect) {
+    dealSelect.addEventListener('change', () => {
+      const option = dealSelect.options[dealSelect.selectedIndex];
+      if (option && option.dataset.target) target.value = Number.parseFloat(option.dataset.target || '0').toFixed(2);
+      if (option && option.dataset.fee && fee) fee.value = Number.parseFloat(option.dataset.fee || '5').toFixed(2);
+    });
+  }
+});
+</script>
+"""
+        body = f"""
+<p class="page-copy">Quadro economico operativo: costi strutturali complessivi, contratti raggiungibili, voci manuali e andamento campagne. La fee piattaforma e' impostata al 5% di default e puo' variare per singola campagna.</p>
+<section class="metric-grid">
+  <div class="metric"><span>Costi strutturali annui</span><strong>{money(structural_total)}</strong></div>
+  <div class="metric"><span>Raccolta tracciata</span><strong>{money(campaign_total)}</strong></div>
+  <div class="metric"><span>Ricavi stimati da fee</span><strong>{money(estimated_revenue)}</strong></div>
+  <div class="metric"><span>Gap break even</span><strong>{money(break_even_gap)}</strong></div>
+</section>
+<section class="panel finance-toolbar">
+  <div>
+    <p class="panel-kicker">Azioni operative</p>
+    <h2>Aggiornamenti economici</h2>
+  </div>
+  <div class="inline-actions left">
+    <a class="button primary" href="{rel_url('/finance', ctx, {'mode': 'cost'})}">+ Nuovo costo</a>
+    <a class="button secondary" href="{rel_url('/finance', ctx, {'mode': 'campaign'})}">+ Aggiorna campagna</a>
+  </div>
+</section>
+<section class="panel">
+  <div class="section-head"><h2>Costi e scadenze</h2><span class="source-chip">Costi complessivi</span></div>
+  <table class="data-table roomy">
+    <thead><tr><th>Voce</th><th>Categoria</th><th>Importo</th><th>Scadenza</th><th>Stato</th><th>Origine / contratto</th><th>Azioni</th></tr></thead>
+    <tbody>{all_cost_rows}</tbody>
+  </table>
+</section>
+<section class="panel">
+  <div class="section-head"><h2>Andamento campagne</h2><span class="source-chip">API / investimenti / manuale</span></div>
+  <table class="data-table roomy finance-campaign-table">
+    <thead><tr><th>Campagna</th><th>Target</th><th>Raccolta</th><th>Fee %</th><th>Ricavo stimato</th><th>Investitori</th><th>Stato</th><th>Aggiornato</th><th>Azioni</th></tr></thead>
+    <tbody>{''.join(campaign_rows) or '<tr><td colspan="9" class="empty-row">Nessuna campagna.</td></tr>'}</tbody>
+  </table>
+</section>
+<section class="panel">
+  <div class="section-head"><h2>Storico rilevazioni campagne</h2><span class="source-chip">trend operativo</span></div>
+  <table class="data-table compact finance-history-table">
+    <thead><tr><th>Data</th><th>Campagna</th><th>Raccolta</th><th>Investitori</th><th>Stato</th><th>Fonte</th><th>Note</th><th>Azioni</th></tr></thead>
+    <tbody>{history_rows}</tbody>
+  </table>
+</section>
+{cost_modal}
+{contract_modal}
+{campaign_modal}
+{sync_script}
+"""
+        self.render("Finance", body, "finance")
+
+    def page_deals(self):
+        ctx = self.get_ctx()
+        pid = ctx["platform_id"]
+        deals = rows(
+            """
+            SELECT d.*, p.name AS proponent_name,
+                   tm.name AS technical_reviewer_name, cm.name AS covi_reviewer_name,
+                   SUM(CASE WHEN r.required = 1 AND r.completed = 0 THEN 1 ELSE 0 END) AS missing_count
+            FROM deals d
+            JOIN proponents p ON p.id = d.proponent_id
+            LEFT JOIN committee_members tm ON tm.id = d.technical_reviewer_id
+            LEFT JOIN committee_members cm ON cm.id = d.covi_reviewer_id
+            LEFT JOIN deal_requirements r ON r.deal_id = d.id
+            WHERE d.platform_id = ?
+            GROUP BY d.id
+            ORDER BY d.updated_at DESC
+            """,
+            (pid,),
+        )
+        create = (
+            f'<a class="button primary" href="{rel_url("/deals/new", ctx)}">Nuovo deal</a>'
+            if user_can(ctx["user"], "create_deal")
+            else ""
+        )
+        deal_rows = "".join(
+            f"""<tr>
+              <td><a href="{rel_url('/deals/' + str(d['id']), ctx)}"><strong>{esc(d['title'])}</strong></a></td>
+              <td>{esc(d['proponent_name'])}</td>
+              <td><span class="badge {badge_class(status_for_phase(d['phase']))}">{esc(status_for_phase(d['phase']))}</span></td>
+              <td>{esc(phase_label(d['phase']))}</td>
+              <td>{esc(d['technical_reviewer_name'] or '-')}</td>
+              <td>{esc(d['covi_reviewer_name'] or '-')}</td>
+              <td>{esc(d['missing_count'] or 0)}</td>
+            </tr>"""
+            for d in deals
+        )
+        body = f"""
+<section class="panel">
+  <div class="section-head">
+    <h2>Deal della piattaforma</h2>
+    {create}
+  </div>
+  <table class="data-table roomy">
+    <thead><tr><th>Deal</th><th>Proponente</th><th>Stato</th><th>Fase</th><th>Relatore CT</th><th>Relatore Advisory</th><th>Mancanti</th></tr></thead>
+    <tbody>{deal_rows}</tbody>
+  </table>
+</section>
+"""
+        self.render("Deal", body, "deals")
+
+    def page_deal_new(self):
+        ctx = self.get_ctx()
+        if not user_can(ctx["user"], "create_deal"):
+            self.render("Nuovo deal", '<section class="panel"><p>Ruolo non abilitato alla creazione deal.</p></section>', "deals")
+            return
+        pid = ctx["platform_id"]
+        proponents = rows("SELECT * FROM proponents WHERE platform_id = ? ORDER BY name", (pid,))
+        tech = rows(
+            "SELECT * FROM committee_members WHERE platform_id = ? AND committee = 'Comitato Tecnico' AND active = 1 ORDER BY name",
+            (pid,),
+        )
+        covi = rows(
+            "SELECT * FROM committee_members WHERE platform_id = ? AND committee = 'Advisory Committee' AND active = 1 ORDER BY name",
+            (pid,),
+        )
+        body = f"""
+<section class="panel narrow">
+  <div class="section-head"><h2>Apri nuovo fascicolo deal</h2></div>
+  <form class="form-grid" method="post" action="/deals/create">
+    {hidden_ctx(ctx)}
+    <label>Titolo deal<input name="title" required placeholder="Nome offerta"></label>
+    <label>Proponente<select name="proponent_id" required>{option_rows(proponents, '')}</select></label>
+    <label>Target raccolta<input name="funding_target" type="number" min="0" step="1000" value="500000"></label>
+    <label>Relatore Comitato Tecnico<select name="technical_reviewer_id">{option_rows(tech, '')}</select></label>
+    <label>Relatore Advisory Committee<select name="covi_reviewer_id">{option_rows(covi, '')}</select></label>
+    <label>Contratto<select name="contract_required"><option value="1">Richiesto</option><option value="0">Non necessario</option></select></label>
+    <div class="form-actions"><button class="button primary" type="submit">Crea deal</button></div>
+  </form>
+</section>
+"""
+        self.render("Nuovo deal", body, "deals")
+
+    def page_deal_detail(self, deal_id):
+        ctx = self.get_ctx()
+        deal = fetch_deal(deal_id)
+        if not deal:
+            self.not_found()
+            return
+        requirements = rows("SELECT * FROM deal_requirements WHERE deal_id = ? ORDER BY kind, category, id", (deal_id,))
+        verifications = rows("SELECT * FROM verifications WHERE deal_id = ? ORDER BY id", (deal_id,))
+        docs = rows("SELECT * FROM documents WHERE deal_id = ? ORDER BY created_at DESC", (deal_id,))
+        opinions = rows(
+            """
+            SELECT o.*, m.name AS reviewer_name, doc.title AS document_title
+            FROM committee_opinions o
+            LEFT JOIN committee_members m ON m.id = o.reviewer_member_id
+            LEFT JOIN documents doc ON doc.id = o.generated_document_id
+            WHERE o.deal_id = ?
+            ORDER BY o.created_at DESC
+            """,
+            (deal_id,),
+        )
+        decisions = rows("SELECT * FROM board_decisions WHERE deal_id = ? ORDER BY created_at DESC", (deal_id,))
+        audit = rows(
+            """
+            SELECT a.*, u.name AS actor_name
+            FROM audit_log a
+            LEFT JOIN users u ON u.id = a.actor_id
+            WHERE a.entity_type = 'deal' AND a.entity_id = ?
+            ORDER BY a.created_at DESC
+            LIMIT 12
+            """,
+            (deal_id,),
+        )
+        body = f"""
+<section class="deal-header">
+  <div>
+    <p class="eyebrow">{esc(deal['proponent_name'])} - {money(deal['funding_target'])}</p>
+    <h2>{esc(deal['title'])}</h2>
+  </div>
+  <div class="header-badges">
+    <span class="badge {badge_class(status_for_phase(deal['phase']))}">{esc(status_for_phase(deal['phase']))}</span>
+    <span class="badge neutral">{esc(phase_label(deal['phase']))}</span>
+  </div>
+</section>
+{self.phase_stepper(deal['phase'])}
+<section class="workspace-grid">
+  <div class="panel">
+    <div class="section-head"><h2>Responsabilita</h2></div>
+    <dl class="definition-list">
+      <dt>Relatore Comitato Tecnico</dt><dd>{esc(deal['technical_reviewer_name'] or '-')}</dd>
+      <dt>Relatore Advisory Committee</dt><dd>{esc(deal['covi_reviewer_name'] or '-')}</dd>
+      <dt>KIIS</dt><dd>{esc(deal['kiis_state'])}</dd>
+      <dt>Contratto</dt><dd>{'Richiesto' if deal['contract_required'] else 'Non necessario'}</dd>
+    </dl>
+  </div>
+  <div class="panel">
+    <div class="section-head"><h2>Azioni fase</h2></div>
+    {self.phase_actions(ctx, deal, requirements, verifications, docs)}
+  </div>
+</section>
+<section class="panel">
+  <div class="section-head"><h2>Documentazione richiesta</h2></div>
+  {self.requirements_table(ctx, deal, requirements)}
+</section>
+<section class="panel">
+  <div class="section-head"><h2>Verifiche art. 5 e controlli</h2></div>
+  {self.verifications_table(ctx, deal, verifications)}
+</section>
+<section class="workspace-grid">
+  <div class="panel">
+    <div class="section-head"><h2>Pareri comitati</h2></div>
+    {self.opinions_panel(ctx, deal, opinions)}
+  </div>
+  <div class="panel">
+    <div class="section-head"><h2>CdA</h2></div>
+    {self.board_panel(ctx, deal, decisions)}
+  </div>
+</section>
+<section class="workspace-grid">
+  <div class="panel">
+    <div class="section-head"><h2>Fascicolo documenti</h2></div>
+    {self.documents_for_deal(ctx, deal, docs)}
+  </div>
+  <div class="panel">
+    <div class="section-head"><h2>Audit trail</h2></div>
+    {self.audit_table(audit)}
+  </div>
+</section>
+"""
+        self.render(deal["title"], body, "deals")
+
+    def phase_stepper(self, current):
+        keys = [
+            "appena_caricato",
+            "istruttoria_documentazione",
+            "verifiche",
+            "comitato_tecnico",
+            "covi",
+            "cda",
+            "integrazione_documenti",
+            "contratto",
+            "pre_pubblicazione",
+            "pubblicato",
+        ]
+        compact_labels = {
+            "appena_caricato": "Caricato",
+            "istruttoria_documentazione": "Istruttoria doc.",
+            "comitato_tecnico": "Comitato Tec.",
+            "integrazione_documenti": "Integrazione doc.",
+            "pre_pubblicazione": "Pre-pubbl.",
+        }
+        cur = PHASE_INDEX.get(current, 0)
+        chunks = []
+        for key in keys:
+            if key == "integrazione_documenti" and current != key:
+                css = "optional"
+            elif PHASE_INDEX[key] < cur:
+                css = "done"
+            elif key == current:
+                css = "current"
+            else:
+                css = "future"
+            chunks.append(f'<li class="{css}"><span></span>{esc(compact_labels.get(key, phase_label(key)))}</li>')
+        return f'<ol class="stepper">{"".join(chunks)}</ol>'
+
+    def requirements_table(self, ctx, deal, requirements):
+        can = user_can(ctx["user"], "edit_requirement")
+        rows_html = []
+        for req in requirements:
+            status = "Completato" if req["completed"] else "Aperto"
+            action = ""
+            if can:
+                button = "Riapri" if req["completed"] else "Completa"
+                next_value = "0" if req["completed"] else "1"
+                action = f"""
+                <form method="post" action="/deals/{deal['id']}/requirement" class="inline-form">
+                  {hidden_ctx(ctx)}
+                  <input type="hidden" name="requirement_id" value="{req['id']}">
+                  <button class="button ghost" name="completed" value="{next_value}" type="submit">{button}</button>
+                </form>"""
+            rows_html.append(
+                f"""<tr>
+                  <td>{esc(req['kind'])}</td>
+                  <td>{esc(req['category'])}</td>
+                  <td>{esc(req['label'])}</td>
+                  <td><span class="badge {badge_class(status)}">{status}</span></td>
+                  <td>{action}</td>
+                </tr>"""
+            )
+        return f"""<table class="data-table">
+        <thead><tr><th>Tipo</th><th>Categoria</th><th>Elemento</th><th>Stato</th><th></th></tr></thead>
+        <tbody>{''.join(rows_html)}</tbody></table>"""
+
+    def verifications_table(self, ctx, deal, verifications):
+        can = user_can(ctx["user"], "verify")
+        rows_html = []
+        for ver in verifications:
+            action = ""
+            if can and PHASE_INDEX.get(deal["phase"], 0) >= PHASE_INDEX["verifiche"]:
+                action = f"""
+                <form method="post" action="/deals/{deal['id']}/verification" class="verification-form">
+                  {hidden_ctx(ctx)}
+                  <input type="hidden" name="verification_id" value="{ver['id']}">
+                  <select name="status">
+                    <option value="pending" {'selected' if ver['status'] == 'pending' else ''}>In attesa</option>
+                    <option value="ok" {'selected' if ver['status'] == 'ok' else ''}>OK</option>
+                    <option value="issue" {'selected' if ver['status'] == 'issue' else ''}>Criticita</option>
+                  </select>
+                  <input name="result" value="{esc(ver['result'])}" placeholder="Esito sintetico">
+                  <button class="button ghost" type="submit">Salva</button>
+                </form>"""
+            rows_html.append(
+                f"""<tr>
+                  <td>{esc(ver['area'])}</td>
+                  <td><span class="badge {badge_class(ver['status'])}">{esc(ver['status'])}</span></td>
+                  <td>{esc(ver['result'] or '-')}</td>
+                  <td>{action}</td>
+                </tr>"""
+            )
+        return f"""<table class="data-table">
+        <thead><tr><th>Area</th><th>Stato</th><th>Esito</th><th>Azione</th></tr></thead>
+        <tbody>{''.join(rows_html)}</tbody></table>"""
+
+    def opinions_panel(self, ctx, deal, opinions):
+        existing = "".join(
+            f"""<tr>
+              <td>{esc(op['committee'])}</td><td>{esc(op['reviewer_name'] or '-')}</td>
+              <td><span class="badge {badge_class(op['outcome'])}">{esc(op['outcome'])}</span></td>
+              <td><a href="{rel_url('/documents/' + str(op['generated_document_id']) + '/download', ctx)}">{esc(op['document_title'] or 'Documento')}</a></td>
+            </tr>"""
+            for op in opinions
+        )
+        table = (
+            f"""<table class="data-table compact"><thead><tr><th>Comitato</th><th>Relatore</th><th>Esito</th><th>Documento</th></tr></thead><tbody>{existing}</tbody></table>"""
+            if existing
+            else '<p class="muted">Nessun parere generato.</p>'
+        )
+        form = ""
+        if deal["phase"] == "comitato_tecnico":
+            form = self.opinion_form(ctx, deal, "Comitato Tecnico", "technical_opinion", "Genera parere e invia ad Advisory Committee")
+        elif deal["phase"] == "covi":
+            form = self.opinion_form(ctx, deal, "Advisory Committee", "covi_opinion", "Genera parere e invia al CdA")
+        return table + form
+
+    def opinion_form(self, ctx, deal, committee, permission, button_label):
+        if not user_can(ctx["user"], permission):
+            return f'<p class="muted">In attesa del ruolo: {esc(ROLE_LABELS.get(permission, committee))}.</p>'
+        members = rows(
+            "SELECT * FROM committee_members WHERE platform_id = ? AND committee = ? AND active = 1 ORDER BY name",
+            (deal["platform_id"], committee),
+        )
+        selected = deal["technical_reviewer_id"] if committee == "Comitato Tecnico" else deal["covi_reviewer_id"]
+        return f"""
+        <form class="stacked-form bordered" method="post" action="/deals/{deal['id']}/opinion">
+          {hidden_ctx(ctx)}
+          <input type="hidden" name="committee" value="{esc(committee)}">
+          <label>Relatore<select name="reviewer_member_id">{option_rows(members, selected)}</select></label>
+          <label>Esito<select name="outcome"><option>Favorevole</option><option>Favorevole con condizioni</option><option>Non favorevole</option></select></label>
+          <label>Valutazione<textarea name="summary" rows="5" required placeholder="Valutazione del progetto, presidi e condizioni"></textarea></label>
+          <button class="button primary" type="submit">{esc(button_label)}</button>
+        </form>"""
+
+    def board_panel(self, ctx, deal, decisions):
+        decision_rows = "".join(
+            f"""<tr>
+              <td>{esc(nice_date(d['created_at']))}</td>
+              <td><span class="badge {badge_class(d['outcome'])}">{esc(d['outcome'])}</span></td>
+              <td>{'Si' if d['integration_required'] else 'No'}</td>
+              <td><a href="{rel_url('/documents/' + str(d['generated_document_id']) + '/download', ctx)}">Delibera</a></td>
+            </tr>"""
+            for d in decisions
+        )
+        table = (
+            f"""<table class="data-table compact"><thead><tr><th>Data</th><th>Esito</th><th>Integrazione</th><th>Documento</th></tr></thead><tbody>{decision_rows}</tbody></table>"""
+            if decision_rows
+            else '<p class="muted">Nessuna delibera registrata.</p>'
+        )
+        form = ""
+        if deal["phase"] == "cda":
+            if user_can(ctx["user"], "board_decision"):
+                form = f"""
+                <form class="stacked-form bordered" method="post" action="/deals/{deal['id']}/board-decision">
+                  {hidden_ctx(ctx)}
+                  <label>Esito
+                    <select name="outcome">
+                      <option value="Approvato">Approvato</option>
+                      <option value="Approvato con integrazioni">Approvato con integrazioni</option>
+                      <option value="Non approvato">Non approvato</option>
+                    </select>
+                  </label>
+                  <label>Note delibera<textarea name="notes" rows="5" required></textarea></label>
+                  <button class="button primary" type="submit">Registra delibera</button>
+                </form>"""
+            else:
+                form = '<p class="muted">Delibera riservata al ruolo CdA.</p>'
+        return table + form
+
+    def documents_for_deal(self, ctx, deal, docs):
+        rows_html = "".join(
+            f"""<tr>
+              <td>{esc(d['category'])}</td>
+              <td><a href="{rel_url('/documents/' + str(d['id']) + '/download', ctx)}">{esc(d['title'])}</a></td>
+              <td>{'Generato' if d['generated'] else 'Caricato'}</td>
+              <td>{esc(nice_date(d['created_at']))}</td>
+            </tr>"""
+            for d in docs
+        )
+        upload = ""
+        if user_can(ctx["user"], "upload_document"):
+            upload = f"""
+            <form class="upload-form" method="post" action="/deals/{deal['id']}/upload" enctype="multipart/form-data">
+              {hidden_ctx(ctx)}
+              <label>Titolo<input name="title" required></label>
+              <label>Categoria<select name="category"><option>Documentazione</option><option>KYC</option><option>KIIS</option><option>Contratto</option><option>Atto societario</option><option>Altro</option></select></label>
+              <label>File<input name="file" type="file" required></label>
+              <button class="button ghost" type="submit">Carica</button>
+            </form>"""
+        report = f"""
+        <form method="post" action="/deals/{deal['id']}/generate-report" class="inline-form top-gap">
+          {hidden_ctx(ctx)}
+          <button class="button secondary" type="submit">Genera report iter</button>
+        </form>"""
+        return f"""<table class="data-table compact"><thead><tr><th>Categoria</th><th>Titolo</th><th>Origine</th><th>Data</th></tr></thead><tbody>{rows_html}</tbody></table>{upload}{report}"""
+
+    def audit_table(self, audit):
+        rows_html = "".join(
+            f"""<tr><td>{esc(nice_date(a['created_at']))}</td><td>{esc(a['actor_name'] or '-')}</td><td>{esc(a['action'])}</td><td>{esc(a['details'])}</td></tr>"""
+            for a in audit
+        )
+        return f"""<table class="data-table compact"><thead><tr><th>Quando</th><th>Chi</th><th>Azione</th><th>Dettagli</th></tr></thead><tbody>{rows_html}</tbody></table>"""
+
+    def phase_actions(self, ctx, deal, requirements, verifications, docs):
+        phase = deal["phase"]
+        if phase in {"comitato_tecnico", "covi", "cda"}:
+            return '<p class="muted">La fase avanza con il documento prodotto dal ruolo competente.</p>'
+        if phase == "respinta":
+            return '<p class="muted">Deal respinto dal CdA.</p>'
+        if phase == "archiviato":
+            return '<p class="muted">Deal chiuso.</p>'
+        actions = {
+            "appena_caricato": ("istruttoria_documentazione", "Apri istruttoria documentale"),
+            "istruttoria_documentazione": ("verifiche", "Passa a verifiche"),
+            "verifiche": ("comitato_tecnico", "Invia a Comitato Tecnico"),
+            "integrazione_documenti": ("contratto" if deal["contract_required"] else "pre_pubblicazione", "Chiudi integrazioni"),
+            "contratto": ("pre_pubblicazione", "Vai a pre-pubblicazione"),
+            "pre_pubblicazione": ("pubblicato", "Pubblica offerta"),
+        }
+        if phase not in actions:
+            return '<p class="muted">Nessuna azione manuale disponibile.</p>'
+        if not user_can(ctx["user"], "finalize") and phase not in {"appena_caricato", "istruttoria_documentazione", "verifiche"}:
+            return '<p class="muted">Ruolo non abilitato all avanzamento manuale.</p>'
+        target, label = actions[phase]
+        return f"""
+        <form method="post" action="/deals/{deal['id']}/transition" class="stacked-form">
+          {hidden_ctx(ctx)}
+          <input type="hidden" name="target_phase" value="{target}">
+          <button class="button primary" type="submit">{esc(label)}</button>
+        </form>
+        <a class="button secondary" href="{rel_url('/deals/' + str(deal['id']) + '/report', ctx)}">Vista report</a>
+        """
+
+    def page_deal_report(self, deal_id):
+        ctx = self.get_ctx()
+        report_html = build_iter_report(deal_id)
+        body = f"""
+<section class="panel">
+  <div class="section-head">
+    <h2>Report iter</h2>
+    <form method="post" action="/deals/{deal_id}/generate-report">
+      {hidden_ctx(ctx)}
+      <button class="button primary" type="submit">Salva nel fascicolo</button>
+    </form>
+  </div>
+  <iframe class="report-frame" srcdoc="{esc(report_html)}"></iframe>
+</section>
+"""
+        self.render("Report iter", body, "deals")
+
+    def page_compagine(self):
+        ctx = self.get_ctx()
+        pid = ctx["platform_id"]
+        params = parse_qs(urlparse(self.path).query)
+        active_tab = (params.get("tab") or ["organigramma"])[0]
+        if active_tab not in {"organigramma", "anagrafiche"}:
+            active_tab = "organigramma"
+        selected_person = (params.get("person") or [""])[0]
+        selected_role = (params.get("role") or [""])[0]
+        selected_shareholder_id = int((params.get("shareholder") or ["0"])[0] or 0)
+        members = rows("SELECT * FROM committee_members WHERE platform_id = ? ORDER BY committee, name", (pid,))
+        shareholders = rows("SELECT * FROM shareholders WHERE platform_id = ? ORDER BY stake_percent DESC", (pid,))
+        selected_shareholder = row(
+            "SELECT * FROM shareholders WHERE id = ? AND platform_id = ?",
+            (selected_shareholder_id, pid),
+        ) if selected_shareholder_id else None
+        agreements = rows("SELECT * FROM person_agreements WHERE platform_id = ? ORDER BY person_name, agreement_type", (pid,))
+        docs = rows("SELECT * FROM documents WHERE platform_id = ? AND origin = 'Compagine' ORDER BY created_at DESC", (pid,))
+        balance_docs = [d for d in docs if d["category"] in {"Bilancio", "Situazione contabile", "Relazione revisore", "Prospetto requisiti prudenziali", "Polizza assicurativa"}]
+        authorization_keywords = [
+            "domanda autorizzazione",
+            "autorizzazione ecsp",
+            "programma attivita",
+            "programma di attivita",
+            "allegato autorizzazione",
+            "governance autorizzazione",
+            "controlli interni",
+            "requisiti esponenti",
+            "partecipazioni qualificate",
+            "organigramma",
+            "outsourcing autorizzazione",
+            "ricevuta autorita",
+            "consob",
+            "banca d'italia",
+        ]
+        authorization_docs = [
+            d for d in docs
+            if d["category"] in {"Domanda autorizzazione ECSP", "Allegato autorizzazione", "Programma attivita", "Ricevuta autorita", "Governance autorizzazione"}
+            or any(keyword in f"{d['title']} {d['category']}".lower() for keyword in authorization_keywords)
+        ]
+        authorization_doc_ids = {d["id"] for d in authorization_docs}
+        balance_doc_ids = {d["id"] for d in balance_docs}
+        corporate_docs = [
+            d for d in docs
+            if d["id"] not in authorization_doc_ids
+            and d["id"] not in balance_doc_ids
+            and d["category"] not in {"Bilancio", "Situazione contabile", "Relazione revisore", "Prospetto requisiti prudenziali", "Polizza assicurativa"}
+        ]
+        suppliers = rows("SELECT * FROM suppliers WHERE platform_id = ? ORDER BY name", (pid,))
+        supplier_contracts = rows(
+            """
+            SELECT sc.*, s.name AS supplier_name, s.service_area, doc.title AS doc_title
+            FROM supplier_contracts sc
+            JOIN suppliers s ON s.id = sc.supplier_id
+            LEFT JOIN documents doc ON doc.id = sc.document_id
+            WHERE sc.platform_id = ?
+            ORDER BY sc.end_date, s.name
+            """,
+            (pid,),
+        )
+        person_docs = rows(
+            """
+            SELECT pd.*, doc.id AS doc_id, doc.title AS doc_title
+            FROM person_documents pd
+            LEFT JOIN documents doc ON doc.id = pd.document_id
+            WHERE pd.platform_id = ? AND pd.person_name = ?
+            ORDER BY pd.created_at DESC
+            """,
+            (pid, selected_person),
+        ) if selected_person else []
+        shareholder_docs = rows(
+            """
+            SELECT sd.*, doc.id AS doc_id, doc.title AS doc_title
+            FROM shareholder_documents sd
+            LEFT JOIN documents doc ON doc.id = sd.document_id
+            WHERE sd.platform_id = ? AND sd.shareholder_id = ?
+            ORDER BY sd.created_at DESC
+            """,
+            (pid, selected_shareholder_id),
+        ) if selected_shareholder else []
+        custom_functions = rows(
+            """
+            SELECT * FROM org_functions
+            WHERE platform_id = ? AND active = 1
+            ORDER BY area, function_name
+            """,
+            (pid,),
+        )
+        org_assignments = rows(
+            """
+            SELECT oa.*, doc.title AS doc_title
+            FROM org_assignments oa
+            LEFT JOIN documents doc ON doc.id = oa.document_id
+            WHERE oa.platform_id = ?
+            ORDER BY oa.function_name, oa.subject_name
+            """,
+            (pid,),
+        )
+        active_assignments_by_function = {}
+        assignment_by_pair = {}
+        assignment_status_by_pair = {}
+        subject_type_by_name = {}
+        for assignment in org_assignments:
+            pair = (assignment["subject_name"], assignment["function_name"])
+            assignment_status_by_pair[pair] = assignment["status"]
+            subject_type_by_name[assignment["subject_name"]] = assignment["subject_type"]
+            if assignment["status"] == "Attivo":
+                active_assignments_by_function.setdefault(assignment["function_name"], []).append(assignment)
+                assignment_by_pair[pair] = assignment
+        removed_assignment_pairs = {
+            pair for pair, status in assignment_status_by_pair.items()
+            if status in {"Archiviato", "Rimosso"}
+        }
+        groups = {}
+        for member in members:
+            groups.setdefault(member["committee"], []).append(member)
+        compliance_user = row("SELECT * FROM users WHERE role = 'compliance' ORDER BY id LIMIT 1")
+        legal_user = row("SELECT * FROM users WHERE role = 'legal' ORDER BY id LIMIT 1")
+        is_isi = ctx["platform"]["code"] == "ISI"
+        isi_function_owners = {
+            "Legale rappresentante": "Antonio Ottaiano",
+            "Revisore dei conti": "Luca Porta",
+            "Gestione reclami e default": "Sebastian Caputo",
+            "Conflitti di interesse": "Renato d'Alessandro",
+            "Continuita operativa": "Antonio Ottaiano",
+            "Prevenzione frodi": "Renato d'Alessandro",
+            "Whistleblowing": "Emma Venturelli",
+            "Privacy e archiviazione": "Renato d'Alessandro",
+            "Contabilita": "Sebastian Caputo",
+            "Compliance interna": "Renato d'Alessandro",
+            "Antiriciclaggio / antiterrorismo": "Renato d'Alessandro",
+            "Risk control": "Renato d'Alessandro",
+            "Questionario appropriatezza": "Renato d'Alessandro",
+            "Responsabile outsourcing": "Michele Mattera",
+            "Presidio demo architettura": "Mario Rossi",
+            "Sviluppatore software": "Daniele Santandrea",
+            "Customer service": "Giuseppina Scatozza",
+            "Marketing": "Tecnotravel Group S.r.l.S.",
+        }
+
+        def person_url(name, role_label):
+            return rel_url("/compagine", ctx, {"person": name, "role": role_label})
+
+        def shareholder_url(shareholder_id):
+            return rel_url("/compagine", ctx, {"shareholder": shareholder_id})
+
+        def anagraphic_person_url(name):
+            return rel_url("/compagine", ctx, {"tab": "anagrafiche", "person": name, "role": "Anagrafica organigramma"})
+
+        def person_link(name, role_label):
+            return f'<a href="{person_url(name, role_label)}">{esc(name)}</a>'
+
+        def names_for(group_name):
+            names = [m["name"] for m in groups.get(group_name, []) if m["active"]]
+            return ", ".join(names)
+
+        def owner_for(label, fallback=""):
+            if is_isi and label in isi_function_owners:
+                return isi_function_owners[label]
+            return fallback
+
+        def org_node(label, people):
+            if isinstance(people, str):
+                people = [name.strip() for name in people.split(",") if name.strip()]
+            people = [p for p in people if p]
+            css = "org-node" if people else "org-node empty"
+            shown = ", ".join(person_link(p, label) for p in people) if people else "da assegnare"
+            return f'<div class="{css}"><span>{esc(label)}</span><strong>{shown}</strong></div>'
+
+        def node_controls(label):
+            return f"""<div class="node-actions" aria-label="Azioni {esc(label)}">
+              <button type="button" title="Aggiungi soggetto" data-open-assignment data-function="{esc(label)}">+</button>
+            </div>"""
+
+        person_registry = {}
+        supplier_registry = {}
+        function_catalog = []
+        rendered_function_labels = set()
+
+        def responsibility_node(label, owner, note="", kind="function", href=""):
+            owner = owner or ""
+            owners = [part.strip() for part in owner.split(",") if part.strip()]
+            owners = [name for name in owners if (name, label) not in removed_assignment_pairs]
+            for assignment in active_assignments_by_function.get(label, []):
+                if assignment["subject_name"] not in owners:
+                    owners.append(assignment["subject_name"])
+            css = f"responsibility-node {kind}" + ("" if owners else " empty")
+            rendered_function_labels.add(label)
+            function_catalog.append({
+                "label": label,
+                "kind": kind,
+                "note": note,
+                "owners": owners,
+                "href": href,
+            })
+            def owner_chip(name):
+                if kind == "outsourcing":
+                    supplier_registry.setdefault(name, {"name": name, "functions": [], "href": href})
+                    supplier_registry[name]["functions"].append(label)
+                else:
+                    person_registry.setdefault(name, {"name": name, "type": subject_type_by_name.get(name, "Persona fisica"), "functions": [], "roles": set()})
+                    person_registry[name]["functions"].append(label)
+                    person_registry[name]["roles"].add(kind)
+                linked_name = f'<a href="{href}">{esc(name)}</a>' if href and kind == "outsourcing" else person_link(name, label)
+                return linked_name
+
+            owner_html = ", ".join(owner_chip(name) for name in owners) if owners else '<span class="empty-owner">da censire</span>'
+            source_link = f'<a class="node-source-link" href="{href}">archivio</a>' if href else ""
+            return f"""<div class="{css}">
+              <div class="node-topline"><span>{esc(label)}</span>{node_controls(label)}</div>
+              <strong>{owner_html}</strong>
+              <small>{esc(note)}</small>
+              <div class="node-bottom-actions"><button type="button" title="Elimina blocco" data-delete-block data-function="{esc(label)}">-</button></div>
+              {source_link}
+            </div>"""
+
+        def custom_nodes_for(area):
+            return [
+                responsibility_node(
+                    item["function_name"],
+                    "",
+                    item["note"] or "Funzione censita manualmente: collegare soggetti, date e contratti.",
+                    item["kind"] or self.org_kind_for_area(item["area"]),
+                )
+                for item in custom_functions
+                if item["area"] == area and item["function_name"] not in rendered_function_labels
+            ]
+
+        def outsourcing_node(contract):
+            href = rel_url("/documents", ctx, {"origin": "Contratto fornitore"})
+            return f"""<a class="responsibility-node outsourcing" href="{href}">
+              <span>{esc(contract['contract_type'])}</span>
+              <strong>{esc(contract['supplier_name'])}</strong>
+              <small>{esc(contract['service_area'] or contract['title'])} - {esc(contract['status'])}</small>
+            </a>"""
+
+        def supplier_slot(label, keywords, fallback_note, kind="outsourcing"):
+            haystack_items = []
+            for contract in supplier_contracts:
+                haystack_items.append(
+                    (
+                        contract,
+                        f"{contract['title']} {contract['contract_type']} {contract['supplier_name']} {contract['service_area']}".lower(),
+                    )
+                )
+            for supplier in suppliers:
+                haystack_items.append(
+                    (
+                        supplier,
+                        f"{supplier['name']} {supplier['service_area']} {supplier['notes']}".lower(),
+                    )
+                )
+            scored = [
+                (sum(1 for keyword in keywords if keyword in hay), item)
+                for item, hay in haystack_items
+            ]
+            score, match = max(scored, key=lambda scored_item: scored_item[0]) if scored else (0, None)
+            if score == 0:
+                match = None
+            href = rel_url("/documents", ctx, {"origin": "Contratto fornitore"})
+            if match:
+                name = match["supplier_name"] if "supplier_name" in match.keys() else match["name"]
+                detail = match["service_area"] or (match["title"] if "title" in match.keys() else "")
+                status = match["status"] if "status" in match.keys() else ""
+                return responsibility_node(label, name, f"{detail}{(' - ' + status) if status else ''}", kind, href)
+            return responsibility_node(label, "", fallback_note, kind)
+
+        def supplier_named_node(label, supplier_name, fallback_note, kind="outsourcing"):
+            match = next((supplier for supplier in suppliers if supplier["name"] == supplier_name), None)
+            if not match:
+                return responsibility_node(label, supplier_name, fallback_note, kind)
+            href = rel_url("/documents", ctx, {"origin": "Contratto fornitore"})
+            return responsibility_node(label, match["name"], f"{match['service_area'] or fallback_note} - {match['status']}", kind, href)
+
+        def responsibility_group(title, kicker, nodes):
+            return f"""<section class="responsibility-group" data-group-name="{esc(title)}">
+              <div class="responsibility-head">
+                <div><h3>{esc(title)}</h3><span>{esc(kicker)}</span></div>
+                <div class="group-actions"><button class="drag-handle" type="button" title="Sposta blocco" draggable="true">::</button><button type="button" title="Aggiungi blocco" data-open-block data-lock-group="true" data-group="{esc(title)}">+</button></div>
+              </div>
+              <div class="responsibility-list">{''.join(nodes)}</div>
+            </section>"""
+
+        def committee_column(name, caption):
+            group = groups.get(name, [])
+            if group:
+                member_html = "".join(
+                    f"""<li>
+                      <strong>{person_link(m['name'], m['role'])}</strong>
+                      <span>{esc(m['role'])}</span>
+                      <small>{esc(m['email'])}</small>
+                    </li>"""
+                    for m in group
+                )
+            else:
+                member_html = '<li class="empty-row">Nessun membro.</li>'
+            return f"""<div class="committee-column">
+              <p class="panel-kicker">{esc(caption)}</p>
+              <ul class="committee-list">{member_html}</ul>
+              <button class="button ghost" type="button">+ Membro</button>
+            </div>"""
+
+        shareholder_cards = "".join(
+            f"""<div class="shareholder-row">
+              <a class="shareholder-main" href="{shareholder_url(s['id'])}">
+                <strong>{esc(s['name'])}</strong>
+                <small>{esc(s['subject_type'])} - {esc(s['legal_form'] or 'forma da censire')} - {esc(s['notes'] or 'profilo da completare')}</small>
+              </a>
+              <form class="shareholder-meta shareholder-percent-form" method="post" action="/shareholders/{s['id']}/update">
+                {hidden_ctx(ctx)}
+                <input type="hidden" name="name" value="{esc(s['name'])}">
+                <input type="hidden" name="subject_type" value="{esc(s['subject_type'])}">
+                <input type="hidden" name="legal_form" value="{esc(s['legal_form'])}">
+                <input type="hidden" name="tax_id" value="{esc(s['tax_id'])}">
+                <input type="hidden" name="contact_email" value="{esc(s['contact_email'])}">
+                <input type="hidden" name="phone" value="{esc(s['phone'])}">
+                <input type="hidden" name="address" value="{esc(s['address'])}">
+                <input type="hidden" name="beneficial_owners" value="{esc(s['beneficial_owners'])}">
+                <input type="hidden" name="requisites_status" value="{esc(s['requisites_status'])}">
+                <input type="hidden" name="status" value="{esc(s['status'])}">
+                <input type="hidden" name="notes" value="{esc(s['notes'])}">
+                <label><span>Quota %</span><input type="number" step="0.01" min="0" max="100" name="stake_percent" value="{s['stake_percent']:.2f}"></label>
+                <span class="badge {badge_class(s['requisites_status'])}">{esc(s['requisites_status'])}</span>
+                <button type="submit">Salva</button>
+              </form>
+            </div>"""
+            for s in shareholders
+        ) or '<p class="empty-state">Nessun partecipante qualificato.</p>'
+        doc_cards = "".join(
+            f"""<div class="document-row">
+              <div><strong>{esc(d['title'])}</strong><span>{esc(d['category'])} - {esc(nice_date(d['created_at']))}</span></div>
+              <a class="button ghost" href="{rel_url('/documents/' + str(d['id']) + '/download', ctx)}">Apri</a>
+            </div>"""
+            for d in corporate_docs
+        ) or '<p class="empty-state">Nessun atto societario puro registrato. Domanda, allegati autorizzativi e bilanci sono organizzati nei fascicoli dedicati sotto.</p>'
+        balance_cards = "".join(
+            f"""<div class="document-row">
+              <div><strong>{esc(d['title'])}</strong><span>{esc(d['category'])} - {esc(nice_date(d['created_at']))}</span></div>
+              <a class="button ghost" href="{rel_url('/documents/' + str(d['id']) + '/download', ctx)}">Apri</a>
+            </div>"""
+            for d in balance_docs
+        ) or '<p class="empty-state">Nessun bilancio o prospetto contabile caricato.</p>'
+        auth_requirements = [
+            ("Domanda autorizzazione ECSP", "Template/domanda firmata e versione inviata"),
+            ("Programma attivita", "Servizi ECSP, modello operativo, mercati e canali"),
+            ("Governance e controlli", "Organigramma, CdA, compliance, risk, AML, reclami"),
+            ("Requisiti esponenti e soci", "Fit & proper, partecipazioni qualificate, deleghe"),
+            ("Outsourcing e ICT", "Contratti critici, SLA, cloud, exit plan"),
+            ("Ricevute e scambi autorita", "PEC, protocolli, richieste integrazione, esiti"),
+        ]
+        auth_doc_cards = "".join(
+            f"""<div class="document-row auth-document-row">
+              <div><strong>{esc(d['title'])}</strong><span>{esc(d['category'])} - {esc(nice_date(d['created_at']))}</span></div>
+              <a class="button ghost" href="{rel_url('/documents/' + str(d['id']) + '/download', ctx)}">Apri</a>
+            </div>"""
+            for d in authorization_docs
+        ) or '<p class="empty-state">Nessuna domanda o allegato autorizzativo ancora caricato.</p>'
+        auth_check_rows = "".join(
+            f"""<li class="auth-check {'found' if any(req.lower().split()[0] in f"{d['title']} {d['category']}".lower() for d in authorization_docs) else 'missing'}">
+              <span></span>
+              <div><strong>{esc(req)}</strong><small>{esc(note)}</small></div>
+            </li>"""
+            for req, note in auth_requirements
+        )
+        context_links = [
+            (
+                "Domanda e allegati autorizzativi",
+                f"{len(authorization_docs)} documenti",
+                "Domanda, programma attivita, allegati, ricevute e scambi con Autorita.",
+                rel_url("/documents", ctx, {"origin": "Compagine", "category": "Domanda autorizzazione ECSP"}),
+            ),
+            (
+                "Organigramma e funzioni",
+                f"{len(members)} persone / funzioni",
+                "CdA, legale rappresentante, compliance, risk, AML, reclami e comitati.",
+                rel_url("/compagine", ctx),
+            ),
+            (
+                "Partecipazioni e accordi persona",
+                f"{len(shareholders)} soci qualificati / {len(agreements)} accordi",
+                "Partecipogramma, patti, incarichi, deleghe, NDA e requisiti dei titolari.",
+                rel_url("/documents", ctx, {"origin": "Persona"}),
+            ),
+            (
+                "Fornitori e contratti critici",
+                f"{len(supplier_contracts)} contratti",
+                "Outsourcing, ICT, KYC/AML, conservazione, SLA, DPA ed exit.",
+                rel_url("/documents", ctx, {"origin": "Contratto fornitore"}),
+            ),
+            (
+                "Bilanci e requisiti prudenziali",
+                f"{len(balance_docs)} documenti",
+                "Bilanci, situazione contabile, polizze e prospetti per CF1/comunicazioni.",
+                rel_url("/documents", ctx, {"origin": "Compagine", "category": "Bilancio"}),
+            ),
+        ]
+        context_matrix = "".join(
+            f"""<a class="context-link-card" href="{href}">
+              <span>{esc(title)}</span>
+              <strong>{esc(count)}</strong>
+              <small>{esc(description)}</small>
+            </a>"""
+            for title, count, description, href in context_links
+        )
+        cda_names = [m["name"] for m in groups.get("CdA", []) if m["active"]]
+        technical_members = [m for m in groups.get("Comitato Tecnico", []) if m["active"]]
+        technical_nodes = [
+            responsibility_node(
+                "Membri Comitato Tecnico",
+                ", ".join(m["name"] for m in technical_members),
+                "Valutazione offerte e pareri tecnici",
+                "committee",
+            )
+        ] if technical_members else [responsibility_node("Comitato tecnico progetti", "", "Membri da censire", "committee")]
+        advisory_members = [m for m in groups.get("Advisory Committee", []) if m["active"]]
+        advisory_nodes = [
+            responsibility_node(
+                "Membri Advisory Committee",
+                ", ".join(m["name"] for m in advisory_members),
+                "Approfondimento successivo alla valutazione tecnica",
+                "advisory",
+            )
+        ] if advisory_members else [responsibility_node("Advisory Committee", "", "Non presente su ISI Crowd" if is_isi else "Membri da censire", "advisory")]
+        if is_isi:
+            outsourcing_nodes = [
+                supplier_named_node("Fornitore servizi cloud", "Keliweb S.r.l.", "Cloud / hosting / infrastruttura"),
+                supplier_named_node("Merito creditizio", "Creditsafe Italia S.r.l.", "Provider merito creditizio"),
+                supplier_named_node("Istituto di pagamento", "Lemonway Sas", "Payment institution / PSP"),
+                supplier_named_node("Contabilita", "012 Factory S.r.l.", "Fornitore contabilita"),
+                supplier_named_node("Compliance esterna", "Avvocati.net", "Advisor compliance esterno"),
+                responsibility_node("Assicurazione / polizza", "", "Polizza professionale e coperture operative da censire", "outsourcing"),
+                responsibility_node("Firma e conservazione", "", "Da censire se distinto dai sistemi documentali", "outsourcing"),
+                responsibility_node("KYC / AML data provider", "", "Da censire se distinto da provider dati e AML", "outsourcing"),
+            ]
+            operational_nodes = [
+                responsibility_node("Sviluppatore software", owner_for("Sviluppatore software"), "Sviluppo e manutenzione piattaforma", "operational"),
+                responsibility_node("Customer service", owner_for("Customer service"), "Assistenza utenti", "operational"),
+                responsibility_node("Marketing", owner_for("Marketing"), "Comunicazioni commerciali e campagne", "operational"),
+            ]
+        else:
+            outsourcing_nodes = [
+                supplier_slot("Fornitore servizi cloud", ["isi cloud", "gestione infrastruttura", "cloud operations", "infrastruttura piattaforma", "servizi cloud", "infrastruttura", "hosting"], "Cloud / hosting / infrastruttura da censire"),
+                supplier_slot("Merito creditizio", ["merito", "credit", "creditsafe", "rating"], "Provider merito creditizio da censire"),
+                supplier_slot("Istituto di pagamento", ["pagamento", "payment", "lemonway", "istituto"], "Payment institution / PSP da censire"),
+                supplier_slot("Contabilita", ["contabil", "bilancio", "amministrazione"], "Fornitore contabilita da censire"),
+                supplier_slot("Compliance esterna", ["compliance", "legale", "avvocati", "consulenza"], "Advisor compliance/legale da censire"),
+                supplier_slot("Assicurazione / polizza", ["assicurazione", "polizza", "copertura", "professionale"], "Polizza professionale e coperture operative da censire"),
+                supplier_slot("Firma e conservazione", ["firma", "conservazione", "documentale", "archiviazione"], "Firma, conservazione e archivio documentale da censire"),
+                supplier_slot("KYC / AML data provider", ["kyc", "aml", "verifiche", "data provider"], "Provider KYC/AML da censire"),
+            ]
+            operational_nodes = [
+                supplier_slot("Sviluppatore software", ["software", "svilupp", "developer", "piattaforma"], "Da collegare a fornitore/contratto", "operational"),
+                supplier_slot("Customer service", ["customer service", "customer", "assistenza utenti"], "Assistenza investitori e proponenti da censire", "operational"),
+                supplier_slot("Marketing", ["marketing", "campagne", "comunicazioni commerciali"], "Comunicazioni commerciali e campagne da censire", "operational"),
+            ]
+        responsibility_map = "".join(
+            [
+                responsibility_group(
+                    "Governance",
+                    "organo e supervisione",
+                    [
+                        responsibility_node("Consiglio di Amministrazione", ", ".join(cda_names), "Organo di gestione", "governance"),
+                        responsibility_node("Legale rappresentante", owner_for("Legale rappresentante", cda_names[0] if cda_names else ""), "Firma, rappresentanza, deleghe", "governance"),
+                        responsibility_node("Revisore dei conti", owner_for("Revisore dei conti"), "Da collegare a incarico/revisione", "governance"),
+                    ] + custom_nodes_for("Governance"),
+                ),
+                responsibility_group(
+                    "Funzioni responsabili",
+                    "presidi interni",
+                    [
+                        responsibility_node("Gestione reclami e default", owner_for("Gestione reclami e default", compliance_user["name"] if compliance_user else ""), "Reclami, tassi di default, comunicazioni clienti", "function"),
+                        responsibility_node("Conflitti di interesse", owner_for("Conflitti di interesse", legal_user["name"] if legal_user else ""), "Policy conflitti, parti correlate, presidi", "function"),
+                        responsibility_node("Continuita operativa", owner_for("Continuita operativa", cda_names[0] if cda_names else ""), "BCP, incidenti, continuita servizi", "function"),
+                        responsibility_node("Prevenzione frodi", owner_for("Prevenzione frodi"), "Presidi antifrode e anomalie operative", "function"),
+                        responsibility_node("Whistleblowing", owner_for("Whistleblowing"), "Canali interni e segnalazioni", "function"),
+                        responsibility_node("Privacy e archiviazione", owner_for("Privacy e archiviazione", legal_user["name"] if legal_user else ""), "Privacy, conservazione, documentazione", "function"),
+                        responsibility_node("Contabilita", owner_for("Contabilita"), "Bilanci e dati prudenziali da collegare", "function"),
+                        responsibility_node("Presidio demo architettura", owner_for("Presidio demo architettura"), "Persona demo per verificare scheda, funzioni, accordi e documenti", "function"),
+                    ] + custom_nodes_for("Funzioni responsabili"),
+                ),
+                responsibility_group(
+                    "Area di controllo",
+                    "compliance, AML, risk",
+                    [
+                        responsibility_node("Compliance interna", owner_for("Compliance interna", compliance_user["name"] if compliance_user else ""), "Regole ECSP, controlli e monitoraggio", "control"),
+                        responsibility_node("Antiriciclaggio / antiterrorismo", owner_for("Antiriciclaggio / antiterrorismo", legal_user["name"] if legal_user else ""), "AML, KYC, questionario appropriatezza", "control"),
+                        responsibility_node("Risk control", owner_for("Risk control", names_for("Advisory Committee")), "Controlli interni e vigilanza", "control"),
+                        responsibility_node("Questionario appropriatezza", owner_for("Questionario appropriatezza"), "Presidio questionari e soglie investitori", "control"),
+                        responsibility_node("Responsabile outsourcing", owner_for("Responsabile outsourcing"), "Coordinamento fornitori critici", "control"),
+                    ] + custom_nodes_for("Area di controllo"),
+                ),
+                responsibility_group("Servizi in outsourcing", "fornitori critici", outsourcing_nodes + custom_nodes_for("Servizi in outsourcing")),
+                responsibility_group(
+                    "Comitato tecnico progetti",
+                    "valutazione offerte",
+                    technical_nodes + custom_nodes_for("Comitato tecnico progetti"),
+                ),
+                responsibility_group(
+                    "Advisory Committee",
+                    "approvazione successiva",
+                    advisory_nodes + custom_nodes_for("Advisory Committee"),
+                ),
+                responsibility_group(
+                    "Area operativa",
+                    "servizi e utenti",
+                    operational_nodes + custom_nodes_for("Area operativa"),
+                ),
+            ]
+        )
+        agreement_rows = "".join(
+            f"""<tr>
+              <td>{person_link(a['person_name'], a['role'])}</td>
+              <td>{esc(a['role'])}</td>
+              <td>{esc(a['agreement_type'])}</td>
+              <td>{esc(a['scope'])}</td>
+              <td><span class="badge {badge_class(a['status'])}">{esc(a['status'])}</span></td>
+              <td>{esc(nice_date(a['expires_at']))}</td>
+            </tr>"""
+            for a in agreements
+        )
+        anagraphic_agreement_rows = "".join(
+            f"""<tr>
+              <td>{person_link(a['person_name'], a['role'])}</td>
+              <td>{esc(a['agreement_type'])}</td>
+              <td>{esc(a['scope'])}</td>
+              <td>{esc(nice_date(a['expires_at']))}</td>
+            </tr>"""
+            for a in agreements
+        ) or '<tr><td colspan="4" class="empty-row">Nessun accordo collegato a funzioni.</td></tr>'
+        person_doc_rows = "".join(
+            f"""<div class="document-row">
+              <div>
+                <strong>{esc(pd['title'])}</strong>
+                <span>{esc(pd['document_type'])} - {esc(pd['counterparty'] or 'controparte non indicata')} - {esc(nice_date(pd['created_at']))}</span>
+              </div>
+              <a class="button ghost" href="{rel_url('/documents/' + str(pd['doc_id']) + '/download', ctx) if pd['doc_id'] else '#'}">Apri</a>
+            </div>"""
+            for pd in person_docs
+        ) or '<p class="empty-state">Nessun documento collegato a questa persona.</p>'
+        if selected_person == "Mario Rossi":
+            person_doc_rows = """
+            <div class="document-row">
+              <div>
+                <strong>Lettera di incarico - presidio demo</strong>
+                <span>Contratto / incarico - ISI Crowd - 15/06/2026</span>
+              </div>
+              <button class="button ghost" type="button" data-open-action data-action="Documento Mario Rossi">Apri</button>
+            </div>
+            <div class="document-row">
+              <div>
+                <strong>Delega operativa funzione demo</strong>
+                <span>Delega - Consiglio di Amministrazione - 15/06/2026</span>
+              </div>
+              <button class="button ghost" type="button" data-open-action data-action="Delega Mario Rossi">Apri</button>
+            </div>"""
+        def contract_alert(contract):
+            if contract["status"] == "Scaduto":
+                return "urgent", "scaduto"
+            try:
+                days = (date.fromisoformat(contract["end_date"]) - date.today()).days
+            except (TypeError, ValueError):
+                return "neutral", "senza scadenza"
+            if days < 0:
+                return "urgent", f"scaduto da {-days} gg"
+            if days <= 60:
+                return "soon", f"{days} gg"
+            return "ok", nice_date(contract["end_date"])
+
+        active_contracts = [c for c in supplier_contracts if c["status"] in {"Attivo", "In rinnovo", "Scaduto", "Da firmare"}]
+        contract_rows = "".join(
+            f"""<div class="contract-alert-row">
+              <div>
+                <strong>{esc(c['title'])}</strong>
+                <span>{esc(c['supplier_name'])} - {esc(c['contract_type'])}</span>
+              </div>
+              <div class="contract-alert-meta">
+                <span class="deadline-dot {contract_alert(c)[0]}"></span>
+                <strong>{esc(contract_alert(c)[1])}</strong>
+                <small>{esc(c['status'])}</small>
+              </div>
+            </div>"""
+            for c in active_contracts
+        ) or '<p class="empty-state">Nessun contratto attivo o in alert.</p>'
+        person_agreement_counts = {}
+        for agreement in agreements:
+            person_agreement_counts[agreement["person_name"]] = person_agreement_counts.get(agreement["person_name"], 0) + 1
+        person_document_counts = {}
+        for doc in rows("SELECT person_name, COUNT(*) AS c FROM person_documents WHERE platform_id = ? GROUP BY person_name", (pid,)):
+            person_document_counts[doc["person_name"]] = doc["c"]
+
+        supplier_contract_counts = {}
+        supplier_due_dates = {}
+        for contract in supplier_contracts:
+            supplier_contract_counts[contract["supplier_name"]] = supplier_contract_counts.get(contract["supplier_name"], 0) + 1
+            if contract["end_date"]:
+                current = supplier_due_dates.get(contract["supplier_name"])
+                supplier_due_dates[contract["supplier_name"]] = min(current, contract["end_date"]) if current else contract["end_date"]
+        subject_entries = []
+        for name, data in person_registry.items():
+            subject_entries.append({
+                "name": name,
+                "type": data.get("type") or subject_type_by_name.get(name, "Persona fisica"),
+                "functions": sorted(set(data["functions"])),
+                "agreements": person_agreement_counts.get(name, 0),
+                "documents": person_document_counts.get(name, 0),
+                "deadline": "",
+                "href": anagraphic_person_url(name),
+            })
+        for name, data in supplier_registry.items():
+            subject_entries.append({
+                "name": name,
+                "type": "Societa / ente",
+                "functions": sorted(set(data["functions"])),
+                "agreements": supplier_contract_counts.get(name, 0),
+                "documents": 0,
+                "deadline": supplier_due_dates.get(name, ""),
+                "href": data["href"] or rel_url("/documents", ctx, {"origin": "Contratto fornitore"}),
+            })
+        subject_directory = "".join(
+            f"""<tr class="subject-directory-row">
+              <td><a href="{entry['href']}"><strong>{esc(entry['name'])}</strong></a><br><span class="muted">{esc(entry['type'])}</span></td>
+              <td>{esc(', '.join(entry['functions']))}</td>
+              <td>{entry['agreements']}</td>
+              <td>{entry['documents']}</td>
+              <td>{esc(nice_date(entry['deadline']) or '-')}</td>
+              <td><span class="badge {badge_class('Attivo' if entry['functions'] else 'Da censire')}">{'Attivo' if entry['functions'] else 'Da censire'}</span></td>
+              <td><a class="button ghost" href="{entry['href']}">Apri</a></td>
+            </tr>"""
+            for entry in sorted(subject_entries, key=lambda item: (item["type"], item["name"]))
+        ) or '<tr><td colspan="7" class="empty-row">Nessun soggetto assegnato nell organigramma.</td></tr>'
+        subject_options = '<option value="">Seleziona soggetto in anagrafica</option>' + "".join(
+            f"""<option value="{esc(entry['name'])}"
+              data-type="{esc(entry['type'])}"
+              data-functions="{esc(', '.join(entry['functions']) or '-')}"
+              data-agreements="{entry['agreements']}"
+              data-documents="{entry['documents']}"
+              data-deadline="{esc(nice_date(entry['deadline']) or '-')}"
+              data-status="{'Attivo' if entry['functions'] else 'Da censire'}">{esc(entry['name'])} - {esc(entry['type'])}</option>"""
+            for entry in sorted(subject_entries, key=lambda item: item["name"])
+        )
+        kind_labels = {
+            "governance": "Governance",
+            "function": "Funzione responsabile",
+            "control": "Area di controllo",
+            "outsourcing": "Outsourcing / servizio",
+            "committee": "Comitato tecnico",
+            "advisory": "Advisory Committee",
+            "operational": "Area operativa",
+        }
+        unique_functions = {}
+        for item in function_catalog:
+            label = item["label"]
+            unique_functions.setdefault(label, {
+                "label": label,
+                "kind": kind_labels.get(item["kind"], item["kind"]),
+                "note": item["note"],
+                "owners": item["owners"],
+                "href": item["href"],
+            })
+        function_entries = sorted(unique_functions.values(), key=lambda item: (item["kind"], item["label"]))
+        function_kind_lookup = {item["label"]: item["kind"] for item in function_entries}
+        function_select_options = '<option value="">Seleziona funzione dall organigramma</option>' + "".join(
+            f'<option value="{esc(item["label"])}" data-area="{esc(item["kind"])}">{esc(item["label"])} - {esc(item["kind"])}</option>'
+            for item in function_entries
+        ) + '<option value="__new__">+ Nuova funzione non ancora in organigramma</option>'
+        function_options = "".join(
+            f'<option value="{esc(item["label"])}">{esc(item["kind"])}</option>'
+            for item in function_entries
+        )
+        document_catalog = []
+        for pd in person_docs:
+            document_catalog.append((pd["title"], f"{pd['document_type']} - {pd['counterparty'] or 'senza controparte'}"))
+        if selected_person == "Mario Rossi":
+            document_catalog.extend([
+                ("Lettera di incarico - presidio demo", "Contratto / incarico - scadenza 31/12/2027"),
+                ("Delega operativa funzione demo", "Delega - scadenza 30/06/2027"),
+            ])
+        for d in list(corporate_docs)[:6] + list(authorization_docs)[:6] + list(balance_docs)[:4]:
+            document_catalog.append((d["title"], f"{d['category']} - {nice_date(d['created_at'])}"))
+        for c in supplier_contracts[:8]:
+            document_catalog.append((c["title"], f"{c['supplier_name']} - scadenza {nice_date(c['end_date']) or 'non indicata'}"))
+        seen_docs = set()
+        document_options_parts = [
+            '<option value="">Nessun documento</option>',
+            '<option value="__upload__">Nuovo documento</option>',
+        ]
+        for title, detail in document_catalog:
+            if title in seen_docs:
+                continue
+            seen_docs.add(title)
+            document_options_parts.append(f'<option value="{esc(title)}">{esc(title)} - {esc(detail)}</option>')
+        document_options = "".join(document_options_parts)
+        selected_person_functions = sorted(set(person_registry.get(selected_person, {}).get("functions", [])))
+        def function_relation_meta(function_name):
+            assignment = assignment_by_pair.get((selected_person, function_name))
+            if assignment:
+                start = nice_date(assignment["start_date"]) if assignment["start_date"] else "--"
+                end = nice_date(assignment["end_date"]) if assignment["end_date"] else "--"
+                document_title = assignment["linked_document_title"] or assignment["doc_title"] or "Nessun documento collegato"
+                return {
+                    "role": assignment["role"] or "Da definire",
+                    "start_date": assignment["start_date"],
+                    "end_date": assignment["end_date"],
+                    "date_range": f"Dal {start} / al {end}",
+                    "document": document_title,
+                    "document_state": "linked" if assignment["linked_document_title"] or assignment["document_id"] else "missing",
+                    "deadline": nice_date(assignment["end_date"]) if assignment["end_date"] else "-",
+                    "context": assignment["notes"] or "Relazione salvata nel modello dati organigramma.",
+                }
+            if selected_person == "Mario Rossi" and function_name == "Presidio demo architettura":
+                return {
+                    "role": "Responsabile funzione demo",
+                    "start_date": "2026-06-15",
+                    "end_date": "2027-12-31",
+                    "date_range": "Dal 15/06/2026 / al 31/12/2027",
+                    "document": "Lettera di incarico - presidio demo",
+                    "document_state": "linked",
+                    "deadline": "31/12/2027",
+                    "context": "Contratto collegato alla funzione e riutilizzabile come fonte documentale.",
+                }
+            if selected_person == "Mario Rossi":
+                return {
+                    "role": "Delegato operativo",
+                    "start_date": "2026-06-15",
+                    "end_date": "2027-06-30",
+                    "date_range": "Dal 15/06/2026 / al 30/06/2027",
+                    "document": "Delega operativa funzione demo",
+                    "document_state": "linked",
+                    "deadline": "30/06/2027",
+                    "context": "Documento collegato a piu funzioni, richiamabile nello scadenziario.",
+                }
+            return {
+                "role": "Da definire",
+                "start_date": "",
+                "end_date": "",
+                "date_range": "Dal -- / al --",
+                "document": "Nessun documento collegato",
+                "document_state": "missing",
+                "deadline": "-",
+                "context": "Relazione da completare con ruolo, date e contratto o documento collegato.",
+            }
+
+        selected_person_function_parts = []
+        for function_name in selected_person_functions:
+            meta = function_relation_meta(function_name)
+            selected_person_function_parts.append(f"""<li class="assignment-linked-row">
+              <div>
+                <strong>{esc(function_name)}</strong>
+                <span>{esc(function_kind_lookup.get(function_name, 'Area da classificare'))} - {esc(meta['role'])}</span>
+                <span>{esc(meta['date_range'])}</span>
+                <small>{esc(meta['context'])}</small>
+              </div>
+              <div class="assignment-meta">
+                <em><span class="deadline-dot {'ok' if meta['document_state'] == 'linked' else 'neutral'}"></span>{esc(meta['document'])}</em>
+                <span class="assignment-deadline">Scadenza {esc(meta['deadline'])}</span>
+                <button type="button" data-open-action data-action="Collegamento funzione" data-function="{esc(function_name)}" data-role="{esc(meta['role'])}" data-start="{esc(meta['start_date'])}" data-end="{esc(meta['end_date'])}" data-document="{esc(meta['document'] if meta['document_state'] == 'linked' else '')}">Modifica</button>
+                <form class="inline-action-form" method="post" action="/compagine/assignment-delete" onsubmit="return window.confirm('Archiviare questa funzione dal profilo selezionato?')">
+                  {hidden_ctx(ctx)}
+                  <input type="hidden" name="subject_name" value="{esc(selected_person)}">
+                  <input type="hidden" name="function_name" value="{esc(function_name)}">
+                  <input type="hidden" name="status" value="Archiviato">
+                  <button type="submit">Archivia</button>
+                </form>
+                <form class="inline-action-form" method="post" action="/compagine/assignment-delete" onsubmit="return window.confirm('Eliminare questa funzione dal profilo selezionato?')">
+                  {hidden_ctx(ctx)}
+                  <input type="hidden" name="subject_name" value="{esc(selected_person)}">
+                  <input type="hidden" name="function_name" value="{esc(function_name)}">
+                  <input type="hidden" name="status" value="Rimosso">
+                  <button type="submit" title="Elimina funzione">x</button>
+                </form>
+              </div>
+            </li>""")
+        selected_person_function_rows = "".join(selected_person_function_parts) or '<li class="empty-row">Nessuna funzione assegnata nell organigramma.</li>'
+        selected_agreement_rows = "".join(
+            f"""<tr>
+              <td>{esc(a['agreement_type'])}</td>
+              <td>{esc(a['scope'])}</td>
+              <td><span class="badge {badge_class(a['status'])}">{esc(a['status'])}</span></td>
+              <td>{esc(nice_date(a['expires_at']))}</td>
+            </tr>"""
+            for a in agreements
+            if a["person_name"] == selected_person
+        ) or '<tr><td colspan="4" class="empty-row">Nessun accordo collegato alla persona.</td></tr>'
+        if selected_person == "Mario Rossi":
+            selected_agreement_rows = """
+            <tr>
+              <td>Lettera di incarico</td>
+              <td>Presidio demo architettura</td>
+              <td><span class="badge ok">Attivo</span></td>
+              <td>31/12/2027</td>
+            </tr>
+            <tr>
+              <td>Delega operativa</td>
+              <td>Supporto a funzione interna</td>
+              <td><span class="badge warning">Da verificare</span></td>
+              <td>30/06/2027</td>
+            </tr>"""
+        selected_parts = selected_person.split(" ", 1)
+        selected_first_name = selected_parts[0] if selected_parts else ""
+        selected_last_name = selected_parts[1] if len(selected_parts) > 1 else ""
+        selected_subject_type = subject_type_by_name.get(
+            selected_person,
+            person_registry.get(selected_person, {}).get("type", "Persona fisica") if selected_person else "Persona fisica",
+        )
+        tab_html = "".join(
+            f'<a class="subtab {"active" if key == active_tab else ""}" href="{rel_url("/compagine", ctx, {"tab": key})}">{label}</a>'
+            for key, label in [("organigramma", "Organigramma"), ("anagrafiche", "Lista anagrafica")]
+        )
+        person_modal = ""
+        if selected_person and active_tab != "anagrafiche":
+            selected_status = "Attivo" if selected_person_functions else "Da censire"
+            selected_next_deadline = next((a["expires_at"] for a in agreements if a["person_name"] == selected_person and a["expires_at"]), "")
+            person_modal = f"""
+<div class="modal-backdrop">
+  <section class="person-modal">
+    <div class="section-head">
+      <h2>{esc(selected_role or 'Fascicolo persona')}</h2>
+      <a class="modal-close" href="{rel_url('/compagine', ctx)}">x</a>
+    </div>
+    <section class="identity-hero">
+      <div>
+        <p class="eyebrow">Anagrafica organigramma</p>
+        <h2>{esc(selected_person)}</h2>
+        <p class="muted">{esc(', '.join(selected_person_functions) or 'Nessuna funzione assegnata')}</p>
+      </div>
+      <div class="header-badges">
+        <span class="badge {badge_class(selected_status)}">{esc(selected_status)}</span>
+        <span class="badge neutral">{len(selected_person_functions)} funzioni</span>
+      </div>
+    </section>
+    <section class="metric-grid compact-metric-grid">
+      <div class="metric"><span>Accordi</span><strong>{person_agreement_counts.get(selected_person, 0)}</strong></div>
+      <div class="metric"><span>Documenti</span><strong>{person_document_counts.get(selected_person, 0)}</strong></div>
+      <div class="metric"><span>Prossima scadenza</span><strong>{esc(nice_date(selected_next_deadline) or '-')}</strong></div>
+      <div class="metric"><span>Stato dossier</span><strong>{esc(selected_status)}</strong></div>
+    </section>
+    <section class="workspace-grid modal-grid">
+      <div class="panel inset-panel">
+        <div class="section-head compact-head"><h3>Dati anagrafici</h3><span class="panel-kicker">profilo</span></div>
+        <dl class="definition-list compact-definition">
+          <dt>Nome</dt><dd>{esc(selected_first_name or '-')}</dd>
+          <dt>Cognome</dt><dd>{esc(selected_last_name or '-')}</dd>
+          <dt>Email</dt><dd>-</dd>
+          <dt>Telefono</dt><dd>-</dd>
+          <dt>Note</dt><dd>Da completare nella scheda anagrafica.</dd>
+        </dl>
+      </div>
+      <div class="panel inset-panel">
+        <div class="section-head compact-head"><h3>Azioni anagrafica</h3><span class="panel-kicker">design</span></div>
+        <div class="inline-actions left">
+          <button class="button primary" type="button" data-open-action data-action="Modifica dati">Modifica dati</button>
+          <button class="button ghost" type="button" data-open-action data-action="Nuovo documento">+ Documento</button>
+          <button class="button secondary" type="button" data-open-action data-action="Aggiungi funzione">+ Funzione</button>
+        </div>
+      </div>
+    </section>
+    <div class="person-document-list">
+      <div class="section-head compact-head">
+        <h3>Funzioni in organigramma</h3>
+        <button class="button primary" type="button" data-open-assignment data-function="{esc(selected_role or '')}">+ Aggiungi funzione</button>
+      </div>
+      <ul class="assignment-list">{selected_person_function_rows}</ul>
+      <p class="panel-kicker">Accordi / contratti collegati</p>
+      <table class="data-table compact">
+        <thead><tr><th>Accordo</th><th>Funzioni / ambito</th><th>Stato</th><th>Scadenza</th></tr></thead>
+        <tbody>{selected_agreement_rows}</tbody>
+      </table>
+      <div class="section-head compact-head">
+        <h3>Documenti collegati</h3>
+        <button class="button ghost" type="button" data-open-action data-action="Collega documento">+ Collega documento</button>
+      </div>
+      {person_doc_rows}
+    </div>
+    <datalist id="org-function-options">{function_options}</datalist>
+  </section>
+</div>"""
+        shareholder_modal = ""
+        if selected_shareholder:
+            shareholder_doc_rows = "".join(
+                f"""<div class="document-row">
+                  <div>
+                    <strong>{esc(sd['title'])}</strong>
+                    <span>{esc(sd['document_type'])} - {esc(nice_date(sd['created_at']))}{' - scadenza ' + esc(nice_date(sd['expires_at'])) if sd['expires_at'] else ''}</span>
+                    <small>{esc(sd['notes'])}</small>
+                  </div>
+                  <a class="button ghost" href="{rel_url('/documents/' + str(sd['doc_id']) + '/download', ctx) if sd['doc_id'] else '#'}">Apri</a>
+                </div>"""
+                for sd in shareholder_docs
+            ) or '<p class="empty-state">Nessun documento caricato per questo partecipante.</p>'
+            shareholder_doc_text = " ".join(f"{sd['document_type']} {sd['title']}" for sd in shareholder_docs).lower()
+            shareholder_requirements = [
+                ("Statuto / atto costitutivo", "Statuto aggiornato o atto costitutivo del socio."),
+                ("Visura camerale", "Visura aggiornata o documento equivalente."),
+                ("Libro soci / cap table", "Dati soci, catena partecipativa e quote rilevanti."),
+                ("Patti parasociali", "Patti o dichiarazione di assenza patti."),
+                ("Titolari effettivi", "Identificazione titolari effettivi e assetto di controllo."),
+                ("Dichiarazioni onorabilita", "Dichiarazioni requisiti di onorabilita dei soggetti rilevanti."),
+            ]
+            shareholder_check_rows = "".join(
+                f"""<li class="auth-check {'found' if any(token in shareholder_doc_text for token in label.lower().replace('/', ' ').split()) else 'missing'}">
+                  <span></span>
+                  <div><strong>{esc(label)}</strong><small>{esc(note)}</small></div>
+                </li>"""
+                for label, note in shareholder_requirements
+            )
+            shareholder_modal = f"""
+<div class="modal-backdrop">
+  <section class="person-modal shareholder-modal">
+    <div class="section-head">
+      <h2>{esc(selected_shareholder['name'])}</h2>
+      <a class="modal-close" href="{rel_url('/compagine', ctx)}">x</a>
+    </div>
+    <section class="identity-hero">
+      <div>
+        <p class="eyebrow">Partecipante qualificato</p>
+        <h2>{esc(selected_shareholder['name'])}</h2>
+        <p class="muted">{esc(selected_shareholder['subject_type'])} - quota {selected_shareholder['stake_percent']:.2f}%</p>
+      </div>
+      <div class="header-badges">
+        <span class="badge {badge_class(selected_shareholder['status'])}">{esc(selected_shareholder['status'])}</span>
+        <span class="badge {badge_class(selected_shareholder['requisites_status'])}">{esc(selected_shareholder['requisites_status'])}</span>
+      </div>
+    </section>
+    <section class="metric-grid compact-metric-grid">
+      <div class="metric"><span>Quota</span><strong>{selected_shareholder['stake_percent']:.2f}%</strong></div>
+      <div class="metric"><span>Documenti</span><strong>{len(shareholder_docs)}</strong></div>
+      <div class="metric"><span>Requisiti</span><strong>{esc(selected_shareholder['requisites_status'])}</strong></div>
+      <div class="metric"><span>Stato</span><strong>{esc(selected_shareholder['status'])}</strong></div>
+    </section>
+    <section class="workspace-grid modal-grid">
+      <div class="panel inset-panel">
+        <div class="section-head compact-head"><h3>Dati societari</h3><span class="panel-kicker">anagrafica</span></div>
+        <form class="form-grid" method="post" action="/shareholders/{selected_shareholder['id']}/update">
+          {hidden_ctx(ctx)}
+          <label>Tipo soggetto<select name="subject_type">
+            {''.join(f'<option {"selected" if selected_shareholder["subject_type"] == option else ""}>{option}</option>' for option in ["Societa / ente", "Persona fisica", "Holding", "Trust / veicolo"])}
+          </select></label>
+          <label>Nome / ragione sociale<input name="name" value="{esc(selected_shareholder['name'])}" required></label>
+          <label>Forma giuridica<input name="legal_form" value="{esc(selected_shareholder['legal_form'])}" placeholder="es. S.r.l., S.p.A."></label>
+          <label>Codice fiscale / P.IVA<input name="tax_id" value="{esc(selected_shareholder['tax_id'])}"></label>
+          <label>Email<input name="contact_email" value="{esc(selected_shareholder['contact_email'])}"></label>
+          <label>Telefono<input name="phone" value="{esc(selected_shareholder['phone'])}"></label>
+          <label>Quota %<input type="number" step="0.01" min="0" max="100" name="stake_percent" value="{selected_shareholder['stake_percent']:.2f}"></label>
+          <label>Stato requisiti<select name="requisites_status">
+            {''.join(f'<option {"selected" if selected_shareholder["requisites_status"] == option else ""}>{option}</option>' for option in ["Da verificare", "In verifica", "Completo", "Da integrare", "Non conforme"])}
+          </select></label>
+          <label>Stato<select name="status">
+            {''.join(f'<option {"selected" if selected_shareholder["status"] == option else ""}>{option}</option>' for option in ["Attivo", "In verifica", "Da integrare", "Archiviato"])}
+          </select></label>
+          <label class="full-span">Sede / indirizzo<input name="address" value="{esc(selected_shareholder['address'])}"></label>
+          <label class="full-span">Dati soci / titolari effettivi<textarea name="beneficial_owners" rows="4" placeholder="Catena partecipativa, soci diretti/indiretti, titolari effettivi">{esc(selected_shareholder['beneficial_owners'])}</textarea></label>
+          <label class="full-span">Note<textarea name="notes" rows="3">{esc(selected_shareholder['notes'])}</textarea></label>
+          <div class="form-actions left full-span"><button class="button primary" type="submit">Salva partecipante</button></div>
+        </form>
+      </div>
+      <div class="panel inset-panel">
+        <div class="section-head compact-head"><h3>Checklist documentale</h3><span class="panel-kicker">requisiti</span></div>
+        <ul class="auth-check-list">{shareholder_check_rows}</ul>
+      </div>
+    </section>
+    <section class="panel inset-panel">
+      <div class="section-head compact-head"><h3>Documenti del partecipante</h3><span class="panel-kicker">statuto, visura, soci, onorabilita</span></div>
+      <form class="form-grid upload-form" method="post" action="/shareholders/{selected_shareholder['id']}/document-upload" enctype="multipart/form-data">
+        {hidden_ctx(ctx)}
+        <label>Tipo documento<select name="document_type">
+          <option>Statuto / atto costitutivo</option>
+          <option>Visura camerale</option>
+          <option>Libro soci / cap table</option>
+          <option>Patti parasociali</option>
+          <option>Titolari effettivi</option>
+          <option>Dichiarazioni onorabilita</option>
+          <option>Documento identita</option>
+          <option>Altro documento socio</option>
+        </select></label>
+        <label>Titolo<input name="title" placeholder="es. Visura aggiornata Holding Alfa"></label>
+        <label>Data documento<input type="date" name="issued_at"></label>
+        <label>Scadenza / aggiornamento<input type="date" name="expires_at"></label>
+        <label class="full-span">Note<textarea name="notes" rows="2" placeholder="Ambito, soci coperti, soggetti firmatari, integrazioni richieste"></textarea></label>
+        <label class="full-span">File<input type="file" name="file" required></label>
+        <div class="form-actions left full-span"><button class="button primary" type="submit">Carica documento</button></div>
+      </form>
+      <div class="document-list compact-document-list">{shareholder_doc_rows}</div>
+    </section>
+  </section>
+</div>"""
+        body = f"""
+<p class="page-copy">Mappa operativa di governance, funzioni responsabili, controlli, outsourcing e documenti societari collegati. Ogni nodo persona apre il fascicolo con incarichi, deleghe e documenti.</p>
+<nav class="subtabs">{tab_html}</nav>
+<section class="panel org-panel">
+  <div class="section-head">
+    <div><h2>Organigramma operativo</h2><span class="muted">Vista per presidi: responsabili interni, controlli, comitato progetti e servizi in outsourcing.</span></div>
+    <div class="inline-actions">
+      <button class="button primary" type="button" data-open-block data-group="Governance">+ Nuovo blocco</button>
+      <span class="panel-kicker">funzioni e fonti</span>
+    </div>
+  </div>
+  <div class="responsibility-map">{responsibility_map}</div>
+  <div class="org-legend">
+    <span class="legend-chip governance">Governance</span>
+    <span class="legend-chip function">Responsabili funzioni</span>
+    <span class="legend-chip control">Area di controllo</span>
+    <span class="legend-chip outsourcing">Servizi in outsourcing</span>
+    <span class="legend-chip committee">Comitato tecnico progetti</span>
+    <span class="legend-chip advisory">Advisory Committee</span>
+    <span class="legend-chip operational">Area operativa</span>
+  </div>
+  <div class="participation-head">
+    <p class="panel-kicker centered">Partecipogramma - partecipanti qualificati (&ge;20%)</p>
+    <button type="button" title="Aggiungi partecipante qualificato" data-open-shareholder>+</button>
+  </div>
+  <div class="shareholder-list">{shareholder_cards}</div>
+</section>
+<section class="workspace-grid">
+  <div class="panel statute-panel">
+    <div class="section-head"><h2>Statuto</h2><span class="panel-kicker">Atto costitutivo</span></div>
+    <div class="statute-list">
+      <div><span>Oggetto sociale</span><strong>-</strong></div>
+      <div><span>Capitale</span><strong>-</strong></div>
+      <div><span>Sede</span><strong>-</strong></div>
+      <div><span>Durata</span><strong>-</strong></div>
+      <div><span>Organo amministrativo</span><strong>-</strong></div>
+    </div>
+    <button class="button ghost" type="button">Modifica statuto</button>
+  </div>
+  <div class="panel">
+    <div class="section-head">
+      <div><h2>Statuto e atti societari</h2><span class="muted">Solo documenti societari puri: statuto, patti, procure e delibere non gia' classificate nei fascicoli autorizzativi o contabili.</span></div>
+      <a class="button primary" href="{rel_url('/documents', ctx, {'origin': 'Compagine', 'category': 'Atto societario', 'mode': 'upload'})}">+ Atto</a>
+    </div>
+    <div class="document-list">{doc_cards}</div>
+  </div>
+</section>
+<section class="panel authorization-panel">
+  <div class="section-head">
+    <div>
+      <h2>Autorizzazione ECSP</h2>
+      <span class="muted">Domanda di autorizzazione, allegati e scambi con Autorita in un fascicolo unico per ricerca e contesto IA.</span>
+    </div>
+    <div class="inline-actions">
+      <a class="button primary" href="{rel_url('/documents', ctx, {'origin': 'Compagine', 'category': 'Domanda autorizzazione ECSP', 'mode': 'upload'})}">+ Domanda</a>
+      <a class="button ghost" href="{rel_url('/documents', ctx, {'origin': 'Compagine', 'category': 'Allegato autorizzazione', 'mode': 'upload'})}">+ Allegato</a>
+      <a class="button secondary" href="{rel_url('/documents', ctx, {'origin': 'Compagine', 'category': 'Domanda autorizzazione ECSP'})}">Apri archivio</a>
+    </div>
+  </div>
+  <div class="authorization-grid">
+    <div>
+      <p class="panel-kicker">Documenti rilevati</p>
+      <div class="document-list compact-document-list">{auth_doc_cards}</div>
+    </div>
+    <div>
+      <p class="panel-kicker">Indice contesto IA</p>
+      <ul class="auth-check-list">{auth_check_rows}</ul>
+    </div>
+  </div>
+  <div class="authorization-context">
+    <div class="section-head compact-head">
+      <div><h3>Fonti collegate al fascicolo</h3><span class="muted">La domanda autorizzativa non duplica questi contenuti: li richiama come fonti strutturate per generare contesto e comunicazioni.</span></div>
+      <span class="panel-kicker">mappa contesto</span>
+    </div>
+    <div class="context-link-grid">{context_matrix}</div>
+  </div>
+</section>
+<section class="panel">
+  <div class="section-head">
+    <div><h2>Bilanci e situazione contabile</h2><span class="muted">Fonti per CF1, VIG12, patrimonio di vigilanza e comunicazioni periodiche.</span></div>
+    <a class="button primary" href="{rel_url('/documents', ctx, {'origin': 'Compagine', 'category': 'Bilancio', 'mode': 'upload'})}">+ Bilancio</a>
+  </div>
+  <div class="document-list">{balance_cards}</div>
+</section>
+<section class="panel">
+  <div class="section-head">
+    <div><h2>Contratti attivi e scadenze</h2><span class="muted">I fornitori si gestiscono dai box dell'organigramma e dall'archivio documenti. Qui restano solo le scadenze operative da monitorare.</span></div>
+    <a class="button primary" href="{rel_url('/documents', ctx, {'origin': 'Contratto fornitore', 'mode': 'upload'})}">+ Contratto</a>
+  </div>
+  <div class="contract-alert-list">{contract_rows}</div>
+</section>
+<section class="panel">
+  <div class="section-head"><h2>Accordi collegati</h2><span class="panel-kicker">Incarichi, patti, NDA</span></div>
+  <table class="data-table roomy">
+    <thead><tr><th>Persona</th><th>Ruolo</th><th>Accordo</th><th>Ambito</th><th>Stato</th><th>Scadenza</th></tr></thead>
+    <tbody>{agreement_rows}</tbody>
+  </table>
+</section>
+{person_modal}
+{shareholder_modal}
+<div class="assignment-modal" data-shareholder-modal hidden>
+  <section class="assignment-dialog">
+    <div class="section-head">
+      <div>
+        <h2>Nuovo partecipante qualificato</h2>
+        <span class="muted">Censisci societa, persona o veicolo con quota, requisiti e dati per il fascicolo partecipogramma.</span>
+      </div>
+      <button class="modal-close buttonless" type="button" data-close-shareholder>x</button>
+    </div>
+    <form class="form-grid assignment-form" method="post" action="/shareholders/create">
+      {hidden_ctx(ctx)}
+      <label>Tipo soggetto<select name="subject_type">
+        <option>Societa / ente</option>
+        <option>Persona fisica</option>
+        <option>Holding</option>
+        <option>Trust / veicolo</option>
+      </select></label>
+      <label>Nome / ragione sociale<input name="name" required placeholder="es. Holding Alfa S.r.l."></label>
+      <label>Forma giuridica<input name="legal_form" placeholder="es. S.r.l., S.p.A."></label>
+      <label>Codice fiscale / P.IVA<input name="tax_id"></label>
+      <label>Email<input name="contact_email"></label>
+      <label>Telefono<input name="phone"></label>
+      <label>Quota %<input type="number" step="0.01" min="0" max="100" name="stake_percent" required></label>
+      <label>Stato requisiti<select name="requisites_status">
+        <option>Da verificare</option>
+        <option>In verifica</option>
+        <option>Completo</option>
+        <option>Da integrare</option>
+        <option>Non conforme</option>
+      </select></label>
+      <label class="full-span">Sede / indirizzo<input name="address" placeholder="Sede legale o domicilio rilevante"></label>
+      <label class="full-span">Dati soci / titolari effettivi<textarea name="beneficial_owners" rows="3" placeholder="Soci diretti/indiretti, catena partecipativa, titolari effettivi"></textarea></label>
+      <label class="full-span">Note<textarea name="notes" rows="2" placeholder="Patti, vincoli, documenti da chiedere, scadenze"></textarea></label>
+      <input type="hidden" name="status" value="Attivo">
+      <div class="form-actions left full-span">
+        <button class="button primary" type="submit">Crea partecipante</button>
+        <button class="button ghost" type="button" data-close-shareholder>Annulla</button>
+      </div>
+    </form>
+  </section>
+</div>
+<div class="assignment-modal" data-assignment-modal hidden>
+  <section class="assignment-dialog">
+    <div class="section-head">
+      <div>
+        <h2>Aggiungi soggetto al box</h2>
+        <span class="muted">Scegli un soggetto gia' in anagrafica oppure censiscine uno nuovo per questa funzione.</span>
+      </div>
+      <button class="modal-close buttonless" type="button" data-close-assignment>x</button>
+    </div>
+    <form class="form-grid assignment-form" method="post" action="/compagine/assignment-save" enctype="multipart/form-data">
+      {hidden_ctx(ctx)}
+      <input type="hidden" name="function_area" data-assignment-area value="">
+      <label class="full-span">Funzione organigramma
+        <select name="function_name" data-assignment-function>
+          {function_select_options}
+        </select>
+      </label>
+      <div class="full-span linked-subform" data-assignment-new-function hidden>
+        <label>Titolo nuova funzione
+          <input name="new_function_title" data-assignment-new-title placeholder="es. Responsabile continuita operativa">
+        </label>
+        <label>Quadrante
+          <select name="new_function_group">
+            <option>Governance</option>
+            <option>Funzioni responsabili</option>
+            <option>Area di controllo</option>
+            <option>Servizi in outsourcing</option>
+            <option>Comitato tecnico progetti</option>
+            <option>Advisory Committee</option>
+            <option>Area operativa</option>
+          </select>
+        </label>
+      </div>
+      <label>Modalita
+        <select name="assignment_mode" data-assignment-mode>
+          <option value="existing">Soggetto gia' in anagrafica</option>
+          <option value="new">Nuovo soggetto</option>
+        </select>
+      </label>
+      <div class="full-span linked-subform subject-mode-panel" data-existing-subject-panel>
+        <label class="full-span">Soggetto in anagrafica
+          <select name="existing_subject" data-existing-subject>
+            {subject_options}
+          </select>
+        </label>
+        <input type="hidden" name="existing_subject_type" data-existing-subject-type value="">
+        <div class="subject-preview full-span" data-subject-preview>
+          <span>Seleziona un soggetto per caricare i dati gia' censiti.</span>
+        </div>
+      </div>
+      <div class="full-span linked-subform subject-mode-panel" data-new-subject-panel hidden>
+        <label>Tipo soggetto
+          <select name="subject_type">
+            <option>Persona fisica</option>
+            <option>Societa / ente</option>
+          </select>
+        </label>
+        <label>Nome / ragione sociale
+          <input name="subject_name" placeholder="Nome persona o societa">
+        </label>
+      </div>
+      <label>Ruolo nel rapporto
+        <input name="role" placeholder="Responsabile, referente, societa incaricata...">
+      </label>
+      <label>Data inizio
+        <input type="date" name="start_date">
+      </label>
+      <label>Data fine / scadenza
+        <input type="date" name="end_date">
+      </label>
+      <label class="full-span">Contratto / documento collegato
+        <select name="linked_document" data-linked-document>
+          {document_options}
+        </select>
+      </label>
+      <div class="full-span linked-subform document-upload-panel" data-new-document-panel hidden>
+        <p class="full-span form-hint">Il documento caricato verra' collegato a questa funzione e richiamato nelle sezioni anagrafica, documenti e scadenze collegate.</p>
+        <label>Titolo documento
+          <input name="new_document_title" placeholder="es. Contratto, delega, incarico">
+        </label>
+        <label>Tipo documento
+          <select name="new_document_type">
+            <option>Contratto</option>
+            <option>Delega</option>
+            <option>Procura</option>
+            <option>Lettera di incarico</option>
+            <option>Altro documento</option>
+          </select>
+        </label>
+        <label class="full-span">File
+          <input type="file" name="new_document_file">
+        </label>
+      </div>
+      <label class="full-span">Note
+        <textarea name="notes" placeholder="Contratto, delega, SLA, delibera o condizioni rilevanti"></textarea>
+      </label>
+      <div class="form-actions left full-span">
+        <button class="button primary" type="submit">Collega al box</button>
+        <button class="button ghost" type="button" data-close-assignment>Annulla</button>
+      </div>
+    </form>
+  </section>
+</div>
+<div class="assignment-modal" data-block-modal hidden>
+  <section class="assignment-dialog">
+    <div class="section-head">
+      <div>
+        <h2>Nuovo blocco nel quadrante</h2>
+        <span class="muted">Aggiunge una funzione/box dentro Governance, Area di controllo, outsourcing o altri gruppi.</span>
+      </div>
+      <button class="modal-close buttonless" type="button" data-close-block>x</button>
+    </div>
+    <form class="form-grid assignment-form" method="post" action="/compagine/function-save">
+      {hidden_ctx(ctx)}
+      <label>Quadrante
+        <select name="group_name" data-block-group>
+          <option>Governance</option>
+          <option>Funzioni responsabili</option>
+          <option>Area di controllo</option>
+          <option>Servizi in outsourcing</option>
+          <option>Comitato tecnico progetti</option>
+          <option>Advisory Committee</option>
+          <option>Area operativa</option>
+          <option>Organigramma operativo</option>
+        </select>
+      </label>
+      <label>Titolo blocco
+        <input name="block_title" data-block-title placeholder="es. nuovo presidio governance">
+      </label>
+      <label class="full-span">Descrizione / presidio
+        <textarea name="block_note" data-block-note placeholder="Cosa copre questo blocco e quali fonti documentali servono"></textarea>
+      </label>
+      <div class="form-actions left full-span">
+        <button class="button primary" type="submit">Aggiungi blocco</button>
+        <button class="button ghost" type="button" data-close-block>Annulla</button>
+      </div>
+    </form>
+  </section>
+</div>
+<div class="assignment-modal" data-action-modal hidden>
+  <section class="assignment-dialog action-dialog">
+    <div class="section-head">
+      <div>
+        <h2 data-action-title>Collegamento funzione</h2>
+        <span class="muted">Persone/societa, funzioni e contratti sono entita separate: qui si modifica solo il collegamento.</span>
+      </div>
+      <button class="modal-close buttonless" type="button" data-close-action>x</button>
+    </div>
+    <form class="form-grid assignment-form" method="post" action="/compagine/assignment-save" enctype="multipart/form-data">
+      {hidden_ctx(ctx)}
+      <input type="hidden" name="subject_name" value="{esc(selected_person or '')}">
+      <input type="hidden" name="subject_type" value="{esc(selected_subject_type)}">
+      <input type="hidden" name="function_area" data-action-function-area value="">
+      <div class="taxonomy-strip full-span">
+        <div><span>Area</span><strong data-action-area>Da organigramma</strong></div>
+        <div><span>Funzione</span><strong data-action-function-label>Seleziona funzione</strong></div>
+        <div><span>Soggetto</span><strong>{esc(selected_person or 'Soggetto selezionato')}</strong></div>
+        <div><span>Contratto</span><strong>Uno o piu funzioni</strong></div>
+      </div>
+      <p class="form-hint full-span">Il soggetto non si modifica da questa finestra perche sei gia' nel suo profilo. Se devi correggere anagrafica o tipo soggetto, usa la scheda anagrafica.</p>
+      <label class="full-span">Funzione organigramma
+        <select name="function_name" data-action-function-select>
+          {function_select_options}
+        </select>
+      </label>
+      <div class="full-span linked-subform" data-action-new-function hidden>
+        <label>Titolo nuova funzione
+          <input name="new_function_title" data-action-new-title placeholder="es. Responsabile continuita operativa">
+        </label>
+        <label>Quadrante organigramma
+          <select name="new_function_group">
+            <option>Governance</option>
+            <option>Funzioni responsabili</option>
+            <option>Area di controllo</option>
+            <option>Servizi in outsourcing</option>
+            <option>Comitato tecnico progetti</option>
+            <option>Advisory Committee</option>
+            <option>Area operativa</option>
+          </select>
+        </label>
+      </div>
+      <label>Ruolo / responsabilita
+        <input name="role" placeholder="es. responsabile, referente, societa incaricata">
+      </label>
+      <label>Data inizio
+        <input type="date" name="start_date">
+      </label>
+      <label>Data fine / scadenza
+        <input type="date" name="end_date">
+      </label>
+      <label class="full-span">Contratto / documento collegato
+        <select name="linked_document" data-action-linked-document>
+          {document_options}
+        </select>
+      </label>
+      <div class="full-span linked-subform document-upload-panel" data-action-new-document hidden>
+        <p class="full-span form-hint">Il nuovo documento verra' censito come fonte della funzione e potra' disciplinare anche altre funzioni.</p>
+        <label>Titolo documento
+          <input name="new_document_title" placeholder="es. Lettera di incarico, contratto quadro, delega">
+        </label>
+        <label>Tipo documento
+          <select name="new_document_type">
+            <option>Contratto</option>
+            <option>Lettera di incarico</option>
+            <option>Delega</option>
+            <option>Procura</option>
+            <option>Altro documento</option>
+          </select>
+        </label>
+        <label class="full-span">File
+          <input type="file" name="new_document_file">
+        </label>
+      </div>
+      <label class="full-span">Note operative
+        <textarea placeholder="Note sul collegamento: perimetro della funzione, limiti, deleghe, SLA o condizioni rilevanti."></textarea>
+      </label>
+      <div class="form-actions left full-span">
+        <button class="button primary" type="submit">Salva collegamento</button>
+        <button class="button ghost" type="button" data-close-action>Annulla</button>
+      </div>
+    </form>
+  </section>
+</div>
+<script>
+const orgMap = document.querySelector('.responsibility-map');
+let draggedGroup = null;
+const assignmentModal = document.querySelector('[data-assignment-modal]');
+const assignmentFunctionInput = document.querySelector('[data-assignment-function]');
+const assignmentAreaInput = document.querySelector('[data-assignment-area]');
+const assignmentNewFunctionFields = document.querySelector('[data-assignment-new-function]');
+const assignmentNewFunctionTitle = document.querySelector('[data-assignment-new-title]');
+const assignmentMode = document.querySelector('[data-assignment-mode]');
+const existingSubjectPanel = document.querySelector('[data-existing-subject-panel]');
+const newSubjectPanel = document.querySelector('[data-new-subject-panel]');
+const existingSubjectSelect = document.querySelector('[data-existing-subject]');
+const existingSubjectTypeInput = document.querySelector('[data-existing-subject-type]');
+const subjectPreview = document.querySelector('[data-subject-preview]');
+const linkedDocumentSelect = document.querySelector('[data-linked-document]');
+const newDocumentPanel = document.querySelector('[data-new-document-panel]');
+const shareholderModal = document.querySelector('[data-shareholder-modal]');
+const blockModal = document.querySelector('[data-block-modal]');
+const blockGroupInput = document.querySelector('[data-block-group]');
+const blockTitleInput = document.querySelector('[data-block-title]');
+const blockNoteInput = document.querySelector('[data-block-note]');
+const actionModal = document.querySelector('[data-action-modal]');
+const actionTitle = document.querySelector('[data-action-title]');
+const actionName = document.querySelector('[data-action-name]');
+const actionFunctionSelect = document.querySelector('[data-action-function-select]');
+const actionNewFunctionFields = document.querySelector('[data-action-new-function]');
+const actionNewFunctionTitle = document.querySelector('[data-action-new-title]');
+const actionArea = document.querySelector('[data-action-area]');
+const actionFunctionLabel = document.querySelector('[data-action-function-label]');
+const actionFunctionAreaInput = document.querySelector('[data-action-function-area]');
+const actionLinkedDocument = document.querySelector('[data-action-linked-document]');
+const actionNewDocumentPanel = document.querySelector('[data-action-new-document]');
+
+function cssKindForGroup(groupName) {{
+  const normalized = (groupName || '').toLowerCase();
+  if (normalized.includes('governance')) return 'governance';
+  if (normalized.includes('controllo')) return 'control';
+  if (normalized.includes('outsourcing')) return 'outsourcing';
+  if (normalized.includes('comitato tecnico')) return 'committee';
+  if (normalized.includes('advisory')) return 'advisory';
+  if (normalized.includes('operativa')) return 'operational';
+  return 'function';
+}}
+
+function openAssignment(functionName) {{
+  if (assignmentModal) assignmentModal.hidden = false;
+  setFunctionChoice(assignmentFunctionInput, functionName || '', assignmentNewFunctionTitle, assignmentNewFunctionFields);
+  setAssignmentMode('existing');
+  setDocumentMode();
+  if (assignmentFunctionInput) assignmentFunctionInput.focus();
+}}
+
+function attachNodeActions(node) {{
+  const addButton = node.querySelector('[data-open-assignment]');
+  if (addButton) {{
+    addButton.addEventListener('click', () => openAssignment(addButton.dataset.function || ''));
+  }}
+  const deleteButton = node.querySelector('[data-delete-block]');
+  if (deleteButton) {{
+    deleteButton.addEventListener('click', () => {{
+      const title = deleteButton.dataset.function || 'questo blocco';
+      if (window.confirm(`Eliminare il blocco "${{title}}" dall'organigramma?`)) {{
+        node.classList.add('is-archived-demo');
+      }}
+    }});
+  }}
+}}
+
+function createEmptyResponsibilityNode(title, groupName, note) {{
+  const node = document.createElement('div');
+  node.className = `responsibility-node ${{cssKindForGroup(groupName)}} empty`;
+
+  const top = document.createElement('div');
+  top.className = 'node-topline';
+
+  const label = document.createElement('span');
+  label.textContent = title;
+
+  const actions = document.createElement('div');
+  actions.className = 'node-actions';
+  actions.setAttribute('aria-label', `Azioni ${{title}}`);
+  const addButton = document.createElement('button');
+  addButton.type = 'button';
+  addButton.title = 'Aggiungi soggetto';
+  addButton.textContent = '+';
+  addButton.dataset.openAssignment = '';
+  addButton.dataset.function = title;
+  actions.appendChild(addButton);
+
+  top.appendChild(label);
+  top.appendChild(actions);
+
+  const owner = document.createElement('strong');
+  const empty = document.createElement('span');
+  empty.className = 'empty-owner';
+  empty.textContent = 'da censire';
+  owner.appendChild(empty);
+
+  const small = document.createElement('small');
+  small.textContent = note || 'Blocco creato nel quadrante: collegare anagrafiche, documenti e scadenze.';
+
+  const bottom = document.createElement('div');
+  bottom.className = 'node-bottom-actions';
+  const remove = document.createElement('button');
+  remove.type = 'button';
+  remove.title = 'Elimina blocco';
+  remove.textContent = '-';
+  remove.dataset.deleteBlock = '';
+  remove.dataset.function = title;
+  bottom.appendChild(remove);
+
+  node.appendChild(top);
+  node.appendChild(owner);
+  node.appendChild(small);
+  node.appendChild(bottom);
+  attachNodeActions(node);
+  return node;
+}}
+
+function setFunctionChoice(select, value, newTitleInput, newFields) {{
+  if (!select) return;
+  const hasOption = Array.from(select.options).some((option) => option.value === value);
+  if (value && hasOption) {{
+    select.value = value;
+  }} else if (value) {{
+    select.value = '__new__';
+    if (newTitleInput) newTitleInput.value = value;
+  }} else {{
+    select.value = '';
+  }}
+  if (newFields) newFields.hidden = select.value !== '__new__';
+  if (select === assignmentFunctionInput) syncAssignmentFunctionArea();
+}}
+
+function addFunctionOption(title, groupName) {{
+  document.querySelectorAll('[data-assignment-function], [data-action-function-select]').forEach((select) => {{
+    const exists = Array.from(select.options).some((option) => option.value === title);
+    if (exists) return;
+    const option = document.createElement('option');
+    option.value = title;
+    option.textContent = `${{title}} - ${{groupName}}`;
+    const newOption = Array.from(select.options).find((item) => item.value === '__new__');
+    select.insertBefore(option, newOption || null);
+  }});
+  const dataList = document.getElementById('org-function-options');
+  if (dataList && !Array.from(dataList.options).some((option) => option.value === title)) {{
+    const option = document.createElement('option');
+    option.value = title;
+    option.textContent = groupName;
+    dataList.appendChild(option);
+  }}
+}}
+
+if (assignmentFunctionInput) {{
+  assignmentFunctionInput.addEventListener('change', () => {{
+    if (assignmentNewFunctionFields) assignmentNewFunctionFields.hidden = assignmentFunctionInput.value !== '__new__';
+    syncAssignmentFunctionArea();
+  }});
+}}
+
+function selectedAreaFrom(select, fallback) {{
+  if (!select) return fallback || '';
+  const selected = select.selectedOptions[0];
+  if (select.value === '__new__') {{
+    const groupSelect = select.closest('form')?.querySelector('select[name="new_function_group"]');
+    return groupSelect?.value || fallback || 'Funzioni responsabili';
+  }}
+  return selected?.dataset.area || (selected?.textContent || '').split(' - ').slice(1).join(' - ') || fallback || '';
+}}
+
+function syncAssignmentFunctionArea() {{
+  if (assignmentAreaInput) assignmentAreaInput.value = selectedAreaFrom(assignmentFunctionInput, 'Funzioni responsabili');
+}}
+
+document.querySelectorAll('select[name="new_function_group"]').forEach((select) => {{
+  select.addEventListener('change', () => {{
+    syncAssignmentFunctionArea();
+    syncActionTaxonomy();
+  }});
+}});
+
+function renderSubjectPreview() {{
+  if (!subjectPreview || !existingSubjectSelect) return;
+  const option = existingSubjectSelect.selectedOptions[0];
+  if (!option || !option.value) {{
+    if (existingSubjectTypeInput) existingSubjectTypeInput.value = '';
+    subjectPreview.innerHTML = '<span>Seleziona un soggetto per caricare i dati gia\\' censiti.</span>';
+    return;
+  }}
+  if (existingSubjectTypeInput) existingSubjectTypeInput.value = option.dataset.type || 'Persona fisica';
+  subjectPreview.innerHTML = `
+    <dl>
+      <dt>Tipo</dt><dd>${{option.dataset.type || '-'}}</dd>
+      <dt>Funzioni attuali</dt><dd>${{option.dataset.functions || '-'}}</dd>
+      <dt>Accordi / contratti</dt><dd>${{option.dataset.agreements || '0'}}</dd>
+      <dt>Documenti</dt><dd>${{option.dataset.documents || '0'}}</dd>
+      <dt>Prossima scadenza</dt><dd>${{option.dataset.deadline || '-'}}</dd>
+      <dt>Stato</dt><dd>${{option.dataset.status || '-'}}</dd>
+    </dl>`;
+}}
+
+function setAssignmentMode(mode) {{
+  const isNew = mode === 'new';
+  if (existingSubjectPanel) existingSubjectPanel.hidden = isNew;
+  if (newSubjectPanel) newSubjectPanel.hidden = !isNew;
+  if (assignmentMode) assignmentMode.value = isNew ? 'new' : 'existing';
+  if (!isNew) renderSubjectPreview();
+}}
+
+if (assignmentMode) {{
+  assignmentMode.addEventListener('change', () => setAssignmentMode(assignmentMode.value));
+}}
+
+if (existingSubjectSelect) {{
+  existingSubjectSelect.addEventListener('change', renderSubjectPreview);
+}}
+
+function setDocumentMode() {{
+  if (!newDocumentPanel || !linkedDocumentSelect) return;
+  newDocumentPanel.hidden = linkedDocumentSelect.value !== '__upload__';
+}}
+
+if (linkedDocumentSelect) {{
+  linkedDocumentSelect.addEventListener('change', setDocumentMode);
+}}
+
+function setActionFunctionChoice(value) {{
+  if (!actionFunctionSelect) return;
+  const hasOption = Array.from(actionFunctionSelect.options).some((option) => option.value === value);
+  if (value && hasOption) {{
+    actionFunctionSelect.value = value;
+  }} else if (value) {{
+    actionFunctionSelect.value = '__new__';
+    if (actionNewFunctionTitle) actionNewFunctionTitle.value = value;
+  }} else {{
+    actionFunctionSelect.value = '';
+  }}
+  if (actionNewFunctionFields) actionNewFunctionFields.hidden = actionFunctionSelect.value !== '__new__';
+  syncActionTaxonomy();
+}}
+
+if (actionFunctionSelect) {{
+  actionFunctionSelect.addEventListener('change', () => {{
+    if (actionNewFunctionFields) actionNewFunctionFields.hidden = actionFunctionSelect.value !== '__new__';
+    syncActionTaxonomy();
+  }});
+}}
+
+function syncActionTaxonomy() {{
+  if (!actionFunctionSelect) return;
+  const selected = actionFunctionSelect.selectedOptions[0];
+  const text = selected?.textContent || '';
+  const parts = text.split(' - ');
+  const fn = actionFunctionSelect.value === '__new__'
+    ? (actionNewFunctionTitle?.value || 'Nuova funzione')
+    : (parts[0] || 'Seleziona funzione');
+  const area = actionFunctionSelect.value === '__new__'
+    ? selectedAreaFrom(actionFunctionSelect, 'Nuova area da scegliere')
+    : (selected?.dataset.area || parts.slice(1).join(' - ') || 'Da organigramma');
+  if (actionFunctionLabel) actionFunctionLabel.textContent = fn;
+  if (actionArea) actionArea.textContent = area;
+  if (actionFunctionAreaInput) actionFunctionAreaInput.value = area;
+}}
+
+if (actionNewFunctionTitle) {{
+  actionNewFunctionTitle.addEventListener('input', syncActionTaxonomy);
+}}
+
+function setActionDocumentMode() {{
+  if (!actionNewDocumentPanel || !actionLinkedDocument) return;
+  actionNewDocumentPanel.hidden = actionLinkedDocument.value !== '__upload__';
+}}
+
+if (actionLinkedDocument) {{
+  actionLinkedDocument.addEventListener('change', setActionDocumentMode);
+}}
+
+document.querySelectorAll('[data-open-action]').forEach((button) => {{
+  button.addEventListener('click', () => {{
+    const action = button.dataset.action || 'Collegamento funzione';
+    if (actionTitle) actionTitle.textContent = action;
+    if (actionName) actionName.value = action;
+    setActionFunctionChoice(button.dataset.function || '');
+    const form = actionModal?.querySelector('form');
+    if (form) {{
+      const roleInput = form.querySelector('input[name="role"]');
+      const startInput = form.querySelector('input[name="start_date"]');
+      const endInput = form.querySelector('input[name="end_date"]');
+      if (roleInput) roleInput.value = button.dataset.role || '';
+      if (startInput) startInput.value = button.dataset.start || '';
+      if (endInput) endInput.value = button.dataset.end || '';
+      if (actionLinkedDocument) {{
+        const docValue = button.dataset.document || '';
+        const hasDocumentOption = Array.from(actionLinkedDocument.options).some((option) => option.value === docValue);
+        actionLinkedDocument.value = hasDocumentOption ? docValue : '';
+      }}
+    }}
+    setActionDocumentMode();
+    if (actionModal) actionModal.hidden = false;
+  }});
+}});
+
+document.querySelectorAll('[data-close-action]').forEach((button) => {{
+  button.addEventListener('click', () => {{
+    if (actionModal) actionModal.hidden = true;
+  }});
+}});
+
+if (actionModal) {{
+  actionModal.addEventListener('click', (event) => {{
+    if (event.target === actionModal) actionModal.hidden = true;
+  }});
+}}
+
+document.querySelectorAll('[data-confirm-action]').forEach((button) => {{
+  button.addEventListener('click', () => {{
+    const action = button.dataset.action || 'procedere';
+    const fn = button.dataset.function || 'questa funzione';
+    if (window.confirm(`Confermi di ${{action}} "${{fn}}"?`)) {{
+      button.closest('li')?.classList.add('is-archived-demo');
+    }}
+  }});
+}});
+
+function clearDropHints() {{
+  document.querySelectorAll('.responsibility-group.drop-before, .responsibility-group.drop-after').forEach((group) => {{
+    group.classList.remove('drop-before', 'drop-after');
+  }});
+}}
+
+function closestDropTarget(x, y) {{
+  const groups = Array.from(orgMap.querySelectorAll('.responsibility-group:not(.dragging)'));
+  if (!groups.length) return {{ target: null, after: false }};
+  return groups.reduce((best, group) => {{
+    const box = group.getBoundingClientRect();
+    const centerX = box.left + box.width / 2;
+    const centerY = box.top + box.height / 2;
+    const distance = Math.hypot(x - centerX, y - centerY);
+    const after = y > centerY || (Math.abs(y - centerY) < box.height * 0.22 && x > centerX);
+    return distance < best.distance ? {{ target: group, after, distance }} : best;
+  }}, {{ target: null, after: false, distance: Number.POSITIVE_INFINITY }});
+}}
+
+document.querySelectorAll('.drag-handle').forEach((handle) => {{
+  handle.addEventListener('dragstart', (event) => {{
+    draggedGroup = handle.closest('.responsibility-group');
+    draggedGroup.classList.add('dragging');
+    event.dataTransfer.effectAllowed = 'move';
+    event.dataTransfer.setData('text/plain', draggedGroup.querySelector('h3').textContent);
+  }});
+  handle.addEventListener('dragend', () => {{
+    if (draggedGroup) draggedGroup.classList.remove('dragging');
+    draggedGroup = null;
+    clearDropHints();
+  }});
+}});
+
+if (orgMap) {{
+  orgMap.addEventListener('dragover', (event) => {{
+    if (!draggedGroup) return;
+    event.preventDefault();
+    clearDropHints();
+    const drop = closestDropTarget(event.clientX, event.clientY);
+    if (drop.target) {{
+      drop.target.classList.add(drop.after ? 'drop-after' : 'drop-before');
+    }}
+  }});
+  orgMap.addEventListener('drop', (event) => {{
+    if (!draggedGroup) return;
+    event.preventDefault();
+    const drop = closestDropTarget(event.clientX, event.clientY);
+    clearDropHints();
+    if (!drop.target) {{
+      orgMap.appendChild(draggedGroup);
+    }} else if (drop.after) {{
+      orgMap.insertBefore(draggedGroup, drop.target.nextSibling);
+    }} else {{
+      orgMap.insertBefore(draggedGroup, drop.target);
+    }}
+  }});
+}}
+
+document.querySelectorAll('[data-open-assignment]').forEach((button) => {{
+  button.addEventListener('click', () => openAssignment(button.dataset.function || ''));
+}});
+
+document.querySelectorAll('[data-open-block]').forEach((button) => {{
+  button.addEventListener('click', () => {{
+    if (blockModal) blockModal.hidden = false;
+    if (blockGroupInput) {{
+      blockGroupInput.value = button.dataset.group || 'Governance';
+      blockGroupInput.focus();
+    }}
+    if (blockTitleInput) blockTitleInput.value = '';
+    if (blockNoteInput) blockNoteInput.value = '';
+  }});
+}});
+
+document.querySelectorAll('[data-close-block]').forEach((button) => {{
+  button.addEventListener('click', () => {{
+    if (blockGroupInput) blockGroupInput.disabled = false;
+    if (blockModal) blockModal.hidden = true;
+  }});
+}});
+
+document.querySelectorAll('[data-save-block]').forEach((button) => {{
+  button.addEventListener('click', () => {{
+    const groupName = blockGroupInput?.value || 'Governance';
+    const title = (blockTitleInput?.value || '').trim();
+    const note = (blockNoteInput?.value || '').trim();
+    if (!title) {{
+      window.alert('Inserisci il titolo del blocco.');
+      blockTitleInput?.focus();
+      return;
+    }}
+    const targetGroup = Array.from(document.querySelectorAll('.responsibility-group')).find((group) => group.dataset.groupName === groupName);
+    const targetList = targetGroup?.querySelector('.responsibility-list');
+    if (!targetList) {{
+      window.alert('Seleziona un quadrante valido dell organigramma.');
+      return;
+    }}
+    targetList.appendChild(createEmptyResponsibilityNode(title, groupName, note));
+    addFunctionOption(title, groupName);
+    if (blockGroupInput) blockGroupInput.disabled = false;
+    if (blockModal) blockModal.hidden = true;
+  }});
+}});
+
+if (blockModal) {{
+  blockModal.addEventListener('click', (event) => {{
+    if (event.target === blockModal) blockModal.hidden = true;
+  }});
+}}
+
+document.querySelectorAll('[data-delete-block]').forEach((button) => {{
+  button.addEventListener('click', () => {{
+    const title = button.dataset.function || 'questo blocco';
+    if (window.confirm(`Eliminare il blocco "${{title}}" dall'organigramma?`)) {{
+      button.closest('.responsibility-node')?.classList.add('is-archived-demo');
+    }}
+  }});
+}});
+
+document.querySelectorAll('[data-close-assignment]').forEach((button) => {{
+  button.addEventListener('click', () => {{
+    if (assignmentModal) assignmentModal.hidden = true;
+  }});
+}});
+
+if (assignmentModal) {{
+  assignmentModal.addEventListener('click', (event) => {{
+    if (event.target === assignmentModal) assignmentModal.hidden = true;
+  }});
+}}
+
+document.querySelectorAll('[data-open-shareholder]').forEach((button) => {{
+  button.addEventListener('click', () => {{
+    if (shareholderModal) shareholderModal.hidden = false;
+    shareholderModal?.querySelector('input[name="name"]')?.focus();
+  }});
+}});
+
+document.querySelectorAll('[data-close-shareholder]').forEach((button) => {{
+  button.addEventListener('click', () => {{
+    if (shareholderModal) shareholderModal.hidden = true;
+  }});
+}});
+
+if (shareholderModal) {{
+  shareholderModal.addEventListener('click', (event) => {{
+    if (event.target === shareholderModal) shareholderModal.hidden = true;
+  }});
+}}
+</script>
+"""
+        if active_tab == "anagrafiche" and selected_person:
+            selected_status = "Attivo" if selected_person_functions else "Da censire"
+            selected_next_deadline = next((a["expires_at"] for a in agreements if a["person_name"] == selected_person and a["expires_at"]), "")
+            body = f"""
+<p class="page-copy">Scheda anagrafica operativa con funzioni, accordi, documenti e scadenze collegate all'organigramma.</p>
+<nav class="subtabs">{tab_html}</nav>
+<section class="deal-header">
+  <div>
+    <p class="eyebrow">CRM organigramma</p>
+    <h2>{esc(selected_person)}</h2>
+    <p class="muted">{esc(', '.join(selected_person_functions) or 'Nessuna funzione assegnata')}</p>
+  </div>
+  <div class="header-badges">
+    <span class="badge {badge_class(selected_status)}">{esc(selected_status)}</span>
+    <span class="badge neutral">{len(selected_person_functions)} funzioni</span>
+    <button class="button primary" type="button" data-open-action data-action="Modifica anagrafica">Modifica anagrafica</button>
+    <a class="button ghost" href="{rel_url('/compagine', ctx, {'tab': 'anagrafiche'})}">Torna alla lista</a>
+  </div>
+</section>
+<section class="metric-grid">
+  <div class="metric"><span>Funzioni</span><strong>{len(selected_person_functions)}</strong></div>
+  <div class="metric"><span>Accordi</span><strong>{person_agreement_counts.get(selected_person, 0)}</strong></div>
+  <div class="metric"><span>Documenti</span><strong>{person_document_counts.get(selected_person, 0)}</strong></div>
+  <div class="metric"><span>Prossima scadenza</span><strong>{esc(nice_date(selected_next_deadline) or '-')}</strong></div>
+</section>
+<section class="workspace-grid">
+  <div class="panel">
+    <div class="section-head"><h2>Profilo anagrafico</h2><span class="panel-kicker">persona</span></div>
+    <dl class="definition-list">
+      <dt>Nome</dt><dd>{esc(selected_first_name or '-')}</dd>
+      <dt>Cognome</dt><dd>{esc(selected_last_name or '-')}</dd>
+      <dt>Email</dt><dd>-</dd>
+      <dt>Telefono</dt><dd>-</dd>
+      <dt>Stato</dt><dd>{esc(selected_status)}</dd>
+      <dt>Note</dt><dd>Da completare nella scheda anagrafica.</dd>
+    </dl>
+  </div>
+  <div class="panel">
+    <div class="section-head"><h2>Azioni operative</h2><span class="panel-kicker">funzioni e documenti</span></div>
+    <div class="inline-actions left">
+      <button class="button primary" type="button" data-open-action data-action="Aggiungi funzione">+ Aggiungi funzione</button>
+      <button class="button ghost" type="button" data-open-action data-action="Collega documento">+ Collega documento</button>
+      <button class="button secondary" type="button" data-open-action data-action="Collega accordo">+ Collega accordo</button>
+    </div>
+  </div>
+</section>
+<section class="panel">
+  <div class="section-head"><h2>Funzioni in organigramma</h2><span class="panel-kicker">inizio, fine, documenti</span></div>
+  <ul class="assignment-list">{selected_person_function_rows}</ul>
+</section>
+<section class="workspace-grid">
+  <div class="panel">
+    <div class="section-head"><h2>Accordi / contratti collegati</h2><span class="panel-kicker">scadenze</span></div>
+    <table class="data-table compact">
+      <thead><tr><th>Accordo</th><th>Funzioni / ambito</th><th>Stato</th><th>Scadenza</th></tr></thead>
+      <tbody>{selected_agreement_rows}</tbody>
+    </table>
+  </div>
+  <div class="panel">
+    <div class="section-head"><h2>Documenti collegati</h2><button class="button ghost" type="button" data-open-action data-action="Nuovo documento">+ Documento</button></div>
+    <div class="document-list">{person_doc_rows}</div>
+  </div>
+</section>
+<div class="assignment-modal" data-action-modal hidden>
+  <section class="assignment-dialog action-dialog">
+    <div class="section-head">
+      <div>
+        <h2 data-action-title>Azione soggetto</h2>
+        <span class="muted">Popup demo: qui andranno modifica dati, collegamento documenti, funzioni e accordi.</span>
+      </div>
+      <button class="modal-close buttonless" type="button" data-close-action>x</button>
+    </div>
+    <form class="form-grid assignment-form">
+      <label>Azione
+        <input data-action-name value="" placeholder="Azione selezionata">
+      </label>
+      <label>Soggetto
+        <input value="{esc(selected_person)}">
+      </label>
+      <label class="full-span">Funzione organigramma
+        <select name="function_name" data-action-function-select>
+          {function_select_options}
+        </select>
+      </label>
+      <div class="full-span linked-subform" data-action-new-function hidden>
+        <label>Titolo nuova funzione
+          <input name="new_function_title" data-action-new-title placeholder="es. Responsabile continuita operativa">
+        </label>
+        <label>Quadrante organigramma
+          <select name="new_function_group">
+            <option>Governance</option>
+            <option>Funzioni responsabili</option>
+            <option>Area di controllo</option>
+            <option>Servizi in outsourcing</option>
+            <option>Comitato tecnico progetti</option>
+            <option>Advisory Committee</option>
+            <option>Area operativa</option>
+          </select>
+        </label>
+      </div>
+      <label>Ruolo / responsabilita
+        <input name="role" placeholder="es. responsabile, referente, societa incaricata">
+      </label>
+      <label>Data inizio
+        <input type="date" name="start_date">
+      </label>
+      <label>Data fine / scadenza
+        <input type="date" name="end_date">
+      </label>
+      <label class="full-span">Documento collegato alla funzione
+        <select name="linked_document">
+          {document_options}
+        </select>
+      </label>
+      <label>Alert scadenza
+        <select name="deadline_alert">
+          <option>60 giorni prima</option>
+          <option>30 giorni prima</option>
+          <option>15 giorni prima</option>
+          <option>Nessun alert</option>
+        </select>
+      </label>
+      <label class="full-span">Note operative
+        <textarea placeholder="Cosa copre la funzione, quale documento prova il collegamento e per quali comunicazioni o controlli serve."></textarea>
+      </label>
+      <div class="form-actions left full-span">
+        <button class="button primary" type="button" data-close-action>Salva collegamento</button>
+        <button class="button ghost" type="button" data-close-action>Annulla</button>
+      </div>
+    </form>
+  </section>
+</div>
+<script>
+const actionModal = document.querySelector('[data-action-modal]');
+const actionTitle = document.querySelector('[data-action-title]');
+const actionName = document.querySelector('[data-action-name]');
+const actionFunctionSelect = document.querySelector('[data-action-function-select]');
+const actionNewFunctionFields = document.querySelector('[data-action-new-function]');
+const actionNewFunctionTitle = document.querySelector('[data-action-new-title]');
+
+function setActionFunctionChoice(value) {{
+  if (!actionFunctionSelect) return;
+  const hasOption = Array.from(actionFunctionSelect.options).some((option) => option.value === value);
+  if (value && hasOption) {{
+    actionFunctionSelect.value = value;
+  }} else if (value) {{
+    actionFunctionSelect.value = '__new__';
+    if (actionNewFunctionTitle) actionNewFunctionTitle.value = value;
+  }} else {{
+    actionFunctionSelect.value = '';
+  }}
+  if (actionNewFunctionFields) actionNewFunctionFields.hidden = actionFunctionSelect.value !== '__new__';
+}}
+
+if (actionFunctionSelect) {{
+  actionFunctionSelect.addEventListener('change', () => {{
+    if (actionNewFunctionFields) actionNewFunctionFields.hidden = actionFunctionSelect.value !== '__new__';
+  }});
+}}
+
+document.querySelectorAll('[data-open-action]').forEach((button) => {{
+  button.addEventListener('click', () => {{
+    const action = button.dataset.action || 'Azione soggetto';
+    if (actionTitle) actionTitle.textContent = action;
+    if (actionName) actionName.value = action;
+    setActionFunctionChoice(button.dataset.function || '');
+    if (actionModal) actionModal.hidden = false;
+  }});
+}});
+
+document.querySelectorAll('[data-close-action]').forEach((button) => {{
+  button.addEventListener('click', () => {{
+    if (actionModal) actionModal.hidden = true;
+  }});
+}});
+
+if (actionModal) {{
+  actionModal.addEventListener('click', (event) => {{
+    if (event.target === actionModal) actionModal.hidden = true;
+  }});
+}}
+
+document.querySelectorAll('[data-confirm-action]').forEach((button) => {{
+  button.addEventListener('click', () => {{
+    const action = button.dataset.action || 'procedere';
+    const fn = button.dataset.function || 'questa funzione';
+    if (window.confirm(`Confermi di ${{action}} "${{fn}}"?`)) {{
+      button.closest('li')?.classList.add('is-archived-demo');
+    }}
+  }});
+}});
+</script>
+"""
+        elif active_tab == "anagrafiche":
+            body = f"""
+<p class="page-copy">Anagrafica unica dei soggetti collegati all'organigramma: persone fisiche, societa ed enti possono coprire qualunque funzione, con accordi, documenti e scadenze collegati.</p>
+<nav class="subtabs">{tab_html}</nav>
+<section class="metric-grid">
+  <div class="metric"><span>Soggetti</span><strong>{len(subject_entries)}</strong></div>
+  <div class="metric"><span>Persone fisiche</span><strong>{len(person_registry)}</strong></div>
+  <div class="metric"><span>Societa / enti</span><strong>{len(supplier_registry)}</strong></div>
+  <div class="metric"><span>Accordi</span><strong>{len(agreements)}</strong></div>
+</section>
+<section class="panel">
+  <div class="section-head">
+    <div><h2>Lista soggetti</h2><span class="muted">Da qui si censiscono natura del soggetto, funzioni collegate, accordi, documenti e scadenze operative.</span></div>
+    <button class="button primary" type="button">+ Nuovo</button>
+  </div>
+  <div class="table-scroll">
+    <table class="data-table compact directory-table">
+      <thead><tr><th>Soggetto</th><th>Funzioni</th><th>Accordi / contratti</th><th>Documenti</th><th>Scadenza</th><th>Stato</th><th></th></tr></thead>
+      <tbody>{subject_directory}</tbody>
+    </table>
+  </div>
+</section>
+<section class="workspace-grid">
+  <div class="panel">
+    <div class="section-head"><h2>Censisci soggetto / collega accordo</h2><span class="panel-kicker">design flusso</span></div>
+    <form class="form-grid">
+      <label>Tipo soggetto<select><option>Persona fisica</option><option>Societa / ente</option></select></label>
+      <label>Soggetto<input placeholder="nome persona o ragione sociale"></label>
+      <label>Tipo accordo<select><option>Lettera di incarico</option><option>NDA</option><option>Contratto fornitore</option><option>Delega</option><option>SLA</option><option>Altro</option></select></label>
+      <label>Ruolo nel rapporto<input placeholder="es. responsabile, societa incaricata, advisor"></label>
+      <label class="full-span">Funzioni coperte<input list="org-function-options" placeholder="es. Compliance interna, Risk control, Reclami"></label>
+      <label>Data decorrenza<input type="date"></label>
+      <label>Scadenza<input type="date"></label>
+      <label class="full-span">Documento / contratto<input type="file"></label>
+      <div class="form-actions"><button class="button primary" type="button">Collega accordo</button></div>
+    </form>
+    <datalist id="org-function-options">{function_options}</datalist>
+  </div>
+  <div class="panel">
+    <div class="section-head"><h2>Scadenze accordi</h2><span class="panel-kicker">alert</span></div>
+    <table class="data-table compact">
+      <thead><tr><th>Soggetto</th><th>Accordo</th><th>Funzioni / ambito</th><th>Scadenza</th></tr></thead>
+      <tbody>{anagraphic_agreement_rows}</tbody>
+    </table>
+  </div>
+</section>
+{person_modal}
+"""
+        self.render("Compagine - organigramma - partecipogramma", body, "compagine")
+
+    def page_governance(self):
+        ctx = self.get_ctx()
+        pid = ctx["platform_id"]
+        meetings = rows(
+            """
+            SELECT bm.*, doc.title AS minutes_title
+            FROM board_meetings bm
+            LEFT JOIN documents doc ON doc.id = bm.minutes_document_id
+            WHERE bm.platform_id = ?
+            ORDER BY bm.meeting_date DESC
+            """,
+            (pid,),
+        )
+        board_members = rows(
+            "SELECT * FROM committee_members WHERE platform_id = ? AND committee = 'CdA' AND active = 1 ORDER BY role, name",
+            (pid,),
+        )
+        decisions = rows(
+            """
+            SELECT bd.*, d.title AS deal_title, doc.title AS document_title
+            FROM board_decisions bd
+            JOIN deals d ON d.id = bd.deal_id
+            LEFT JOIN documents doc ON doc.id = bd.generated_document_id
+            WHERE d.platform_id = ?
+            ORDER BY bd.created_at DESC
+            """,
+            (pid,),
+        )
+        params = parse_qs(urlparse(self.path).query)
+        active_tab = (params.get("tab") or ["convocazioni"])[0]
+        if active_tab not in {"convocazioni", "sedute", "membri"}:
+            active_tab = "convocazioni"
+        mode = (params.get("mode") or [""])[0]
+        selected_meeting_id = int((params.get("meeting") or [0])[0] or 0)
+        selected_meeting = None if mode == "new" else next((m for m in meetings if m["id"] == selected_meeting_id), None)
+        if not selected_meeting and mode != "new":
+            selected_meeting = meetings[0] if meetings else None
+        selected_member = board_members[0] if board_members else None
+        selected_date = nice_date(selected_meeting["meeting_date"]) if selected_meeting else ""
+        selected_title = selected_meeting["title"] if selected_meeting else "CdA - (data da definire)"
+        selected_agenda = selected_meeting["agenda"] if selected_meeting else ""
+        selected_link = selected_meeting["meeting_link"] if selected_meeting else ""
+        invited_count = len(board_members)
+        board_emails = ",".join(m["email"] for m in board_members)
+        tabs = [
+            ("convocazioni", "Convocazioni"),
+            ("sedute", "Sedute & verbali"),
+            ("membri", "Membri CdA"),
+        ]
+        tab_html = "".join(
+            f'<a class="subtab {"active" if key == active_tab else ""}" href="{rel_url("/governance", ctx, {"tab": key})}">{label}</a>'
+            for key, label in tabs
+        )
+        new_convocation_item = (
+            '<a class="record-item active" href="#"><strong>CdA - (data da definire)</strong><span>Mista - ore 18:00 - 0 invitati</span><small>Bozza</small></a>'
+            if active_tab == "convocazioni" and mode == "new"
+            else ""
+        )
+        meeting_items = "".join(
+            f"""<a class="record-item {"active" if selected_meeting and m['id'] == selected_meeting['id'] else ""}" href="{rel_url('/governance', ctx, {'tab': 'convocazioni', 'meeting': m['id']})}">
+              <strong>{esc(m['title'] or 'CdA - (data da definire)')}</strong>
+              <span>{esc('Mista')} - {esc(nice_date(m['meeting_date']))} - {len(board_members)} invitati</span>
+              <small>{esc(m['status'])}</small>
+            </a>"""
+            for idx, m in enumerate(meetings)
+        )
+        meeting_items = new_convocation_item + (meeting_items or '<p class="empty-state">Nessuna convocazione.</p>')
+        new_seduta_item = (
+            '<a class="record-item active" href="#"><strong>(senza titolo)</strong><span>Seduta ordinaria - data da definire</span><small>Bozza</small></a>'
+            if active_tab == "sedute" and mode == "new"
+            else ""
+        )
+        seduta_items = "".join(
+            f"""<a class="record-item {"active" if selected_meeting and m['id'] == selected_meeting['id'] else ""}" href="{rel_url('/governance', ctx, {'tab': 'sedute', 'meeting': m['id']})}">
+              <strong>{esc(m['title'] or '(senza titolo)')}</strong>
+              <span>Seduta ordinaria - {esc(nice_date(m['meeting_date']))}</span>
+              <small>{esc(m['status'])}</small>
+            </a>"""
+            for idx, m in enumerate(meetings)
+        )
+        seduta_items = new_seduta_item + (seduta_items or '<p class="empty-state">Nessuna seduta.</p>')
+        member_items = "".join(
+            f"""<div class="record-item {"active" if idx == 0 else ""}">
+              <strong>{esc(m['name'])}</strong>
+              <span>{esc(m['role'])}</span>
+              <small>{esc(m['email'])}</small>
+            </div>"""
+            for idx, m in enumerate(board_members)
+        ) or '<p class="empty-state">Nessun membro in rubrica.</p>'
+        invite_warning = (
+            f"<p class=\"muted\">{invited_count} membri in rubrica CdA pronti per la convocazione.</p>"
+            if invited_count
+            else '<p class="danger-text">Nessun membro in rubrica. Aggiungili in "Membri CdA" per poterli convocare.</p>'
+        )
+        convocation_text = f"""Oggetto: Convocazione del Consiglio di Amministrazione di {ctx['platform']['name']} - {selected_date or '[data]'}
+
+Egregi Consiglieri,
+con la presente si convoca il Consiglio di Amministrazione di {ctx['platform']['name']}, che si terra il giorno {selected_date or '[data]'} alle ore 18:00, presso la sede legale, con possibilita di collegamento da remoto al link: {selected_link or '[link riunione]'}, per discutere e deliberare sul seguente
+
+ORDINE DEL GIORNO
+{selected_agenda or '1. [punto all ordine del giorno]'}
+
+Si prega di confermare la propria presenza.
+"""
+        mail_subject = f"Convocazione CdA {ctx['platform']['name']} - {selected_date or '[data]'}"
+        mailto_url = f"mailto:{quote(board_emails, safe='@,.')}?subject={quote(mail_subject)}&body={quote(convocation_text)}"
+        decision_rows = "".join(
+            f"""<li>
+              <strong>{esc(d['deal_title'])}</strong>
+              <span>{esc(d['outcome'])} - {esc(nice_date(d['created_at']))}</span>
+            </li>"""
+            for d in decisions
+        ) or '<li class="empty-row">Nessuna delibera collegata.</li>'
+        convocation_view = f"""
+<section class="governance-board">
+  <div class="panel">
+    <div class="section-head"><h2>Convocazioni</h2><a class="button primary" href="{rel_url('/governance', ctx, {'tab': 'convocazioni', 'mode': 'new'})}">+ Nuova</a></div>
+    <div class="record-list">{meeting_items}</div>
+  </div>
+  <div class="panel detail-panel">
+    <div class="section-head"><h2>Dettaglio convocazione</h2><span class="panel-kicker">Email & link</span></div>
+    <form class="form-grid governance-form" method="post" action="/governance/meeting-create">
+      {hidden_ctx(ctx)}
+      <input type="hidden" name="status" value="Convocata">
+      <label>Data<input name="meeting_date" type="date" value="{esc(selected_date)}" required></label>
+      <label>Ora<input name="meeting_time" value="18:00"></label>
+      <label>Modalita<select name="meeting_mode"><option>Mista</option><option>Presenza</option><option>Videoconferenza</option></select></label>
+      <label>Luogo<input name="meeting_place" value="sede legale"></label>
+      <label class="full-span">Oggetto convocazione<input name="title" value="{esc(selected_title)}"></label>
+      <label class="full-span link-row">Link riunione (videoconferenza)<span><input id="meeting-link" name="meeting_link" value="{esc(selected_link)}" placeholder="incolla qui il link Meet / Zoom / Teams"><button class="button ghost" type="button" data-generate-meeting-link="meet" data-target="#meeting-link">Crea Meet</button><button class="button ghost" type="button" data-generate-meeting-link="zoom" data-target="#meeting-link">Crea Zoom</button></span></label>
+      <div class="full-span">
+        <p class="panel-kicker">Invitati (rubrica CdA)</p>
+        {invite_warning}
+        <p class="muted">Destinatari: {esc(board_emails or 'nessun indirizzo disponibile')}</p>
+      </div>
+      <label class="full-span">Ordine del giorno (una voce per riga)<textarea name="agenda" rows="5">{esc(selected_agenda)}</textarea></label>
+      <div class="form-actions left"><button class="button primary" type="submit">Salva convocazione</button><a class="button ghost" href="{rel_url('/governance', ctx, {'tab': 'convocazioni'})}">Annulla</a></div>
+      <label class="full-span">Testo della convocazione<textarea id="convocation-text" class="template-text" rows="12">{esc(convocation_text)}</textarea></label>
+      <div class="form-actions left"><a class="button primary" href="{esc(mailto_url)}">Apri email a tutti</a><button class="button ghost" type="button" data-copy-from="#convocation-text">Copia testo</button></div>
+    </form>
+  </div>
+</section>"""
+        sedute_view = f"""
+<section class="governance-board">
+  <div class="panel">
+    <div class="section-head"><h2>Sedute & verbali</h2><a class="button primary" href="{rel_url('/governance', ctx, {'tab': 'sedute', 'mode': 'new'})}">+ Nuova seduta</a></div>
+    <div class="record-list">{seduta_items}</div>
+  </div>
+  <div class="panel detail-panel">
+    <div class="section-head"><h2>Dettaglio seduta</h2><span class="panel-kicker">Relazione & iter</span></div>
+    <ol class="mini-progress"><li class="active">Bozza</li><li>In Comitato Tecnico</li><li>In Advisory Committee</li><li>In approvazione Board</li><li>Esito</li></ol>
+    <form class="form-grid governance-form" method="post" action="/governance/meeting-create">
+      {hidden_ctx(ctx)}
+      <label class="full-span">Oggetto della seduta<input name="title" value="{esc('' if mode == 'new' and active_tab == 'sedute' else selected_title)}" placeholder="es. Seduta CdA del..." required></label>
+      <label>Data seduta<input name="meeting_date" type="date" value="{esc(selected_date)}" required></label>
+      <label>Tipo<select name="meeting_type"><option>Seduta ordinaria</option><option>Seduta straordinaria</option></select></label>
+      <label>Stato<select name="status"><option>Bozza</option><option>Convocata</option><option>In preparazione verbale</option><option>Verbale archiviato</option></select></label>
+      <label class="full-span">Ordine del giorno<textarea name="agenda" rows="6" placeholder="Punti all ordine del giorno...">{esc('' if mode == 'new' and active_tab == 'sedute' else selected_agenda)}</textarea></label>
+      <div class="full-span">
+        <p class="panel-kicker">Documenti a corredo</p>
+        <p class="muted">Nessun allegato (relazione, KIIS, pareri, due diligence...).</p>
+        <button class="button ghost" type="button">+ Allegato</button>
+      </div>
+      <label class="full-span">Delibere / verbale<textarea rows="4" placeholder="Delibere assunte, esiti, condizioni..."></textarea></label>
+      <div class="form-actions left"><button class="button primary" type="submit">Salva seduta</button><a class="button ghost danger-button" href="{rel_url('/governance', ctx, {'tab': 'sedute'})}">Elimina</a></div>
+    </form>
+    <div class="linked-decisions"><p class="panel-kicker">Delibere generate dai deal</p><ul>{decision_rows}</ul></div>
+  </div>
+</section>"""
+        members_view = f"""
+<section class="governance-board">
+  <div class="panel">
+    <div class="section-head"><h2>Membri CdA</h2><button class="button primary" type="button">+ Membro</button></div>
+    <div class="record-list">{member_items}</div>
+  </div>
+  <div class="panel detail-panel">
+    <div class="section-head"><h2>Dettaglio membro CdA</h2><span class="panel-kicker">Rubrica & mandato</span></div>
+    <form class="form-grid governance-form">
+      <label>Nome<input value="{esc(selected_member['name'] if selected_member else '')}"></label>
+      <label>Ruolo<input value="{esc(selected_member['role'] if selected_member else '')}"></label>
+      <label>Email<input value="{esc(selected_member['email'] if selected_member else '')}"></label>
+      <label>Stato<select><option>Attivo</option><option>Non attivo</option></select></label>
+      <label>Inizio mandato<input type="date"></label>
+      <label>Fine mandato<input type="date"></label>
+      <label class="full-span">Note incarico<textarea rows="5" placeholder="Deleghe, patti, accordi collegati..."></textarea></label>
+      <div class="form-actions left"><button class="button primary" type="button">Salva membro</button><button class="button ghost" type="button">Collega accordo</button></div>
+    </form>
+  </div>
+</section>"""
+        tab_view = {"convocazioni": convocation_view, "sedute": sedute_view, "membri": members_view}[active_tab]
+        body = f"""
+<p class="page-copy">Il mondo del CdA: convocazione delle sedute con email automatica e link di riunione, registrazione delle sedute con verbali e relativo archivio, rubrica dei membri.</p>
+<div class="subtabs">{tab_html}</div>
+{tab_view}
+"""
+        self.render("Governance · Consiglio di Amministrazione", body, "governance")
+
+    def page_investors(self):
+        ctx = self.get_ctx()
+        pid = ctx["platform_id"]
+        params = parse_qs(urlparse(self.path).query)
+        mode = (params.get("mode") or [""])[0]
+        investors = rows(
+            """
+            SELECT inv.*, COUNT(i.id) AS deal_count, COALESCE(SUM(i.amount), 0) AS tracked_total
+            FROM investors inv
+            LEFT JOIN investments i ON i.investor_id = inv.id
+            WHERE inv.platform_id = ?
+            GROUP BY inv.id
+            ORDER BY inv.name
+            """,
+            (pid,),
+        )
+        investments = rows(
+            """
+            SELECT i.*, inv.name AS investor_name, d.title AS deal_title
+            FROM investments i
+            JOIN investors inv ON inv.id = i.investor_id
+            JOIN deals d ON d.id = i.deal_id
+            WHERE inv.platform_id = ?
+            ORDER BY i.invested_at DESC
+            """,
+            (pid,),
+        )
+        total_invested = sum(float(i["total_invested"] or 0) for i in investors)
+        non_sophisticated = sum(1 for i in investors if i["investor_type"] == "Non sofisticato")
+        onboarding_open = sum(1 for i in investors if i["onboarding_status"] != "Completo")
+        api_linked = sum(1 for i in investors if (i["source_system"] or "").startswith("adapter:"))
+        recurring = sum(1 for i in investors if i["recurrence_status"] == "Ricorrente" or int(i["deal_count"] or 0) > 1)
+        investor_rows = []
+        for inv in investors:
+            display_total = max(float(inv["total_invested"] or 0), float(inv["tracked_total"] or 0))
+            investor_rows.append(
+                f"""<tr>
+                  <td><a href="{rel_url('/investors/' + str(inv['id']), ctx)}"><strong>{esc(inv['name'])}</strong></a><br><span class="muted">{esc(inv['email'])}</span></td>
+                  <td>{esc(inv['phone'] or '-')}</td>
+                  <td>{esc(inv['investor_type'])}</td>
+                  <td>{money(display_total)}</td>
+                  <td>{inv['deal_count']}</td>
+                  <td>{esc(inv['recurrence_status'])}<br><span class="muted">{esc(inv['preferred_channel'])}</span></td>
+                  <td>{esc(inv['preferred_categories'] or '-')}</td>
+                  <td><span class="badge {badge_class(inv['onboarding_status'])}">{esc(inv['onboarding_status'])}</span></td>
+                  <td>{esc(inv['source_system'] or 'Manuale')}<br><span class="muted">{esc(nice_date(inv['last_synced_at']))}</span></td>
+                </tr>"""
+            )
+        investment_rows = "".join(
+            f"""<tr>
+              <td>{esc(nice_date(i['invested_at']))}</td>
+              <td><a href="{rel_url('/investors/' + str(i['investor_id']), ctx)}">{esc(i['investor_name'])}</a></td>
+              <td>{esc(i['deal_title'])}</td>
+              <td>{money(i['amount'])}</td>
+              <td><span class="badge {badge_class(i['status'])}">{esc(i['status'])}</span></td>
+            </tr>"""
+            for i in investments
+        )
+        action_button = ""
+        create_modal = ""
+        if user_can(ctx["user"], "manage_investors"):
+            action_button = f'<a class="button primary" href="{rel_url("/investors", ctx, {"mode": "new"})}">+ Nuovo investitore</a>'
+            if mode == "new":
+                create_modal = f"""
+<div class="modal-backdrop">
+  <section class="person-modal entity-modal">
+    <div class="section-head">
+      <h2>Nuovo investitore</h2>
+      <a class="modal-close" href="{rel_url('/investors', ctx)}">x</a>
+    </div>
+    <form class="form-grid" method="post" action="/investors/create">
+      {hidden_ctx(ctx)}
+      <label>Nome<input name="name" required></label>
+      <label>Email<input name="email" type="email" required></label>
+      <label>Telefono<input name="phone" placeholder="+39 ..."></label>
+      <label>Tipologia<select name="investor_type"><option>Non sofisticato</option><option>Sofisticato</option></select></label>
+      <label>Totale investito<input name="total_invested" type="number" min="0" step="100" value="0"></label>
+      <label>Stato CRM<select name="crm_status"><option>Attivo</option><option>Prospect</option><option>Da ricontattare</option><option>In pausa</option></select></label>
+      <label>Ricorrenza<select name="recurrence_status"><option>Da valutare</option><option>Prospect</option><option>Occasionale</option><option>Ricorrente</option></select></label>
+      <label>Canale preferito<select name="preferred_channel"><option>Email</option><option>Telefono</option><option>PEC</option><option>WhatsApp</option><option>Portale</option></select></label>
+      <label>Profilo rischio<select name="risk_profile"><option>Da profilare</option><option>Prudente</option><option>Bilanciato</option><option>Dinamico</option><option>Professionale</option></select></label>
+      <label>Ticket minimo<input name="preferred_ticket_min" type="number" min="0" step="1000" value="0"></label>
+      <label>Ticket massimo<input name="preferred_ticket_max" type="number" min="0" step="1000" value="0"></label>
+      <label class="full-span">Preferenze deal<input name="preferred_categories" placeholder="es. MedTech, energia, PMI produttive"></label>
+      <label>Onboarding<select name="onboarding_status"><option>Da completare</option><option>In revisione</option><option>Completo</option></select></label>
+      <label>Test ingresso<select name="entry_test_status"><option>Da completare</option><option>Superato</option><option>Non richiesto</option></select></label>
+      <label>Simulazione perdite<select name="loss_simulation_status"><option>Da completare</option><option>Completata</option><option>Non richiesta</option></select></label>
+      <label>Soglie<select name="threshold_status"><option>Da verificare</option><option>Sotto soglia</option><option>Soglia superata</option><option>Verificata</option></select></label>
+      <label>Periodo riflessione<select name="reflection_status"><option>Non applicabile</option><option>In corso</option><option>Decorso</option></select></label>
+      <label>Fonte dato<select name="source_system"><option>Manuale</option><option>adapter:future-platform-api</option><option>Import CSV</option><option>Backoffice</option></select></label>
+      <label>ID esterno<input name="external_investor_id" placeholder="ID piattaforma sorgente"></label>
+      <label class="full-span">Note CRM<textarea name="crm_notes" rows="3"></textarea></label>
+      <div class="form-actions left"><button class="button primary" type="submit">Crea anagrafica</button><a class="button ghost" href="{rel_url('/investors', ctx)}">Annulla</a></div>
+    </form>
+  </section>
+</div>"""
+        body = f"""
+<section class="metric-grid">
+  <div class="metric"><span>Investitori</span><strong>{len(investors)}</strong></div>
+  <div class="metric"><span>Non sofisticati</span><strong>{non_sophisticated}</strong></div>
+  <div class="metric"><span>Ricorrenti</span><strong>{recurring}</strong></div>
+  <div class="metric"><span>Da API</span><strong>{api_linked}</strong></div>
+  <div class="metric"><span>Totale investito</span><strong>{money(total_invested)}</strong></div>
+</section>
+<section class="panel">
+  <div class="section-head"><h2>Anagrafica e onboarding</h2>{action_button}</div>
+  <table class="data-table roomy">
+    <thead><tr><th>Investitore</th><th>Telefono</th><th>Tipo</th><th>Totale</th><th>Deal</th><th>Relazione</th><th>Preferenze</th><th>Onboarding</th><th>Fonte</th></tr></thead>
+    <tbody>{''.join(investor_rows)}</tbody>
+  </table>
+</section>
+<section class="panel">
+  <div class="section-head"><h2>Deal e importi</h2></div>
+  <table class="data-table compact"><thead><tr><th>Data</th><th>Investitore</th><th>Deal</th><th>Importo</th><th>Stato</th></tr></thead><tbody>{investment_rows}</tbody></table>
+</section>
+{create_modal}
+"""
+        self.render("Investitori", body, "investors")
+
+    def page_investor_detail(self, investor_id):
+        ctx = self.get_ctx()
+        pid = ctx["platform_id"]
+        params = parse_qs(urlparse(self.path).query)
+        mode = (params.get("mode") or [""])[0]
+        investor = row("SELECT * FROM investors WHERE id = ? AND platform_id = ?", (investor_id, pid))
+        if not investor:
+            self.not_found()
+            return
+        investments = rows(
+            """
+            SELECT i.*, d.title AS deal_title, d.phase, d.funding_target, p.name AS proponent_name, p.notes AS proponent_notes
+            FROM investments i
+            JOIN deals d ON d.id = i.deal_id
+            JOIN proponents p ON p.id = d.proponent_id
+            WHERE i.investor_id = ?
+            ORDER BY i.invested_at DESC
+            """,
+            (investor_id,),
+        )
+        all_deals = rows(
+            """
+            SELECT d.*, p.name AS proponent_name, p.notes AS proponent_notes, p.internal_score
+            FROM deals d
+            JOIN proponents p ON p.id = d.proponent_id
+            WHERE d.platform_id = ?
+            ORDER BY d.updated_at DESC
+            """,
+            (pid,),
+        )
+        total_tracked = sum(float(i["amount"] or 0) for i in investments)
+        display_total = max(float(investor["total_invested"] or 0), total_tracked)
+        avg_ticket = total_tracked / len(investments) if investments else 0
+        first_investment = min((i["invested_at"] for i in investments), default="")
+        last_investment = max((i["invested_at"] for i in investments), default="")
+        try:
+            days_in_crm = (date.today() - date.fromisoformat(investor["created_at"][:10])).days
+        except ValueError:
+            days_in_crm = 0
+
+        if investor["onboarding_status"] != "Completo":
+            lifecycle = "Onboarding"
+        elif investor["reflection_status"] == "In corso":
+            lifecycle = "Periodo riflessione"
+        elif investments:
+            lifecycle = "Attivo"
+        else:
+            lifecycle = "Prospect"
+        observed_themes = {}
+        for inv in investments:
+            theme = deal_theme(inv["deal_title"], inv["proponent_name"], inv["proponent_notes"])
+            observed_themes[theme] = observed_themes.get(theme, 0) + 1
+        theme_labels = [theme for theme, _ in sorted(observed_themes.items(), key=lambda item: (-item[1], item[0]))]
+        preferred_terms = [term.strip().lower() for term in re.split(r"[,;/]+", investor["preferred_categories"] or "") if term.strip()]
+        effective_recurrence = investor["recurrence_status"]
+        if len(investments) > 1 and effective_recurrence in {"", "Da valutare", "Occasionale"}:
+            effective_recurrence = "Ricorrente"
+        if display_total >= 100000:
+            segment = "High value"
+        elif display_total >= 25000:
+            segment = "Core"
+        elif investments:
+            segment = "Retail attivo"
+        else:
+            segment = "Prospect"
+
+        investment_rows = "".join(
+            f"""<tr>
+              <td>{esc(nice_date(i['invested_at']))}</td>
+              <td><a href="{rel_url('/deals/' + str(i['deal_id']), ctx)}"><strong>{esc(i['deal_title'])}</strong></a><br><span class="muted">{esc(i['proponent_name'])}</span></td>
+              <td>{money(i['amount'])}</td>
+              <td>{esc(phase_label(i['phase']))}</td>
+              <td><span class="badge {badge_class(i['status'])}">{esc(i['status'])}</span></td>
+            </tr>"""
+            for i in investments
+        ) or '<tr><td colspan="5" class="empty-row">Nessun investimento registrato.</td></tr>'
+
+        invested_deal_ids = {int(i["deal_id"]) for i in investments}
+        ticket_min = float(investor["preferred_ticket_min"] or 0)
+        ticket_max = float(investor["preferred_ticket_max"] or 0)
+        match_cards = []
+        for deal in all_deals:
+            if int(deal["id"]) in invested_deal_ids:
+                continue
+            theme = deal_theme(deal["title"], deal["proponent_name"], deal["proponent_notes"])
+            haystack = f"{deal['title']} {deal['proponent_name']} {deal['proponent_notes']} {theme}".lower()
+            score = 45
+            reasons = []
+            if preferred_terms and any(term in haystack for term in preferred_terms):
+                score += 25
+                reasons.append("preferenze dichiarate")
+            if theme in theme_labels:
+                score += 15
+                reasons.append("tema gia investito")
+            if avg_ticket and (not ticket_min or avg_ticket >= ticket_min) and (not ticket_max or avg_ticket <= ticket_max):
+                score += 10
+                reasons.append("ticket coerente")
+            if deal["phase"] in {"pubblicato", "raccolta_in_corso", "pre_pubblicazione"}:
+                score += 10
+                reasons.append("timing sollecitabile")
+            score = min(score, 95)
+            reason_text = ", ".join(reasons) if reasons else "profilo da validare"
+            match_cards.append((score, deal, theme, reason_text))
+        match_cards = sorted(match_cards, key=lambda item: item[0], reverse=True)[:3]
+        match_html = "".join(
+            f"""<div class="match-card">
+              <div>
+                <span>{esc(theme)} - match {score}%</span>
+                <strong><a href="{rel_url('/deals/' + str(deal['id']), ctx)}">{esc(deal['title'])}</a></strong>
+                <small>{esc(deal['proponent_name'])} - {esc(phase_label(deal['phase']))} - {esc(reason)}</small>
+              </div>
+              <em>{money(deal['funding_target'])}</em>
+            </div>"""
+            for score, deal, theme, reason in match_cards
+        ) or '<p class="empty-state">Nessun deal compatibile da proporre in questa vista.</p>'
+
+        matching_notes = []
+        if effective_recurrence == "Ricorrente":
+            matching_notes.append("Inserire in campagne prioritarie con aggiornamenti mirati sui deal coerenti.")
+        elif effective_recurrence == "Occasionale":
+            matching_notes.append("Usare sollecitazioni leggere: interesse da validare prima di invii frequenti.")
+        else:
+            matching_notes.append("Profilo ancora da qualificare: completare preferenze e range ticket.")
+        if investor["preferred_channel"]:
+            matching_notes.append(f"Canale consigliato: {investor['preferred_channel']}.")
+        if theme_labels:
+            matching_notes.append(f"Pattern osservato: {', '.join(theme_labels[:3])}.")
+        matching_note_html = "".join(f"<li>{esc(item)}</li>" for item in matching_notes)
+
+        compliance_items = [
+            ("Classificazione", investor["investor_type"], "Sophisticated / non sophisticated"),
+            ("Onboarding", investor["onboarding_status"], "Identificazione, dati cliente, consensi"),
+            ("Test ingresso", investor["entry_test_status"], "Conoscenza ed esperienza"),
+            ("Simulazione perdite", investor["loss_simulation_status"], "Capacita di sostenere perdite"),
+            ("Soglie", investor["threshold_status"], "Controllo soglia e warning"),
+            ("Riflessione", investor["reflection_status"], "Periodo di riflessione precontrattuale"),
+        ]
+        compliance_html = "".join(
+            f"""<div class="crm-check">
+              <span>{esc(label)}</span>
+              <strong><span class="badge {badge_class(status)}">{esc(status)}</span></strong>
+              <small>{esc(note)}</small>
+            </div>"""
+            for label, status, note in compliance_items
+        )
+
+        actions = []
+        if investor["onboarding_status"] != "Completo":
+            actions.append("Completare onboarding e verifiche anagrafiche prima di nuove sottoscrizioni.")
+        if investor["investor_type"] == "Non sofisticato" and investor["entry_test_status"] != "Superato":
+            actions.append("Richiedere o aggiornare il test d'ingresso per investitore non sofisticato.")
+        if investor["investor_type"] == "Non sofisticato" and investor["loss_simulation_status"] not in {"Completata", "Non richiesta"}:
+            actions.append("Completare simulazione della capacita di sostenere perdite.")
+        if investor["threshold_status"] == "Soglia superata":
+            actions.append("Verificare superamento soglia e warning prima dell'adesione.")
+        if investor["reflection_status"] == "In corso":
+            actions.append("Monitorare decorrenza del periodo di riflessione prima di confermare l'ordine.")
+        if investor["crm_status"] == "Da ricontattare":
+            actions.append(f"Pianificare ricontatto sul canale preferito: {investor['preferred_channel'] or 'da definire'}.")
+        if not investor["preferred_categories"]:
+            actions.append("Completare preferenze deal per abilitare matching e segmentazione campagne.")
+        if (investor["source_system"] or "").startswith("adapter:") and not investor["last_synced_at"]:
+            actions.append("Record collegato ad API ma senza ultima sincronizzazione: verificare mapping sorgente.")
+        if not actions:
+            actions.append("Profilo operativo: mantenere monitoraggio periodico e aggiornamento classificazione.")
+        action_html = "".join(f"<li>{esc(item)}</li>" for item in actions)
+
+        timeline_items = [
+            (investor["created_at"], "Registrazione investitore", f"Profilo creato come {investor['investor_type']}."),
+        ]
+        for inv in investments:
+            timeline_items.append((inv["invested_at"], f"Investimento in {inv['deal_title']}", f"{money(inv['amount'])} - {inv['status']}"))
+        timeline_items.append((today_iso(), "Stato compliance corrente", f"Onboarding: {investor['onboarding_status']}; soglie: {investor['threshold_status']}; riflessione: {investor['reflection_status']}."))
+        timeline_items = sorted(timeline_items, key=lambda item: item[0] or "", reverse=True)
+        timeline_html = "".join(
+            f"""<li>
+              <span>{esc(nice_date(moment))}</span>
+              <strong>{esc(title)}</strong>
+              <small>{esc(detail)}</small>
+            </li>"""
+            for moment, title, detail in timeline_items
+        )
+
+        edit_button = ""
+        edit_modal = ""
+        if user_can(ctx["user"], "manage_investors"):
+            edit_button = f'<a class="button primary" href="{rel_url("/investors/" + str(investor_id), ctx, {"mode": "edit"})}">Modifica investitore</a>'
+            if mode == "edit":
+                edit_modal = f"""
+<div class="modal-backdrop">
+  <section class="person-modal entity-modal">
+    <div class="section-head">
+      <h2>Modifica investitore</h2>
+      <a class="modal-close" href="{rel_url('/investors/' + str(investor_id), ctx)}">x</a>
+    </div>
+    <form class="form-grid" method="post" action="/investors/{investor_id}/update">
+      {hidden_ctx(ctx)}
+      <label>Nome<input name="name" value="{esc(investor['name'])}" required></label>
+      <label>Email<input name="email" type="email" value="{esc(investor['email'])}" required></label>
+      <label>Telefono<input name="phone" value="{esc(investor['phone'])}" placeholder="+39 ..."></label>
+      <label>Tipologia<select name="investor_type">{option_values(['Non sofisticato', 'Sofisticato'], investor['investor_type'])}</select></label>
+      <label>Totale investito<input name="total_invested" type="number" min="0" step="100" value="{esc(investor['total_invested'])}"></label>
+      <label>Stato CRM<select name="crm_status">{option_values(['Attivo', 'Prospect', 'Da ricontattare', 'In pausa'], investor['crm_status'])}</select></label>
+      <label>Ricorrenza<select name="recurrence_status">{option_values(['Da valutare', 'Prospect', 'Occasionale', 'Ricorrente'], investor['recurrence_status'])}</select></label>
+      <label>Canale preferito<select name="preferred_channel">{option_values(['Email', 'Telefono', 'PEC', 'WhatsApp', 'Portale'], investor['preferred_channel'])}</select></label>
+      <label>Profilo rischio<select name="risk_profile">{option_values(['Da profilare', 'Prudente', 'Bilanciato', 'Dinamico', 'Professionale'], investor['risk_profile'])}</select></label>
+      <label>Ticket minimo<input name="preferred_ticket_min" type="number" min="0" step="1000" value="{esc(investor['preferred_ticket_min'])}"></label>
+      <label>Ticket massimo<input name="preferred_ticket_max" type="number" min="0" step="1000" value="{esc(investor['preferred_ticket_max'])}"></label>
+      <label class="full-span">Preferenze deal<input name="preferred_categories" value="{esc(investor['preferred_categories'])}" placeholder="es. MedTech, energia, PMI produttive"></label>
+      <label>Onboarding<select name="onboarding_status">{option_values(['Da completare', 'In revisione', 'Completo'], investor['onboarding_status'])}</select></label>
+      <label>Test ingresso<select name="entry_test_status">{option_values(['Da completare', 'Superato', 'Non richiesto'], investor['entry_test_status'])}</select></label>
+      <label>Simulazione perdite<select name="loss_simulation_status">{option_values(['Da completare', 'Completata', 'Non richiesta'], investor['loss_simulation_status'])}</select></label>
+      <label>Soglie<select name="threshold_status">{option_values(['Da verificare', 'Sotto soglia', 'Soglia superata', 'Verificata'], investor['threshold_status'])}</select></label>
+      <label>Periodo riflessione<select name="reflection_status">{option_values(['Non applicabile', 'In corso', 'Decorso'], investor['reflection_status'])}</select></label>
+      <label>Fonte dato<select name="source_system">{option_values(['Manuale', 'adapter:future-platform-api', 'Import CSV', 'Backoffice'], investor['source_system'])}</select></label>
+      <label>ID esterno<input name="external_investor_id" value="{esc(investor['external_investor_id'])}" placeholder="ID piattaforma sorgente"></label>
+      <label class="full-span">Note override manuale<textarea name="manual_override_notes" rows="3">{esc(investor['manual_override_notes'])}</textarea></label>
+      <label class="full-span">Note CRM<textarea name="crm_notes" rows="3">{esc(investor['crm_notes'])}</textarea></label>
+      <div class="form-actions left"><button class="button primary" type="submit">Salva modifiche</button><a class="button ghost" href="{rel_url('/investors/' + str(investor_id), ctx)}">Annulla</a></div>
+    </form>
+  </section>
+</div>"""
+
+        body = f"""
+<section class="deal-header">
+  <div>
+    <p class="eyebrow">CRM investitore</p>
+    <h2>{esc(investor['name'])}</h2>
+    <p class="muted">{esc(investor['email'])} - {esc(investor['phone'] or 'telefono non indicato')}</p>
+  </div>
+  <div class="header-badges">
+    <span class="badge {badge_class(investor['investor_type'])}">{esc(investor['investor_type'])}</span>
+    <span class="badge {badge_class(investor['crm_status'])}">{esc(investor['crm_status'])}</span>
+    {edit_button}
+    <a class="button ghost" href="{rel_url('/investors', ctx)}">Torna agli investitori</a>
+  </div>
+</section>
+<section class="metric-grid">
+  <div class="metric"><span>Investito tracciato</span><strong>{money(total_tracked)}</strong></div>
+  <div class="metric"><span>Deal sottoscritti</span><strong>{len(investments)}</strong></div>
+  <div class="metric"><span>Ticket medio</span><strong>{money(avg_ticket)}</strong></div>
+  <div class="metric"><span>Ricorrenza</span><strong>{esc(effective_recurrence)}</strong></div>
+  <div class="metric"><span>Giorni in CRM</span><strong>{days_in_crm}</strong></div>
+</section>
+<section class="workspace-grid">
+  <div class="panel">
+    <div class="section-head"><h2>Profilo CRM</h2><span class="panel-kicker">{esc(segment)}</span></div>
+    <dl class="definition-list">
+      <dt>Registrazione</dt><dd>{esc(nice_date(investor['created_at']))}</dd>
+      <dt>Ciclo vita</dt><dd>{esc(lifecycle)}</dd>
+      <dt>Classificazione</dt><dd>{esc(investor['investor_type'])}</dd>
+      <dt>Telefono</dt><dd>{esc(investor['phone'] or '-')}</dd>
+      <dt>Canale preferito</dt><dd>{esc(investor['preferred_channel'] or '-')}</dd>
+      <dt>Profilo rischio</dt><dd>{esc(investor['risk_profile'])}</dd>
+      <dt>Totale dichiarato</dt><dd>{money(investor['total_invested'])}</dd>
+      <dt>Ticket preferito</dt><dd>{money(investor['preferred_ticket_min'])} - {money(investor['preferred_ticket_max'])}</dd>
+      <dt>Primo investimento</dt><dd>{esc(nice_date(first_investment))}</dd>
+      <dt>Ultimo investimento</dt><dd>{esc(nice_date(last_investment))}</dd>
+    </dl>
+  </div>
+  <div class="panel">
+    <div class="section-head"><h2>Compliance investitore</h2><span class="panel-kicker">ECSP</span></div>
+    <div class="crm-check-grid">{compliance_html}</div>
+  </div>
+</section>
+<section class="workspace-grid">
+  <div class="panel">
+    <div class="section-head"><h2>Dati piattaforma e override</h2><span class="panel-kicker">API + manuale</span></div>
+    <dl class="definition-list">
+      <dt>Fonte</dt><dd>{esc(investor['source_system'] or 'Manuale')}</dd>
+      <dt>ID esterno</dt><dd>{esc(investor['external_investor_id'] or '-')}</dd>
+      <dt>Ultimo sync</dt><dd>{esc(nice_date(investor['last_synced_at']))}</dd>
+      <dt>Override</dt><dd>{esc(investor['manual_override_notes'] or 'Nessuna correzione manuale registrata.')}</dd>
+      <dt>Note CRM</dt><dd>{esc(investor['crm_notes'] or '-')}</dd>
+    </dl>
+  </div>
+  <div class="panel">
+    <div class="section-head"><h2>Mappa matching</h2><span class="panel-kicker">sollecitazione</span></div>
+    <div class="crm-check-grid">
+      <div class="crm-check"><span>Preferenze dichiarate</span><strong>{esc(investor['preferred_categories'] or 'da completare')}</strong><small>Campo modificabile o importato da piattaforma.</small></div>
+      <div class="crm-check"><span>Pattern osservato</span><strong>{esc(', '.join(theme_labels) or 'nessuno storico')}</strong><small>Derivato dagli investimenti gia presenti.</small></div>
+      <div class="crm-check"><span>Ricorrenza</span><strong>{esc(effective_recurrence)}</strong><small>Usata per priorita campagne e follow-up.</small></div>
+      <div class="crm-check"><span>Canale</span><strong>{esc(investor['preferred_channel'] or '-')}</strong><small>Canale operativo per contatto e sollecitazione.</small></div>
+    </div>
+  </div>
+</section>
+<section class="workspace-grid">
+  <div class="panel">
+    <div class="section-head"><h2>Deal suggeriti</h2><span class="panel-kicker">matching</span></div>
+    <div class="match-list">{match_html}</div>
+  </div>
+  <div class="panel">
+    <div class="section-head"><h2>Regole di sollecitazione</h2><span class="panel-kicker">CRM</span></div>
+    <ul class="plain-list">{matching_note_html}</ul>
+  </div>
+</section>
+<section class="panel">
+  <div class="section-head"><h2>Storico investimenti</h2><span class="panel-kicker">{len(investments)} deal</span></div>
+  <table class="data-table roomy">
+    <thead><tr><th>Data</th><th>Deal / proponente</th><th>Importo</th><th>Fase deal</th><th>Stato ordine</th></tr></thead>
+    <tbody>{investment_rows}</tbody>
+  </table>
+</section>
+<section class="workspace-grid">
+  <div class="panel">
+    <div class="section-head"><h2>Timeline CRM</h2><span class="panel-kicker">eventi</span></div>
+    <ol class="crm-timeline">{timeline_html}</ol>
+  </div>
+  <div class="panel">
+    <div class="section-head"><h2>Prossime azioni</h2><span class="panel-kicker">operativo</span></div>
+    <ul class="plain-list">{action_html}</ul>
+  </div>
+</section>
+{edit_modal}
+"""
+        self.render(investor["name"], body, "investors")
+
+    def page_conflicts(self):
+        ctx = self.get_ctx()
+        pid = ctx["platform_id"]
+        params = parse_qs(urlparse(self.path).query)
+        mode = (params.get("mode") or [""])[0]
+        conflicts = rows(
+            """
+            SELECT c.*, d.title AS deal_title
+            FROM conflicts c
+            LEFT JOIN deals d ON d.id = c.deal_id
+            WHERE c.platform_id = ?
+            ORDER BY c.opened_at DESC
+            """,
+            (pid,),
+        )
+        deals = rows("SELECT id, title AS name FROM deals WHERE platform_id = ? ORDER BY title", (pid,))
+        open_count = sum(1 for c in conflicts if c["status"] in {"Aperto", "In analisi"})
+        mitigated_count = sum(1 for c in conflicts if c["status"] in {"Mitigato", "Chiuso"})
+        conflict_rows = "".join(
+            f"""<tr>
+              <td>{esc(nice_date(c['opened_at']))}</td>
+              <td><strong>{esc(c['subject'])}</strong><br><span class="muted">{esc(c['description'])}</span></td>
+              <td>{esc(c['related_party'])}</td>
+              <td>{esc(c['deal_title'] or '-')}</td>
+              <td>{esc(c['mitigation'] or '-')}</td>
+              <td><span class="badge {badge_class(c['status'])}">{esc(c['status'])}</span></td>
+            </tr>"""
+            for c in conflicts
+        )
+        action_button = ""
+        create_modal = ""
+        if user_can(ctx["user"], "manage_registers"):
+            action_button = f'<a class="button primary" href="{rel_url("/conflicts", ctx, {"mode": "new"})}">+ Nuovo conflitto</a>'
+            if mode == "new":
+                create_modal = f"""
+<div class="modal-backdrop">
+  <section class="person-modal entity-modal">
+    <div class="section-head">
+      <h2>Nuovo conflitto</h2>
+      <a class="modal-close" href="{rel_url('/conflicts', ctx)}">x</a>
+    </div>
+    <form class="form-grid" method="post" action="/conflicts/create">
+      {hidden_ctx(ctx)}
+      <label>Oggetto<input name="subject" required></label>
+      <label>Parte correlata<input name="related_party"></label>
+      <label>Deal<select name="deal_id"><option value="">-</option>{option_rows(deals, '')}</select></label>
+      <label>Stato<select name="status"><option>Aperto</option><option>In analisi</option><option>Mitigato</option><option>Chiuso</option></select></label>
+      <label class="full-span">Descrizione<textarea name="description" rows="3"></textarea></label>
+      <label class="full-span">Presidio / mitigazione<textarea name="mitigation" rows="3"></textarea></label>
+      <div class="form-actions left"><button class="button primary" type="submit">Registra conflitto</button><a class="button ghost" href="{rel_url('/conflicts', ctx)}">Annulla</a></div>
+    </form>
+  </section>
+</div>"""
+        body = f"""
+<section class="metric-grid">
+  <div class="metric"><span>Conflitti censiti</span><strong>{len(conflicts)}</strong></div>
+  <div class="metric"><span>Aperti / analisi</span><strong>{open_count}</strong></div>
+  <div class="metric"><span>Mitigati / chiusi</span><strong>{mitigated_count}</strong></div>
+  <div class="metric"><span>Deal collegati</span><strong>{sum(1 for c in conflicts if c['deal_id'])}</strong></div>
+</section>
+<section class="panel">
+  <div class="section-head"><h2>Registro conflitti d'interesse</h2>{action_button}</div>
+  <table class="data-table roomy"><thead><tr><th>Apertura</th><th>Oggetto</th><th>Parte correlata</th><th>Deal</th><th>Mitigazione</th><th>Stato</th></tr></thead><tbody>{conflict_rows}</tbody></table>
+</section>
+{create_modal}
+"""
+        self.render("Conflitti", body, "conflicts")
+
+    def page_complaints(self):
+        ctx = self.get_ctx()
+        pid = ctx["platform_id"]
+        params = parse_qs(urlparse(self.path).query)
+        mode = (params.get("mode") or [""])[0]
+        complaints = rows(
+            """
+            SELECT c.*, u.name AS owner_name
+            FROM complaints c
+            LEFT JOIN users u ON u.id = c.owner_user_id
+            WHERE c.platform_id = ?
+            ORDER BY c.received_at DESC
+            """,
+            (pid,),
+        )
+        users = rows("SELECT id, name FROM users WHERE active = 1 ORDER BY name")
+        open_count = sum(1 for c in complaints if c["status"] != "Chiuso")
+        closed_count = sum(1 for c in complaints if c["status"] == "Chiuso")
+        overdue_count = 0
+        for c in complaints:
+            if c["status"] != "Chiuso" and (date.today() - date.fromisoformat(c["received_at"][:10])).days > 30:
+                overdue_count += 1
+        complaint_rows = "".join(
+            f"""<tr>
+              <td>{esc(nice_date(c['received_at']))}</td>
+              <td>{esc(c['complainant'])}</td>
+              <td>{esc(c['channel'])}</td>
+              <td><strong>{esc(c['object'])}</strong><br><span class="muted">{esc(c['outcome'] or '-')}</span></td>
+              <td>{esc(c['owner_name'] or '-')}</td>
+              <td><span class="badge {badge_class(c['status'])}">{esc(c['status'])}</span></td>
+            </tr>"""
+            for c in complaints
+        )
+        action_button = ""
+        create_modal = ""
+        if user_can(ctx["user"], "manage_registers"):
+            action_button = f'<a class="button primary" href="{rel_url("/complaints", ctx, {"mode": "new"})}">+ Nuovo reclamo</a>'
+            if mode == "new":
+                create_modal = f"""
+<div class="modal-backdrop">
+  <section class="person-modal entity-modal">
+    <div class="section-head">
+      <h2>Nuovo reclamo</h2>
+      <a class="modal-close" href="{rel_url('/complaints', ctx)}">x</a>
+    </div>
+    <form class="form-grid" method="post" action="/complaints/create">
+      {hidden_ctx(ctx)}
+      <label>Data ricezione<input name="received_at" type="date" value="{today_iso()}" required></label>
+      <label>Soggetto<input name="complainant" required></label>
+      <label>Canale<select name="channel"><option>Email</option><option>Portale</option><option>PEC</option><option>Telefono</option><option>Altro</option></select></label>
+      <label>Owner<select name="owner_user_id">{option_rows(users, ctx['user_id'])}</select></label>
+      <label>Stato<select name="status"><option>Aperto</option><option>In istruttoria</option><option>In attesa cliente</option><option>Chiuso</option></select></label>
+      <label class="full-span">Oggetto<textarea name="object" rows="3" required></textarea></label>
+      <label class="full-span">Esito / prossima azione<textarea name="outcome" rows="3"></textarea></label>
+      <div class="form-actions left"><button class="button primary" type="submit">Registra reclamo</button><a class="button ghost" href="{rel_url('/complaints', ctx)}">Annulla</a></div>
+    </form>
+  </section>
+</div>"""
+        body = f"""
+<section class="metric-grid">
+  <div class="metric"><span>Reclami totali</span><strong>{len(complaints)}</strong></div>
+  <div class="metric"><span>Aperti</span><strong>{open_count}</strong></div>
+  <div class="metric"><span>Chiusi</span><strong>{closed_count}</strong></div>
+  <div class="metric"><span>Oltre 30 giorni</span><strong>{overdue_count}</strong></div>
+</section>
+<section class="panel">
+  <div class="section-head">
+    <h2>Registro reclami</h2>
+    <div class="header-badges"><span class="source-chip">Base reportistica CONSOB</span>{action_button}</div>
+  </div>
+  <table class="data-table roomy"><thead><tr><th>Data</th><th>Soggetto</th><th>Canale</th><th>Oggetto ed esito</th><th>Owner</th><th>Stato</th></tr></thead><tbody>{complaint_rows}</tbody></table>
+</section>
+{create_modal}
+"""
+        self.render("Reclami", body, "complaints")
+
+    def page_proponents(self):
+        ctx = self.get_ctx()
+        pid = ctx["platform_id"]
+        params = parse_qs(urlparse(self.path).query)
+        mode = (params.get("mode") or [""])[0]
+        proponents = rows(
+            """
+            SELECT p.*, COUNT(DISTINCT d.id) AS deal_count, COUNT(DISTINCT doc.id) AS doc_count
+            FROM proponents p
+            LEFT JOIN deals d ON d.proponent_id = p.id
+            LEFT JOIN documents doc ON doc.proponent_id = p.id
+            WHERE p.platform_id = ?
+            GROUP BY p.id
+            ORDER BY p.name
+            """,
+            (pid,),
+        )
+        api_linked = sum(1 for p in proponents if (p["source_system"] or "").startswith("adapter:"))
+        active_pipeline = sum(1 for p in proponents if p["crm_status"] in {"Attivo", "Prioritario", "In istruttoria"})
+        missing_docs = sum(1 for p in proponents if p["onboarding_status"] in {"Documenti da raccogliere", "Integrazione richiesta"})
+        create = f'<a class="button primary" href="{rel_url("/proponents", ctx, {"mode": "new"})}">+ Nuovo proponente</a>'
+        create_modal = ""
+        if mode == "new" and user_can(ctx["user"], "manage_proponents"):
+            create_modal = f"""
+<div class="modal-backdrop">
+  <section class="person-modal entity-modal">
+    <div class="section-head">
+      <h2>Nuovo proponente</h2>
+      <a class="modal-close" href="{rel_url('/proponents', ctx)}">x</a>
+    </div>
+    <form class="form-grid" method="post" action="/proponents/create">
+      {hidden_ctx(ctx)}
+      <label>Ragione sociale<input name="name" required></label>
+      <label>Forma giuridica<input name="legal_form"></label>
+      <label>Codice fiscale / VAT<input name="tax_id"></label>
+      <label>Email referente<input name="contact_email" type="email"></label>
+      <label>Telefono<input name="phone"></label>
+      <label>Sito web<input name="website"></label>
+      <label>Settore<input name="sector" placeholder="es. MedTech, Industria sostenibile"></label>
+      <label>Titolari effettivi<textarea name="beneficial_owners" rows="3"></textarea></label>
+      <label>Esposizione<input name="exposure" type="number" min="0" step="1000" value="0"></label>
+      <label>Score interno<select name="internal_score"><option>Da valutare</option><option>A</option><option>A-</option><option>B+</option><option>B</option><option>C</option></select></label>
+      <label>Stato CRM<select name="crm_status"><option>In istruttoria</option><option>Prioritario</option><option>Attivo</option><option>In pausa</option><option>Archiviato</option></select></label>
+      <label>Onboarding<select name="onboarding_status"><option>Documenti da raccogliere</option><option>Documentazione in verifica</option><option>Integrazione richiesta</option><option>Comitato tecnico</option><option>Pronto per CdA</option><option>Completo</option></select></label>
+      <label>Owner interno<input name="owner_name" placeholder="Responsabile dossier"></label>
+      <label>Fonte dato<select name="source_system"><option>Manuale</option><option>adapter:future-platform-api</option><option>Import CSV</option><option>Backoffice</option></select></label>
+      <label>ID esterno<input name="external_proponent_id" placeholder="ID piattaforma sorgente"></label>
+      <label class="full-span">Prossima azione<input name="next_action" placeholder="es. richiedere business plan aggiornato"></label>
+      <label>Note<textarea name="notes" rows="3"></textarea></label>
+      <div class="form-actions left"><button class="button primary" type="submit">Crea proponente</button><a class="button ghost" href="{rel_url('/proponents', ctx)}">Annulla</a></div>
+    </form>
+  </section>
+</div>"""
+        body_rows = "".join(
+            f"""<tr>
+              <td><a href="{rel_url('/proponents/' + str(p['id']), ctx)}"><strong>{esc(p['name'])}</strong></a></td>
+              <td>{esc(p['sector'] or '-')}<br><span class="muted">{esc(p['legal_form'])}</span></td>
+              <td><span class="badge {badge_class(p['crm_status'])}">{esc(p['crm_status'])}</span><br><span class="muted">{esc(p['owner_name'] or '-')}</span></td>
+              <td>{esc(p['internal_score'])}</td>
+              <td>{money(p['exposure'])}</td>
+              <td>{p['deal_count']}</td>
+              <td>{p['doc_count']}</td>
+              <td>{esc(p['source_system'] or 'Manuale')}<br><span class="muted">{esc(nice_date(p['last_synced_at']))}</span></td>
+            </tr>"""
+            for p in proponents
+        )
+        body = f"""
+<section class="metric-grid">
+  <div class="metric"><span>Proponenti</span><strong>{len(proponents)}</strong></div>
+  <div class="metric"><span>Pipeline attiva</span><strong>{active_pipeline}</strong></div>
+  <div class="metric"><span>Documenti aperti</span><strong>{missing_docs}</strong></div>
+  <div class="metric"><span>Da API</span><strong>{api_linked}</strong></div>
+</section>
+<section class="panel">
+  <div class="section-head"><h2>Dossier proponenti</h2>{create}</div>
+  <table class="data-table roomy">
+    <thead><tr><th>Proponente</th><th>Settore</th><th>CRM / owner</th><th>Score</th><th>Esposizione</th><th>Deal</th><th>Doc.</th><th>Fonte</th></tr></thead>
+    <tbody>{body_rows}</tbody>
+  </table>
+</section>
+{create_modal}
+"""
+        self.render("Proponenti", body, "proponents")
+
+    def page_proponent_new(self):
+        ctx = self.get_ctx()
+        body = f"""
+<section class="panel narrow">
+  <div class="section-head"><h2>Nuovo proponente</h2></div>
+  <form class="form-grid" method="post" action="/proponents/create">
+    {hidden_ctx(ctx)}
+    <label>Ragione sociale<input name="name" required></label>
+    <label>Forma giuridica<input name="legal_form"></label>
+    <label>Codice fiscale / VAT<input name="tax_id"></label>
+    <label>Email referente<input name="contact_email" type="email"></label>
+    <label>Telefono<input name="phone"></label>
+    <label>Sito web<input name="website"></label>
+    <label>Settore<input name="sector" placeholder="es. MedTech, Industria sostenibile"></label>
+    <label>Titolari effettivi<textarea name="beneficial_owners" rows="3"></textarea></label>
+    <label>Esposizione<input name="exposure" type="number" min="0" step="1000" value="0"></label>
+    <label>Score interno<select name="internal_score"><option>Da valutare</option><option>A</option><option>A-</option><option>B+</option><option>B</option><option>C</option></select></label>
+    <label>Stato CRM<select name="crm_status"><option>In istruttoria</option><option>Prioritario</option><option>Attivo</option><option>In pausa</option><option>Archiviato</option></select></label>
+    <label>Onboarding<select name="onboarding_status"><option>Documenti da raccogliere</option><option>Documentazione in verifica</option><option>Integrazione richiesta</option><option>Comitato tecnico</option><option>Pronto per CdA</option><option>Completo</option></select></label>
+    <label>Owner interno<input name="owner_name" placeholder="Responsabile dossier"></label>
+    <label>Fonte dato<select name="source_system"><option>Manuale</option><option>adapter:future-platform-api</option><option>Import CSV</option><option>Backoffice</option></select></label>
+    <label>ID esterno<input name="external_proponent_id" placeholder="ID piattaforma sorgente"></label>
+    <label class="full-span">Prossima azione<input name="next_action" placeholder="es. richiedere business plan aggiornato"></label>
+    <label>Note<textarea name="notes" rows="3"></textarea></label>
+    <div class="form-actions"><button class="button primary" type="submit">Crea proponente</button></div>
+  </form>
+</section>
+"""
+        self.render("Nuovo proponente", body, "proponents")
+
+    def page_proponent_detail(self, proponent_id):
+        ctx = self.get_ctx()
+        params = parse_qs(urlparse(self.path).query)
+        mode = (params.get("mode") or [""])[0]
+        prop = row("SELECT * FROM proponents WHERE id = ? AND platform_id = ?", (proponent_id, ctx["platform_id"]))
+        if not prop:
+            self.not_found()
+            return
+        deals = rows("SELECT * FROM deals WHERE proponent_id = ? ORDER BY updated_at DESC", (proponent_id,))
+        docs = rows("SELECT * FROM documents WHERE proponent_id = ? ORDER BY created_at DESC", (proponent_id,))
+        audit = rows(
+            """
+            SELECT * FROM audit_log
+            WHERE platform_id = ? AND (
+              (entity_type = 'proponent' AND entity_id = ?)
+              OR (entity_type = 'deal' AND entity_id IN (SELECT id FROM deals WHERE proponent_id = ?))
+            )
+            ORDER BY created_at DESC
+            LIMIT 8
+            """,
+            (ctx["platform_id"], proponent_id, proponent_id),
+        )
+        total_target = sum(float(d["funding_target"] or 0) for d in deals)
+        active_deals = sum(1 for d in deals if d["phase"] not in {"concluso", "respinta", "archiviato"})
+        doc_categories = {d["category"] for d in docs}
+        required_docs = ["Visura camerale", "Bilanci", "Business plan", "KYC", "KIIS", "Contratto"]
+        missing_docs = [item for item in required_docs if not any(item.lower().split()[0] in cat.lower() or item.lower().split()[0] in d["title"].lower() for cat in doc_categories for d in docs)]
+        data_source_label = prop["source_system"] or "Manuale"
+        crm_items = [
+            ("Stato CRM", prop["crm_status"], "Priorita commerciale e operativa del dossier."),
+            ("Onboarding", prop["onboarding_status"], "Avanzamento raccolta e verifica documentale."),
+            ("Score interno", prop["internal_score"], "Valutazione sintetica rischio/opportunita."),
+            ("Fonte", data_source_label, "Origine dato: API piattaforma, backoffice o manuale."),
+        ]
+        crm_html = "".join(
+            f"""<div class="crm-check">
+              <span>{esc(label)}</span>
+              <strong><span class="badge {badge_class(status)}">{esc(status)}</span></strong>
+              <small>{esc(note)}</small>
+            </div>"""
+            for label, status, note in crm_items
+        )
+        deal_rows = "".join(
+            f"""<tr><td><a href="{rel_url('/deals/' + str(d['id']), ctx)}">{esc(d['title'])}</a></td><td>{esc(status_for_phase(d['phase']))}</td><td>{esc(phase_label(d['phase']))}</td><td>{money(d['funding_target'])}</td></tr>"""
+            for d in deals
+        ) or '<tr><td colspan="4" class="empty-row">Nessun deal collegato.</td></tr>'
+        doc_rows = "".join(
+            f"""<tr><td>{esc(d['category'])}</td><td><a href="{rel_url('/documents/' + str(d['id']) + '/download', ctx)}">{esc(d['title'])}</a></td><td>{esc(nice_date(d['created_at']))}</td></tr>"""
+            for d in docs
+        ) or '<tr><td colspan="3" class="empty-row">Nessun documento caricato.</td></tr>'
+        timeline_items = [
+            (prop["created_at"], "Creazione proponente", f"Profilo creato con score {prop['internal_score']}."),
+        ]
+        for d in deals:
+            timeline_items.append((d["updated_at"], f"Deal: {d['title']}", f"{phase_label(d['phase'])} - {money(d['funding_target'])}"))
+        for event in audit:
+            timeline_items.append((event["created_at"], event["action"], event["details"]))
+        timeline_items = sorted(timeline_items, key=lambda item: item[0] or "", reverse=True)[:10]
+        timeline_html = "".join(
+            f"""<li>
+              <span>{esc(nice_date(moment))}</span>
+              <strong>{esc(title)}</strong>
+              <small>{esc(detail or '-')}</small>
+            </li>"""
+            for moment, title, detail in timeline_items
+        )
+        actions = []
+        if prop["onboarding_status"] in {"Documenti da raccogliere", "Integrazione richiesta"}:
+            actions.append("Richiedere o caricare la documentazione mancante prima di avanzare il dossier.")
+        if missing_docs:
+            actions.append(f"Documenti da verificare: {', '.join(missing_docs[:4])}.")
+        if prop["next_action"]:
+            actions.append(prop["next_action"])
+        if not deals:
+            actions.append("Creare o collegare un deal per trasformare il proponente in pipeline operativa.")
+        if not actions:
+            actions.append("Mantenere monitoraggio periodico su documenti, scoring e stato del deal.")
+        action_html = "".join(f"<li>{esc(item)}</li>" for item in actions)
+
+        edit_button = ""
+        upload_button = ""
+        edit_modal = ""
+        upload_modal = ""
+        if user_can(ctx["user"], "manage_proponents"):
+            edit_button = f'<a class="button primary" href="{rel_url("/proponents/" + str(proponent_id), ctx, {"mode": "edit"})}">Modifica proponente</a>'
+        if user_can(ctx["user"], "upload_document"):
+            upload_button = f'<a class="button ghost" href="{rel_url("/proponents/" + str(proponent_id), ctx, {"mode": "upload"})}">+ Documento</a>'
+        if mode == "edit" and user_can(ctx["user"], "manage_proponents"):
+            edit_modal = f"""
+<div class="modal-backdrop">
+  <section class="person-modal entity-modal">
+    <div class="section-head">
+      <h2>Modifica proponente</h2>
+      <a class="modal-close" href="{rel_url('/proponents/' + str(proponent_id), ctx)}">x</a>
+    </div>
+    <form class="form-grid" method="post" action="/proponents/{proponent_id}/update">
+      {hidden_ctx(ctx)}
+      <label>Ragione sociale<input name="name" value="{esc(prop['name'])}" required></label>
+      <label>Forma giuridica<input name="legal_form" value="{esc(prop['legal_form'])}"></label>
+      <label>Codice fiscale / VAT<input name="tax_id" value="{esc(prop['tax_id'])}"></label>
+      <label>Email referente<input name="contact_email" type="email" value="{esc(prop['contact_email'])}"></label>
+      <label>Telefono<input name="phone" value="{esc(prop['phone'])}"></label>
+      <label>Sito web<input name="website" value="{esc(prop['website'])}"></label>
+      <label>Settore<input name="sector" value="{esc(prop['sector'])}"></label>
+      <label>Esposizione<input name="exposure" type="number" min="0" step="1000" value="{esc(prop['exposure'])}"></label>
+      <label>Score interno<select name="internal_score">{option_values(['Da valutare', 'A', 'A-', 'B+', 'B', 'C'], prop['internal_score'])}</select></label>
+      <label>Stato CRM<select name="crm_status">{option_values(['In istruttoria', 'Prioritario', 'Attivo', 'In pausa', 'Archiviato'], prop['crm_status'])}</select></label>
+      <label>Onboarding<select name="onboarding_status">{option_values(['Documenti da raccogliere', 'Documentazione in verifica', 'Integrazione richiesta', 'Comitato tecnico', 'Pronto per CdA', 'Completo'], prop['onboarding_status'])}</select></label>
+      <label>Owner interno<input name="owner_name" value="{esc(prop['owner_name'])}"></label>
+      <label>Fonte dato<select name="source_system">{option_values(['Manuale', 'adapter:future-platform-api', 'Import CSV', 'Backoffice'], prop['source_system'])}</select></label>
+      <label>ID esterno<input name="external_proponent_id" value="{esc(prop['external_proponent_id'])}"></label>
+      <label class="full-span">Titolari effettivi<textarea name="beneficial_owners" rows="3">{esc(prop['beneficial_owners'])}</textarea></label>
+      <label class="full-span">Prossima azione<input name="next_action" value="{esc(prop['next_action'])}"></label>
+      <label class="full-span">Note override manuale<textarea name="manual_override_notes" rows="3">{esc(prop['manual_override_notes'])}</textarea></label>
+      <label class="full-span">Note CRM / istruttoria<textarea name="notes" rows="3">{esc(prop['notes'])}</textarea></label>
+      <div class="form-actions left"><button class="button primary" type="submit">Salva modifiche</button><a class="button ghost" href="{rel_url('/proponents/' + str(proponent_id), ctx)}">Annulla</a></div>
+    </form>
+  </section>
+</div>"""
+        if mode == "upload" and user_can(ctx["user"], "upload_document"):
+            upload_modal = f"""
+<div class="modal-backdrop">
+  <section class="person-modal entity-modal">
+    <div class="section-head">
+      <h2>Carica documento proponente</h2>
+      <a class="modal-close" href="{rel_url('/proponents/' + str(proponent_id), ctx)}">x</a>
+    </div>
+    <form class="form-grid" method="post" action="/documents/upload" enctype="multipart/form-data">
+      {hidden_ctx(ctx)}
+      <input type="hidden" name="entity_kind" value="proponent">
+      <input type="hidden" name="proponent_id" value="{proponent_id}">
+      <input type="hidden" name="origin" value="Proponente">
+      <label>Tipo documento<input name="category" list="proponent-document-types" value="Documentazione societaria"></label>
+      <label>Titolo<input name="title" value="Documento {esc(prop['name'])}"></label>
+      <label class="full-span">File<input name="file" type="file" required></label>
+      <datalist id="proponent-document-types">
+        <option value="Visura camerale"><option value="Statuto"><option value="Atto societario"><option value="Bilancio"><option value="Business plan"><option value="KYC / AML"><option value="KIIS"><option value="Contratto"><option value="Due diligence"><option value="Domanda autorizzazione ECSP">
+      </datalist>
+      <div class="form-actions left"><button class="button primary" type="submit">Carica documento</button><a class="button ghost" href="{rel_url('/proponents/' + str(proponent_id), ctx)}">Annulla</a></div>
+    </form>
+  </section>
+</div>"""
+        body = f"""
+<section class="deal-header">
+  <div>
+    <p class="eyebrow">CRM proponente - {esc(prop['sector'] or prop['legal_form'])}</p>
+    <h2>{esc(prop['name'])}</h2>
+    <p class="muted">{esc(prop['contact_email'] or 'email non indicata')} - {esc(prop['phone'] or 'telefono non indicato')}</p>
+  </div>
+  <div class="header-badges">
+    <span class="badge neutral">{esc(prop['internal_score'])}</span>
+    <span class="badge {badge_class(prop['crm_status'])}">{esc(prop['crm_status'])}</span>
+    {edit_button}
+    {upload_button}
+    <a class="button ghost" href="{rel_url('/proponents', ctx)}">Torna ai proponenti</a>
+  </div>
+</section>
+<section class="metric-grid">
+  <div class="metric"><span>Deal collegati</span><strong>{len(deals)}</strong></div>
+  <div class="metric"><span>Pipeline attiva</span><strong>{active_deals}</strong></div>
+  <div class="metric"><span>Target totale</span><strong>{money(total_target)}</strong></div>
+  <div class="metric"><span>Documenti</span><strong>{len(docs)}</strong></div>
+</section>
+<section class="workspace-grid">
+  <div class="panel">
+    <div class="section-head"><h2>Anagrafica e relazione</h2><span class="panel-kicker">{esc(prop['owner_name'] or 'owner da assegnare')}</span></div>
+    <dl class="definition-list">
+      <dt>Forma giuridica</dt><dd>{esc(prop['legal_form'])}</dd>
+      <dt>Codice fiscale / VAT</dt><dd>{esc(prop['tax_id'])}</dd>
+      <dt>Referente</dt><dd>{esc(prop['contact_email'])}</dd>
+      <dt>Telefono</dt><dd>{esc(prop['phone'] or '-')}</dd>
+      <dt>Sito</dt><dd>{esc(prop['website'] or '-')}</dd>
+      <dt>Settore</dt><dd>{esc(prop['sector'] or '-')}</dd>
+      <dt>Titolari effettivi</dt><dd>{esc(prop['beneficial_owners'])}</dd>
+      <dt>Esposizione</dt><dd>{money(prop['exposure'])}</dd>
+      <dt>Note</dt><dd>{esc(prop['notes'])}</dd>
+    </dl>
+  </div>
+  <div class="panel">
+    <div class="section-head"><h2>CRM e istruttoria</h2><span class="panel-kicker">stato dossier</span></div>
+    <div class="crm-check-grid">{crm_html}</div>
+  </div>
+</section>
+<section class="workspace-grid">
+  <div class="panel">
+    <div class="section-head"><h2>Dati piattaforma e override</h2><span class="panel-kicker">API + manuale</span></div>
+    <dl class="definition-list">
+      <dt>Fonte</dt><dd>{esc(data_source_label)}</dd>
+      <dt>ID esterno</dt><dd>{esc(prop['external_proponent_id'] or '-')}</dd>
+      <dt>Ultimo sync</dt><dd>{esc(nice_date(prop['last_synced_at']))}</dd>
+      <dt>Override</dt><dd>{esc(prop['manual_override_notes'] or 'Nessuna correzione manuale registrata.')}</dd>
+      <dt>Prossima azione</dt><dd>{esc(prop['next_action'] or '-')}</dd>
+    </dl>
+  </div>
+  <div class="panel">
+    <div class="section-head"><h2>Azioni operative</h2><span class="panel-kicker">CRM</span></div>
+    <ul class="plain-list">{action_html}</ul>
+  </div>
+</section>
+<section class="panel">
+  <div class="section-head"><h2>Deal collegati</h2></div>
+  <table class="data-table compact"><thead><tr><th>Deal</th><th>Stato</th><th>Fase</th><th>Target</th></tr></thead><tbody>{deal_rows}</tbody></table>
+</section>
+<section class="panel">
+  <div class="section-head"><h2>Documenti proponente</h2>{upload_button}</div>
+  <table class="data-table compact"><thead><tr><th>Categoria</th><th>Titolo</th><th>Data</th></tr></thead><tbody>{doc_rows}</tbody></table>
+</section>
+<section class="panel">
+  <div class="section-head"><h2>Timeline dossier</h2><span class="panel-kicker">audit</span></div>
+  <ol class="crm-timeline">{timeline_html}</ol>
+</section>
+{edit_modal}
+{upload_modal}
+"""
+        self.render(prop["name"], body, "proponents")
+
+    def page_communications(self):
+        ctx = self.get_ctx()
+        params = parse_qs(urlparse(self.path).query)
+        active_tab = (params.get("tab") or ["scadenzario"])[0]
+        if active_tab not in {"scadenzario", "generatore", "obblighi", "fonti"}:
+            active_tab = "scadenzario"
+        selected_id = (params.get("comm") or [COMMUNICATION_WORKFLOWS[0]["id"]])[0]
+        selected = next((item for item in COMMUNICATION_WORKFLOWS if item["id"] == selected_id), COMMUNICATION_WORKFLOWS[0])
+        output_id = int((params.get("output") or ["0"])[0] or 0)
+        edit_output = (params.get("edit") or [""])[0] == "1"
+        selected_output = None
+        if output_id:
+            selected_output = row(
+                """
+                SELECT co.*, doc.title AS document_title
+                FROM communication_outputs co
+                LEFT JOIN documents doc ON doc.id = co.document_id
+                WHERE co.id = ? AND co.platform_id = ? AND co.workflow_id = ?
+                """,
+                (output_id, ctx["platform_id"], selected["id"]),
+            )
+        if selected_output and not self.communication_output_is_editable(selected_output["status"]):
+            edit_output = False
+        tabs = [
+            ("scadenzario", "Scadenzario"),
+            ("generatore", "Generatore"),
+            ("obblighi", "Obblighi"),
+            ("fonti", "Fonti ufficiali"),
+        ]
+        tab_html = "".join(
+            f'<a class="subtab {"active" if key == active_tab else ""}" href="{rel_url("/communications", ctx, {"tab": key, "comm": selected["id"]})}">{label}</a>'
+            for key, label in tabs
+        )
+        if active_tab == "generatore":
+            content = self.communication_generator_view(ctx, selected, selected_output, edit_output)
+        elif active_tab == "obblighi":
+            content = self.communication_obligations_view(ctx)
+        elif active_tab == "fonti":
+            content = self.communication_sources_view(ctx)
+        else:
+            content = self.communication_schedule_view(ctx, selected)
+        body = f"""
+<p class="page-copy">Registro operativo delle comunicazioni: scadenze, stato, storico e generazione guidata dei file da inviare o archiviare.</p>
+<nav class="subtabs">{tab_html}</nav>
+{content}
+"""
+        self.render("Comunicazioni", body, "communications")
+
+    def communication_workflow_by_id(self, workflow_id):
+        return next((item for item in COMMUNICATION_WORKFLOWS if item["id"] == workflow_id), COMMUNICATION_WORKFLOWS[0])
+
+    def communication_status_meta(self, status, due_date):
+        normalized = (status or "").lower()
+        if "respinta" in normalized:
+            return "status-rejected", status
+        if "approvata" in normalized or "conclusa" in normalized:
+            return "status-done", status
+        if "inviata" in normalized:
+            return "status-sent", status
+        if "validata" in normalized or "da inviare" in normalized:
+            return "status-ready", status
+        if "bozza" in normalized:
+            return "status-draft", status
+        if due_date:
+            try:
+                days = (date.fromisoformat(due_date) - date.today()).days
+                if days < 0:
+                    return "status-urgent", f"Scaduta da {-days} gg"
+                if days <= 10:
+                    return "status-urgent", f"Urgente - {days} gg"
+                if days <= 30:
+                    return "status-soon", f"Vicino - {days} gg"
+                return "status-due", f"Da fare - {days} gg"
+            except ValueError:
+                pass
+        return "status-due", status or "Da fare"
+
+    def communication_output_is_editable(self, status):
+        normalized = (status or "").lower()
+        return not any(final in normalized for final in ("inviata", "approvata", "respinta", "conclusa"))
+
+    def communication_output_rows(self, ctx, workflow_id=None, limit=20):
+        where = "WHERE co.platform_id = ?"
+        args = [ctx["platform_id"]]
+        if workflow_id:
+            where += " AND co.workflow_id = ?"
+            args.append(workflow_id)
+        return rows(
+            f"""
+            SELECT co.*, doc.title AS document_title, doc.storage_path
+            FROM communication_outputs co
+            LEFT JOIN documents doc ON doc.id = co.document_id
+            {where}
+            ORDER BY co.created_at DESC
+            LIMIT ?
+            """,
+            (*args, limit),
+        )
+
+    def communication_latest_output_by_workflow(self, ctx):
+        latest = {}
+        for item in self.communication_output_rows(ctx, None, 200):
+            latest.setdefault(item["workflow_id"], item)
+        return latest
+
+    def communication_output_status_form(self, ctx, output, workflow_id):
+        statuses = ["Bozza generata", "Validata - da inviare", "Inviata", "Approvata", "Respinta"]
+        options = option_values(statuses, output["status"])
+        return f"""
+        <form class="inline-form comm-output-state" method="post" action="/communications/output-status">
+          {hidden_ctx(ctx)}
+          <input type="hidden" name="output_id" value="{output['id']}">
+          <input type="hidden" name="workflow_id" value="{esc(workflow_id)}">
+          <select name="status">{options}</select>
+          <button class="button secondary" type="submit">Aggiorna</button>
+        </form>"""
+
+    def communication_output_table(self, ctx, item):
+        outputs = self.communication_output_rows(ctx, item["id"], 12)
+        rows_html = []
+        for output in outputs:
+            status_class, status_label = self.communication_status_meta(output["status"], "")
+            document_title = output["document_title"] or "Documento rimosso / scollegato"
+            download = (
+                f'<a class="button ghost" href="{rel_url("/documents/" + str(output["document_id"]) + "/download", ctx)}">Scarica</a>'
+                if output["document_id"]
+                else '<span class="muted">Nessun file</span>'
+            )
+            open_link = rel_url("/communications", ctx, {"tab": "generatore", "comm": item["id"], "output": output["id"]})
+            edit_link = (
+                f'<a class="button primary" href="{rel_url("/communications", ctx, {"tab": "generatore", "comm": item["id"], "output": output["id"], "edit": "1"})}">Modifica</a>'
+                if self.communication_output_is_editable(output["status"])
+                else ""
+            )
+            rows_html.append(
+                f"""<tr>
+                  <td>
+                    <strong><a href="{open_link}">{esc(document_title)}</a></strong>
+                    <span class="archive-file">Creato {esc(nice_date(output['created_at']))} - aggiornato {esc(nice_date(output['updated_at']))}</span>
+                  </td>
+                  <td><span class="comm-status {status_class}">{esc(status_label)}</span></td>
+                  <td>{esc(output['reviewer'] or '-')}</td>
+                  <td>{self.communication_output_status_form(ctx, output, item['id'])}</td>
+                  <td>
+                    <div class="inline-actions">
+                      <a class="button secondary" href="{open_link}">Vedi</a>
+                      {edit_link}
+                      {download}
+                      <form method="post" action="/communications/output-delete">
+                        {hidden_ctx(ctx)}
+                        <input type="hidden" name="output_id" value="{output['id']}">
+                        <input type="hidden" name="workflow_id" value="{esc(item['id'])}">
+                        <button class="button danger-button" type="submit">Rimuovi</button>
+                      </form>
+                    </div>
+                  </td>
+                </tr>"""
+            )
+        if not rows_html:
+            rows_html.append('<tr><td colspan="5" class="empty-row">Nessuna bozza ancora generata per questa comunicazione.</td></tr>')
+        return f"""
+<section class="panel communication-output-panel">
+  <div class="section-head">
+    <div><h2>Bozze e storico della comunicazione</h2><span class="muted">Qui rientrano le bozze appena generate, la validazione interna, l'invio e l'esito finale.</span></div>
+    <span class="panel-kicker">flusso documento</span>
+  </div>
+  <ol class="communication-flow">
+    <li><span>1</span><strong>Bozza generata</strong><small>Scaricabile e rimovibile.</small></li>
+    <li><span>2</span><strong>Validata</strong><small>Pronta da inviare.</small></li>
+    <li><span>3</span><strong>Inviata</strong><small>In attesa esito/ricevuta.</small></li>
+    <li><span>4</span><strong>Approvata o respinta</strong><small>Resta nello storico della comunicazione.</small></li>
+  </ol>
+  <div class="table-scroll">
+    <table class="data-table compact communication-output-table">
+      <thead><tr><th>Output</th><th>Stato</th><th>Validatore</th><th>Aggiorna stato</th><th>Azioni</th></tr></thead>
+      <tbody>{''.join(rows_html)}</tbody>
+    </table>
+  </div>
+</section>
+"""
+
+    def communication_schedule_view(self, ctx, selected):
+        latest_outputs = self.communication_latest_output_by_workflow(ctx)
+        enriched = []
+        for item in COMMUNICATION_SCHEDULE:
+            copy_item = dict(item)
+            latest = latest_outputs.get(item["workflow_id"])
+            if latest:
+                copy_item["status"] = latest["status"]
+                copy_item["note"] = f"{item['note']} Ultimo output: {latest['document_title'] or 'documento rimosso'}."
+                copy_item["output_id"] = latest["id"]
+                copy_item["document_id"] = latest["document_id"]
+            enriched.append(copy_item)
+        active_statuses = {"Da fare", "Bozza generata", "Validata - da inviare", "Inviata", "Respinta"}
+        entries = enriched
+        active_entries = [item for item in enriched if item["status"] in active_statuses]
+        completed = [item for item in enriched if item["status"] not in active_statuses]
+        schedule_rows = "".join(self.communication_schedule_row(ctx, item) for item in entries)
+        history_rows = "".join(self.communication_history_row(ctx, item) for item in completed)
+        generated = self.communication_output_rows(ctx, None, 6)
+        draft_rows = "".join(
+            f"""<tr>
+              <td><strong><a href="{rel_url('/communications', ctx, {'tab': 'generatore', 'comm': doc['workflow_id'], 'output': doc['id']})}">{esc(doc['document_title'] or 'Documento rimosso')}</a></strong></td>
+              <td><span class="comm-status {self.communication_status_meta(doc['status'], '')[0]}">{esc(doc['status'])}</span></td>
+              <td>{esc(nice_date(doc['created_at']))}</td>
+            </tr>"""
+            for doc in generated
+        ) or '<tr><td colspan="3" class="empty-row">Nessuna bozza generata.</td></tr>'
+        return f"""
+<section class="metric-grid communication-metrics">
+  <div class="metric"><span>Da fare</span><strong>{len(active_entries)}</strong></div>
+  <div class="metric"><span>Inviate</span><strong>{sum(1 for item in completed if item['status'] == 'Inviata')}</strong></div>
+  <div class="metric"><span>Approvate / concluse</span><strong>{sum(1 for item in completed if item['status'] in {'Approvata', 'Conclusa'})}</strong></div>
+  <div class="metric"><span>Generatori attivi</span><strong>{len(COMMUNICATION_WORKFLOWS)}</strong></div>
+</section>
+<section class="panel">
+  <div class="section-head">
+    <div><h2>Scadenzario comunicazioni</h2><span class="muted">Le comunicazioni da fare cambiano colore con l'avvicinarsi della scadenza.</span></div>
+    <span class="panel-kicker">clic su una riga per compilarla</span>
+  </div>
+  <div class="table-scroll">
+    <table class="data-table roomy communication-register-table">
+      <thead><tr><th>Comunicazione</th><th>Periodo</th><th>Scadenza</th><th>Stato</th><th>Owner</th><th>Azione</th></tr></thead>
+      <tbody>{schedule_rows}</tbody>
+    </table>
+  </div>
+</section>
+<section class="workspace-grid">
+  <div class="panel">
+    <div class="section-head"><h2>Storico comunicazioni</h2><span class="panel-kicker">inviate, approvate, concluse</span></div>
+    <table class="data-table compact">
+      <thead><tr><th>Comunicazione</th><th>Periodo</th><th>Scadenza</th><th>Stato</th></tr></thead>
+      <tbody>{history_rows}</tbody>
+    </table>
+  </div>
+  <div class="panel">
+    <div class="section-head"><h2>Bozze generate</h2><span class="panel-kicker">archivio Comunicazioni</span></div>
+    <table class="data-table compact">
+      <thead><tr><th>Documento</th><th>Stato</th><th>Data</th></tr></thead>
+      <tbody>{draft_rows}</tbody>
+    </table>
+  </div>
+</section>
+"""
+
+    def communication_schedule_row(self, ctx, item):
+        workflow = self.communication_workflow_by_id(item["workflow_id"])
+        status_class, status_label = self.communication_status_meta(item["status"], item["due_date"])
+        due = nice_date(item["due_date"]) if item["due_date"] else "Evento / prima dell'avvio"
+        open_params = {"tab": "generatore", "comm": workflow["id"]}
+        if item.get("output_id"):
+            open_params["output"] = item["output_id"]
+        action_html = self.communication_schedule_actions(ctx, item, workflow, open_params)
+        return f"""<tr>
+          <td><strong>{esc(workflow['title'])}</strong><br><span class="muted">{esc(item['note'])}</span></td>
+          <td>{esc(item['period'])}</td>
+          <td>{esc(due)}</td>
+          <td><span class="comm-status {status_class}">{esc(status_label)}</span></td>
+          <td>{esc(item['owner'])}</td>
+          <td><div class="inline-actions">{action_html}</div></td>
+        </tr>"""
+
+    def communication_schedule_actions(self, ctx, item, workflow, open_params):
+        status = item.get("status") or "Da fare"
+        if not item.get("output_id"):
+            label = "Genera" if status == "Da fare" else "Vedi"
+            button_class = "primary" if status == "Da fare" else "secondary"
+            return f'<a class="button {button_class}" href="{rel_url("/communications", ctx, {"tab": "generatore", "comm": workflow["id"]})}">{label}</a>'
+        open_url = rel_url("/communications", ctx, open_params)
+        download = (
+            f'<a class="button ghost" href="{rel_url("/documents/" + str(item["document_id"]) + "/download", ctx)}">Scarica</a>'
+            if item.get("document_id")
+            else ""
+        )
+        if self.communication_output_is_editable(status):
+            edit_params = dict(open_params)
+            edit_params["edit"] = "1"
+            return (
+                f'<a class="button secondary" href="{open_url}">Vedi</a>'
+                f'<a class="button primary" href="{rel_url("/communications", ctx, edit_params)}">Modifica</a>'
+                f'{download}'
+            )
+        return f'<a class="button secondary" href="{open_url}">Vedi</a>{download}'
+
+    def communication_history_row(self, ctx, item):
+        workflow = self.communication_workflow_by_id(item["workflow_id"])
+        status_class, status_label = self.communication_status_meta(item["status"], item["due_date"])
+        due = nice_date(item["due_date"]) if item["due_date"] else "-"
+        open_params = {"tab": "generatore", "comm": workflow["id"]}
+        if item.get("output_id"):
+            open_params["output"] = item["output_id"]
+        return f"""<tr>
+          <td><strong><a href="{rel_url('/communications', ctx, open_params)}">{esc(workflow['title'])}</a></strong></td>
+          <td>{esc(item['period'])}</td>
+          <td>{esc(due)}</td>
+          <td><span class="comm-status {status_class}">{esc(status_label)}</span></td>
+        </tr>"""
+
+    def communication_generator_view(self, ctx, selected, selected_output=None, edit_output=False):
+        picker_rows = "".join(self.communication_generator_picker_row(ctx, item, selected["id"]) for item in COMMUNICATION_WORKFLOWS)
+        return f"""
+<section class="communication-generator-shell">
+  <details class="panel communication-picker">
+    <summary>
+      <div>
+        <span class="panel-kicker">seleziona comunicazione</span>
+        <strong>{esc(selected['title'])}</strong>
+        <small>{esc(selected['authority'])} - {esc(selected['channel'])}</small>
+      </div>
+      <span class="picker-trigger">Cambia</span>
+    </summary>
+    <div class="record-list">{picker_rows}</div>
+  </details>
+  <div class="communication-generator-main">{self.communication_workflow_form(ctx, selected, selected_output, edit_output)}</div>
+</section>
+"""
+
+    def communication_generator_picker_row(self, ctx, item, selected_id):
+        active = " active" if item["id"] == selected_id else ""
+        return f"""<a class="record-item{active}" href="{rel_url('/communications', ctx, {'tab': 'generatore', 'comm': item['id']})}">
+          <strong>{esc(item['title'])}</strong>
+          <span>{esc(item['authority'])} - {esc(item['channel'])}</span>
+          <small>{esc(item['frequency'])}</small>
+        </a>"""
+
+    def communication_documents(self, ctx):
+        docs = rows(
+            """
+            SELECT id, title, category, origin
+            FROM documents
+            WHERE platform_id = ? AND generated = 0 AND origin != 'Comunicazioni'
+            ORDER BY created_at DESC
+            """,
+            (ctx["platform_id"],),
+        )
+        person_docs = rows(
+            """
+            SELECT document_id AS id, title, document_type AS category, 'Persona' AS origin
+            FROM person_documents
+            WHERE platform_id = ?
+            ORDER BY created_at DESC
+            """,
+            (ctx["platform_id"],),
+        )
+        supplier_docs = rows(
+            """
+            SELECT document_id AS id, title, contract_type AS category, 'Fornitore' AS origin
+            FROM supplier_contracts
+            WHERE platform_id = ?
+            ORDER BY created_at DESC
+            """,
+            (ctx["platform_id"],),
+        )
+        return list(docs) + list(person_docs) + list(supplier_docs)
+
+    def communication_doc_match(self, docs, requested):
+        needle = re.sub(r"[^a-z0-9]+", " ", (requested or "").lower()).strip()
+        if not needle:
+            return None
+        parts = [part for part in needle.split() if len(part) > 2]
+        for doc in docs:
+            hay = re.sub(
+                r"[^a-z0-9]+",
+                " ",
+                f"{doc['title']} {doc['category']} {doc['origin']}".lower(),
+            )
+            if needle in hay:
+                return doc
+            if len(parts) == 1 and parts[0] in hay:
+                return doc
+            if len(parts) > 1 and all(part in hay for part in parts):
+                return doc
+        return None
+
+    def communication_data_snapshot(self, ctx):
+        pid = ctx["platform_id"]
+        first_deal = row(
+            """
+            SELECT d.*, p.name AS proponent_name
+            FROM deals d
+            JOIN proponents p ON p.id = d.proponent_id
+            WHERE d.platform_id = ?
+            ORDER BY d.updated_at DESC
+            LIMIT 1
+            """,
+            (pid,),
+        )
+        return {
+            "deal_count": row("SELECT COUNT(*) AS c FROM deals WHERE platform_id = ?", (pid,))["c"],
+            "active_deal_count": row("SELECT COUNT(*) AS c FROM deals WHERE platform_id = ? AND phase NOT IN ('concluso','archiviato','respinta')", (pid,))["c"],
+            "total_target": row("SELECT COALESCE(SUM(funding_target), 0) AS c FROM deals WHERE platform_id = ?", (pid,))["c"],
+            "investor_count": row("SELECT COUNT(*) AS c FROM investors WHERE platform_id = ?", (pid,))["c"],
+            "sophisticated_count": row("SELECT COUNT(*) AS c FROM investors WHERE platform_id = ? AND LOWER(investor_type) LIKE '%sofistic%'", (pid,))["c"],
+            "supplier_count": row("SELECT COUNT(*) AS c FROM suppliers WHERE platform_id = ?", (pid,))["c"],
+            "first_deal": first_deal,
+        }
+
+    def communication_field_suggestion(self, ctx, item, field, docs, snapshot):
+        label = field[0]
+        key = label.lower()
+        first_deal = snapshot["first_deal"]
+        if "periodo" in key:
+            if "30 giugno" in item["reference"].lower():
+                return "30/06/2026", "Dati calendario", "prefilled"
+            if "anno" in item["reference"].lower():
+                return "2025", "Dati calendario", "prefilled"
+        if "data riferimento" in key:
+            if "31 dicembre" in item["reference"].lower():
+                return "31/12/2025", "Dati calendario", "prefilled"
+        if "anno" in key:
+            return "2025", "Dati calendario", "prefilled"
+        if "numero offerte" in key or "offerte concluse" in key:
+            return str(snapshot["active_deal_count"] or snapshot["deal_count"]), "Deal/API piattaforma", "prefilled"
+        if "numero investitori" in key:
+            return str(snapshot["investor_count"]), "Investitori/API piattaforma", "prefilled"
+        if "investitori sofisticati" in key:
+            return str(snapshot["sophisticated_count"]), "CRM investitori", "prefilled"
+        if "investitori non sofisticati" in key:
+            return str(max(0, snapshot["investor_count"] - snapshot["sophisticated_count"])), "CRM investitori", "prefilled"
+        if "totale raccolto" in key or "importo raccolto" in key:
+            return str(int(snapshot["total_target"] or 0)), "Deal/API piattaforma", "prefilled"
+        if first_deal and "deal" in key:
+            return first_deal["title"], "Deal", "prefilled"
+        if first_deal and "titolare progetto" in key:
+            return first_deal["proponent_name"], "Proponente", "prefilled"
+        if first_deal and "importo obiettivo" in key:
+            return str(int(first_deal["funding_target"] or 0)), "Deal", "prefilled"
+        if "contratti" in key or "outsourcing" in key:
+            return str(snapshot["supplier_count"]), "Fornitori e contratti", "prefilled"
+        if "copertura assicurativa" in key:
+            match = self.communication_doc_match(docs, "Polizza assicurativa")
+            if match:
+                return f"Da documento: {match['title']}", "Documento rilevato", "prefilled"
+        manual_keywords = ["note", "descrizione", "impatto", "warning", "rischi", "variazioni", "misure", "azioni", "causa"]
+        if any(word in key for word in manual_keywords):
+            return "", "Inserimento manuale", "manual"
+        return "", "Da completare", "empty"
+
+    def communication_attachment_rows(self, ctx, item, docs):
+        cards = []
+        for required in item["required_docs"]:
+            match = self.communication_doc_match(docs, required)
+            if match:
+                link = rel_url("/documents/" + str(match["id"]) + "/download", ctx) if match["id"] else "#"
+                cards.append(
+                    f"""<li class="attachment-item found">
+                      <span class="attachment-dot"></span>
+                      <div><strong>{esc(required)}</strong><small>Rilevato: <a href="{link}">{esc(match['title'])}</a></small></div>
+                    </li>"""
+                )
+            else:
+                cards.append(
+                    f"""<li class="attachment-item missing">
+                      <span class="attachment-dot"></span>
+                      <div><strong>{esc(required)}</strong><small>Mancante o da collegare</small></div>
+                    </li>"""
+                )
+        return "".join(cards)
+
+    def communication_send_instructions(self, item):
+        channel = item["channel"].lower()
+        if "infostat" in channel:
+            return [
+                "Accedere al portale INFOSTAT con il profilo abilitato della piattaforma.",
+                f"Selezionare il flusso coerente con: {item['title']}.",
+                "Caricare o compilare i dati finali, allegare il fascicolo evidenze e salvare la ricevuta.",
+                "Archiviare ricevuta, file finale e log validazione nella sezione Documenti / Comunicazioni.",
+            ]
+        if "sicrowd" in channel:
+            return [
+                "Preparare il file dati nel formato richiesto dal portale SICROWD.",
+                "Allegare KIIS o reporting richiesto e verificare quadrature su offerta, proponente e investitori.",
+                "Inviare dal canale SICROWD e archiviare ricevuta e versione finale.",
+            ]
+        if "pec" in channel:
+            return [
+                "Preparare testo firmabile, allegati e oggetto della comunicazione.",
+                "Inviare dalla PEC societaria all'indirizzo dell'Autorita competente indicato dalla richiesta o dalla procedura.",
+                "Archiviare PEC inviata, ricevuta accettazione/consegna e allegati.",
+            ]
+        return [
+            "Validare campi e allegati.",
+            "Generare la bozza finale e farla approvare dal responsabile.",
+            "Inviare tramite il canale previsto e archiviare evidenze e ricevute.",
+        ]
+
+    def communication_obligations_view(self, ctx):
+        communication_rows = "".join(self.communication_row(ctx, item) for item in COMMUNICATION_CATALOG)
+        immediate_count = sum(1 for item in COMMUNICATION_CATALOG if "Senza indugio" in item["deadline"] or "10 giorni" in item["deadline"])
+        return f"""
+<section class="metric-grid">
+  <div class="metric"><span>Obblighi mappati</span><strong>{len(COMMUNICATION_CATALOG)}</strong></div>
+  <div class="metric"><span>Event-driven critici</span><strong>{immediate_count}</strong></div>
+  <div class="metric"><span>Flussi CONSOB</span><strong>{sum(1 for item in COMMUNICATION_CATALOG if 'CONSOB' in item['recipient'])}</strong></div>
+  <div class="metric"><span>Flussi Banca d'Italia</span><strong>{sum(1 for item in COMMUNICATION_CATALOG if "Banca d'Italia" in item['recipient'])}</strong></div>
+</section>
+<section class="panel table-scroll">
+  <div class="section-head">
+    <h2>Comunicazioni obbligatorie</h2>
+    <span class="source-chip">Fonti ufficiali</span>
+  </div>
+  <p class="muted">Elenco normativo operativo per ECSP. Il registro scadenze usa questi obblighi come base e li trasforma in attivita, stati, output e archivio.</p>
+  <table class="data-table roomy communications-table">
+    <thead><tr><th>Comunicazione</th><th>Destinatario</th><th>Quando</th><th>Termine</th><th>Fonte</th><th>Template</th></tr></thead>
+    <tbody>{communication_rows}</tbody>
+  </table>
+</section>
+"""
+
+    def communication_sources_view(self, ctx):
+        template_rows = "".join(self.template_row(ctx, item) for item in OFFICIAL_TEMPLATES)
+        downloaded = sum(1 for item in OFFICIAL_TEMPLATES if (TEMPLATE_DIR / item["filename"]).exists())
+        return f"""
+<section class="metric-grid">
+  <div class="metric"><span>Fonti censite</span><strong>{len(OFFICIAL_TEMPLATES)}</strong></div>
+  <div class="metric"><span>File disponibili</span><strong>{downloaded}</strong></div>
+  <div class="metric"><span>Autorita</span><strong>CONSOB / BDI</strong></div>
+  <div class="metric"><span>Uso</span><strong>Template</strong></div>
+</section>
+<section class="panel">
+  <div class="section-head"><h2>Template e fonti ufficiali</h2><span class="source-chip">CONSOB / Banca d'Italia / UE</span></div>
+  <table class="data-table compact">
+    <thead><tr><th>Documento</th><th>Autorita</th><th>Stato</th><th>File</th></tr></thead>
+    <tbody>{template_rows}</tbody>
+  </table>
+</section>
+<section class="panel">
+  <div class="section-head"><h2>Note operative</h2></div>
+  <ul class="plain-list">
+    <li><strong>Excel SICROWD:</strong> le tavole KIIS e reporting annuale sono trattate come formato di portale. La suite prepara dati, controlli, allegati e fascicolo evidenze.</li>
+    <li><strong>Outsourcing Banca d'Italia:</strong> il provvedimento ufficiale e' in archivio; gli allegati tecnici vanno agganciati quando disponibili o caricati manualmente.</li>
+    <li><strong>Output finale:</strong> ogni generazione deve conservare template usato, versione, responsabile, allegati, controlli e ricevuta di invio.</li>
+  </ul>
+</section>
+"""
+
+    def communication_workflow_form(self, ctx, item, selected_output=None, edit_output=False):
+        docs_available = self.communication_documents(ctx)
+        snapshot = self.communication_data_snapshot(ctx)
+        saved_payload = {}
+        saved_fields = {}
+        if selected_output and selected_output["payload_json"]:
+            try:
+                saved_payload = json.loads(selected_output["payload_json"])
+                saved_fields = {
+                    field.get("label"): field.get("value", "")
+                    for field in saved_payload.get("fields", [])
+                    if isinstance(field, dict)
+                }
+            except (TypeError, ValueError):
+                saved_payload = {}
+                saved_fields = {}
+        readonly_output = bool(selected_output and not edit_output)
+        fields = "".join(
+            self.communication_field_input(
+                i,
+                field,
+                self.communication_field_suggestion(ctx, item, field, docs_available, snapshot),
+                saved_fields.get(field[0]) if selected_output else None,
+                readonly_output,
+            )
+            for i, field in enumerate(item["fields"])
+        )
+        attachment_rows = self.communication_attachment_rows(ctx, item, docs_available)
+        prefill = "".join(f"<li>{esc(src)}</li>" for src in item["prefill"])
+        instructions = "".join(f"<li>{esc(step)}</li>" for step in self.communication_send_instructions(item))
+        template = item["template"]
+        template_link = (
+            f'<a href="{rel_url("/official-templates/" + template, ctx)}">Apri template/fonte</a>'
+            if template
+            else '<span class="muted">Template ufficiale non disponibile in locale: generazione da schema interno.</span>'
+        )
+        reviewer_value = saved_payload.get("reviewer") if selected_output else ctx["user"]["name"]
+        manual_notes_value = saved_payload.get("manual_notes") if selected_output else ""
+        readonly_attr = " readonly" if readonly_output else ""
+        view_banner = ""
+        form_actions = f"""
+        <button class="button primary" type="submit">Genera bozza output</button>
+        <a class="button ghost" href="{rel_url('/documents', ctx, {'origin': 'Comunicazioni'})}">Vedi archivio</a>
+        """
+        if selected_output:
+            status_class, status_label = self.communication_status_meta(selected_output["status"], "")
+            document_title = selected_output["document_title"] if "document_title" in selected_output.keys() else "Output comunicazione"
+            can_edit_selected = self.communication_output_is_editable(selected_output["status"])
+            if readonly_output:
+                locked_action = (
+                    f'<a class="button primary" href="{rel_url("/communications", ctx, {"tab": "generatore", "comm": item["id"], "output": selected_output["id"], "edit": "1"})}">Modifica / rigenera</a>'
+                    if can_edit_selected
+                    else '<span class="badge neutral">Versione chiusa</span>'
+                )
+                form_actions = (
+                    f"""
+        <a class="button primary" href="{rel_url('/communications', ctx, {'tab': 'generatore', 'comm': item['id'], 'output': selected_output['id'], 'edit': '1'})}">Modifica / rigenera</a>
+        <a class="button ghost" href="{rel_url('/communications', ctx, {'tab': 'generatore', 'comm': item['id']})}">Nuova bozza pulita</a>
+        """
+                    if can_edit_selected
+                    else f"""
+        <a class="button ghost" href="{rel_url('/documents/' + str(selected_output['document_id']) + '/download', ctx) if selected_output['document_id'] else '#'}">Scarica</a>
+        <a class="button secondary" href="{rel_url('/communications', ctx, {'tab': 'generatore', 'comm': item['id']})}">Nuova comunicazione</a>
+        """
+                )
+                view_banner = f"""
+    <div class="communication-opened-output">
+      <div>
+        <span class="panel-kicker">comunicazione aperta dallo storico</span>
+        <strong>{esc(document_title or 'Output comunicazione')}</strong>
+        <small>Stato: <span class="comm-status {status_class}">{esc(status_label)}</span> - versione fissata, non modificabile.</small>
+      </div>
+      {locked_action}
+    </div>"""
+            else:
+                view_banner = f"""
+    <div class="communication-opened-output is-editing">
+      <div>
+        <span class="panel-kicker">modifica da pratica esistente</span>
+        <strong>Stai lavorando su una copia modificabile.</strong>
+        <small>La rigenerazione crea una nuova bozza nello storico; la versione precedente resta archiviata finche non viene rimossa.</small>
+      </div>
+      <a class="button ghost" href="{rel_url('/communications', ctx, {'tab': 'generatore', 'comm': item['id'], 'output': selected_output['id']})}">Annulla modifica</a>
+    </div>"""
+        return f"""
+<section class="panel generator-summary">
+  <div class="section-head">
+    <div>
+      <p class="eyebrow">{esc(item['authority'])} - {esc(item['channel'])}</p>
+      <h2>{esc(item['title'])}</h2>
+    </div>
+    <span class="badge {badge_class(item['deadline'])}">{esc(item['deadline'])}</span>
+  </div>
+  <div class="generator-summary-grid">
+    <div><span>Periodicita</span><strong>{esc(item['frequency'])}</strong></div>
+    <div><span>Riferimento</span><strong>{esc(item['reference'])}</strong></div>
+    <div><span>Output</span><strong>{esc(item['output'])}</strong></div>
+    <div><span>Fonte ufficiale</span><strong>{esc(item['source'])}</strong></div>
+  </div>
+</section>
+<div class="communication-workbench refined-generator">
+  <div class="panel generator-form-panel">
+    <div class="section-head">
+      <div><h2>Compilazione</h2><span class="muted">Ogni campo resta modificabile. I valori suggeriti vengono tracciati come precompilati.</span></div>
+      <span class="panel-kicker">campi editabili</span>
+    </div>
+    {view_banner}
+    <form class="form-grid top-gap" method="post" action="/communications/generate">
+      {hidden_ctx(ctx)}
+      <input type="hidden" name="workflow_id" value="{esc(item['id'])}">
+      <input type="hidden" name="source_output_id" value="{esc(selected_output['id'] if selected_output else '')}">
+      {fields}
+      <label class="comm-field full-span is-prefilled">
+        <span class="field-head"><span>Responsabile validazione</span><em>precompilato</em></span>
+        <input name="reviewer" value="{esc(reviewer_value)}" data-field-state="prefilled"{readonly_attr}>
+        <small>Fonte: utente corrente</small>
+      </label>
+      <label class="comm-field full-span is-manual">
+        <span class="field-head"><span>Note operative e rettifiche manuali</span><em>manuale</em></span>
+        <textarea name="manual_notes" rows="4" placeholder="Annota dati mancanti, assunzioni, fonti da verificare, differenze rispetto al template ufficiale." data-field-state="manual"{readonly_attr}>{esc(manual_notes_value)}</textarea>
+        <small>Usa questo campo per rettifiche e decisioni non ricavate dai dati/documenti.</small>
+      </label>
+      <div class="form-actions left">
+        {form_actions}
+      </div>
+    </form>
+  </div>
+  <aside class="panel generator-control-panel">
+    <div class="section-head"><h2>Controlli output</h2><span class="panel-kicker">prima di generare</span></div>
+    <div class="prefill-grid">
+      <div><span>Precompilazione suggerita</span><ul class="plain-list">{prefill}</ul></div>
+      <div><span>Allegati richiesti</span><ul class="attachment-list">{attachment_rows}</ul></div>
+    </div>
+    <div class="output-preview">
+      <p class="panel-kicker">Output generato</p>
+      <strong>{esc(item['output'])}</strong>
+      <span>La bozza salvata in Documenti mantiene: campi inseriti, fonti, template, responsabile, warning e timestamp.</span>
+      {template_link}
+    </div>
+  </aside>
+</div>
+{self.communication_output_table(ctx, item)}
+<section class="panel send-instructions">
+  <div class="section-head"><h2>Istruzioni invio</h2><span class="panel-kicker">{esc(item['channel'])}</span></div>
+  <ol>{instructions}</ol>
+</section>
+"""
+
+    def communication_field_input(self, index, field, suggestion, saved_value=None, readonly=False):
+        label, kind, placeholder = field
+        name = f"field_{index}"
+        value, source, state = suggestion
+        if saved_value is not None:
+            value = saved_value
+            source = "Versione salvata"
+            state = "prefilled" if saved_value else "empty"
+        state_class = {
+            "prefilled": "is-prefilled",
+            "manual": "is-manual",
+            "empty": "is-empty",
+        }.get(state, "is-empty")
+        badge = {
+            "prefilled": "precompilato",
+            "manual": "manuale",
+            "empty": "vuoto",
+        }.get(state, "vuoto")
+        readonly_attr = " readonly" if readonly else ""
+        if kind == "textarea":
+            control = f'<textarea name="{name}" rows="4" placeholder="{esc(placeholder)}" data-field-state="{esc(state)}"{readonly_attr}>{esc(value)}</textarea>'
+        else:
+            input_type = "date" if kind == "date" else "number" if kind == "number" else "text"
+            control = f'<input name="{name}" type="{input_type}" placeholder="{esc(placeholder)}" value="{esc(value)}" data-field-state="{esc(state)}"{readonly_attr}>'
+        return f"""<label class="comm-field {state_class}">
+          <span class="field-head"><span>{esc(label)}</span><em>{badge}</em></span>
+          {control}
+          <small>Fonte: {esc(source)}</small>
+        </label>"""
+
+    def communication_generator_panel(self, ctx):
+        pid = ctx["platform_id"]
+        docs = rows(
+            """
+            SELECT category, origin, COUNT(*) AS count
+            FROM documents
+            WHERE platform_id = ?
+            GROUP BY category, origin
+            ORDER BY count DESC, category
+            """,
+            (pid,),
+        )
+        active_deals = row(
+            "SELECT COUNT(*) AS c FROM deals WHERE platform_id = ? AND phase NOT IN ('concluso','archiviato')",
+            (pid,),
+        )["c"]
+        proponents = row("SELECT COUNT(*) AS c FROM proponents WHERE platform_id = ?", (pid,))["c"]
+        doc_sources = "".join(
+            f"""<li>
+              <span>{esc(d['origin'])} / {esc(d['category'])}</span>
+              <strong>{d['count']}</strong>
+            </li>"""
+            for d in docs[:6]
+        )
+        if not doc_sources:
+            doc_sources = '<li><span>Nessun documento caricato</span><strong>0</strong></li>'
+        obligation_options = "".join(
+            f'<option value="{esc(item["title"])}" {"selected" if item["title"] == "KIIS offerta art. 23" else ""}>{esc(item["title"])}</option>'
+            for item in COMMUNICATION_CATALOG
+        )
+        field_rows = "".join(
+            [
+                self.field_mapping_row("Identificativo offerta", "Deal", "external_offer_id / progressivo interno", "Da validare"),
+                self.field_mapping_row("Nome progetto", "Deal", "title", "Pronto"),
+                self.field_mapping_row("Titolare progetto", "Proponente", "name, legal_form, tax_id", "Pronto"),
+                self.field_mapping_row("Importo obiettivo", "Deal", "funding_target", "Pronto"),
+                self.field_mapping_row("Statuto e diritti investitori", "Documenti", "statuto / delibere / patti", "Da estrarre"),
+                self.field_mapping_row("Costi e commissioni", "Contratti", "contratto proponente / fee schedule", "Da estrarre"),
+                self.field_mapping_row("Rischi specifici", "Business plan / due diligence", "documenti istruttoria", "Da revisionare"),
+                self.field_mapping_row("Conflitti di interesse", "Registro conflitti", "registro + compagine", "Da validare"),
+            ]
+        )
+        return f"""
+<section class="panel generator-panel">
+  <div class="section-head">
+    <div>
+      <p class="eyebrow">Design architetturale</p>
+      <h2>Generatore file finale</h2>
+    </div>
+    <span class="badge warning">Prototipo UI</span>
+  </div>
+  <div class="generator-layout">
+    <div class="generator-control">
+      <label>Comunicazione da generare
+        <select>{obligation_options}</select>
+      </label>
+      <label>Output finale
+        <select>
+          <option>Excel SICROWD + fascicolo evidenze</option>
+          <option>DOCX domanda autorizzazione</option>
+          <option>PDF comunicazione firmabile</option>
+          <option>ZIP documenti e ricevute</option>
+        </select>
+      </label>
+      <div class="generator-actions">
+        <button class="button primary disabled-button" type="button" aria-disabled="true">Genera bozza file</button>
+        <button class="button secondary disabled-button" type="button" aria-disabled="true">Valida campi mancanti</button>
+      </div>
+      <p class="muted">In questa fase i comandi mostrano il disegno del flusso: la generazione reale arrivera' quando collegheremo parser documentale, template engine e controlli di firma/invio.</p>
+    </div>
+    <div class="source-stack">
+      <div class="source-card">
+        <span>Dati strutturati disponibili</span>
+        <strong>{active_deals} deal attivi</strong>
+        <small>{proponents} proponenti in anagrafica</small>
+      </div>
+      <div class="source-card">
+        <span>Documenti candidati</span>
+        <ul class="source-list">{doc_sources}</ul>
+      </div>
+    </div>
+  </div>
+  <ol class="generation-flow">
+    <li class="done"><span>1</span><strong>Seleziona obbligo</strong><small>Template, destinatario, scadenza</small></li>
+    <li class="current"><span>2</span><strong>Raccogli dati</strong><small>Deal, proponenti, compagine, documenti</small></li>
+    <li><span>3</span><strong>Estrai evidenze</strong><small>Contratti, statuti, verbali, allegati</small></li>
+    <li><span>4</span><strong>Valida</strong><small>Campi mancanti, fonte, reviewer</small></li>
+    <li><span>5</span><strong>Genera finale</strong><small>File + audit + ricevuta</small></li>
+  </ol>
+  <div class="workspace-grid generator-grid">
+    <div class="panel inset-panel">
+      <div class="section-head"><h2>Mappa dati proposta</h2><span class="source-chip">KIIS art. 23 esempio</span></div>
+      <table class="data-table compact">
+        <thead><tr><th>Campo</th><th>Fonte</th><th>Punto di prelievo</th><th>Stato</th></tr></thead>
+        <tbody>{field_rows}</tbody>
+      </table>
+    </div>
+    <div class="panel inset-panel">
+      <div class="section-head"><h2>Regole di generazione</h2></div>
+      <ul class="plain-list">
+        <li><strong>Ogni campo mantiene la fonte:</strong> dato strutturato, documento, pagina, estratto e utente validatore.</li>
+        <li><strong>I documenti caricati diventano fonti interrogabili:</strong> contratti, patti, statuti, verbali, business plan, KYC e KIIS vengono indicizzati e collegati al fascicolo.</li>
+        <li><strong>Il file finale non nasce mai “al buio”:</strong> prima si vede una bozza con campi mancanti, conflitti e warning normativi.</li>
+        <li><strong>La generazione produce evidenza:</strong> file finale, versione template, hash, allegati usati, log validazioni e ricevuta di trasmissione quando disponibile.</li>
+      </ul>
+    </div>
+  </div>
+</section>
+"""
+
+    def field_mapping_row(self, field, source, pointer, state):
+        return f"""<tr>
+          <td>{esc(field)}</td>
+          <td>{esc(source)}</td>
+          <td>{esc(pointer)}</td>
+          <td><span class="badge {badge_class(state)}">{esc(state)}</span></td>
+        </tr>"""
+
+    def communication_row(self, ctx, item):
+        template = item["template"]
+        if template:
+            template_html = f'<a href="{rel_url("/official-templates/" + template, ctx)}">{esc(item["status"])}</a>'
+        else:
+            template_html = f'<span class="badge {badge_class(item["status"])}">{esc(item["status"])}</span>'
+        return f"""<tr>
+          <td><strong>{esc(item['title'])}</strong><br><span class="muted">{esc(item['payload'])}</span></td>
+          <td>{esc(item['recipient'])}</td>
+          <td>{esc(item['trigger'])}</td>
+          <td><span class="badge {badge_class(item['deadline'])}">{esc(item['deadline'])}</span></td>
+          <td>{esc(item['source'])}</td>
+          <td>{template_html}</td>
+        </tr>"""
+
+    def template_row(self, ctx, item):
+        path = TEMPLATE_DIR / item["filename"]
+        local = (
+            f'<a href="{rel_url("/official-templates/" + item["filename"], ctx)}">Apri</a>'
+            if path.exists()
+            else '<span class="badge warning">Non presente</span>'
+        )
+        return f"""<tr>
+          <td><strong>{esc(item['title'])}</strong><br><span class="muted">{esc(item['note'])}</span></td>
+          <td>{esc(item['authority'])}</td>
+          <td><span class="badge {badge_class(item['status'])}">{esc(item['status'])}</span></td>
+          <td>{local}<br><a href="{esc(item['source_url'])}" target="_blank" rel="noreferrer">Fonte</a></td>
+        </tr>"""
+
+    def page_documents(self):
+        ctx = self.get_ctx()
+        pid = ctx["platform_id"]
+        params = parse_qs(urlparse(self.path).query)
+        mode = (params.get("mode") or [""])[0]
+        q = (params.get("q") or [""])[0].strip()
+        origin_filter = (params.get("origin") or [""])[0]
+        category_filter = (params.get("category") or [""])[0]
+        context_filter = (params.get("context") or [""])[0]
+
+        origin_counts_raw = rows(
+            "SELECT origin AS name, COUNT(*) AS count FROM documents WHERE platform_id = ? GROUP BY origin ORDER BY origin",
+            (pid,),
+        )
+        category_counts_raw = rows(
+            """
+            SELECT label AS name, SUM(count) AS count
+            FROM (
+              SELECT category AS label, COUNT(*) AS count FROM documents WHERE platform_id = ? GROUP BY category
+              UNION ALL
+              SELECT document_type AS label, COUNT(*) AS count FROM person_documents WHERE platform_id = ? GROUP BY document_type
+              UNION ALL
+              SELECT contract_type AS label, COUNT(*) AS count FROM supplier_contracts WHERE platform_id = ? GROUP BY contract_type
+            )
+            WHERE label != ''
+            GROUP BY label
+            ORDER BY label
+            """,
+            (pid, pid, pid),
+        )
+        origin_taxonomy = [
+            "Archivio",
+            "Compagine",
+            "CdA",
+            "Proponente",
+            "Deal",
+            "Persona",
+            "Fornitore",
+            "Contratto fornitore",
+            "Governance",
+            "Autorita",
+            "Comunicazioni",
+            "Altro",
+        ]
+        category_taxonomy = [
+            "Documentazione",
+            "Atto societario",
+            "Statuto",
+            "Bilancio",
+            "Situazione contabile",
+            "Relazione revisore",
+            "Prospetto requisiti prudenziali",
+            "Polizza assicurativa",
+            "Domanda autorizzazione ECSP",
+            "Delibera CdA",
+            "Verbale CdA",
+            "Visura camerale",
+            "Patti parasociali",
+            "Lettera di incarico",
+            "Contratto amministratore",
+            "Contratto fornitore",
+            "Outsourcing",
+            "Data processing agreement",
+            "SLA",
+            "NDA",
+            "Procura",
+            "Delega",
+            "KIIS",
+            "Business plan",
+            "KYC / AML",
+            "Comunicazione CONSOB",
+            "Comunicazione Banca d'Italia",
+            "Altro",
+        ]
+
+        def merge_taxonomy(count_rows, base):
+            counts = {item["name"]: item["count"] for item in count_rows}
+            ordered = [{"name": name, "count": counts.pop(name, 0)} for name in base]
+            ordered.extend({"name": name, "count": count} for name, count in sorted(counts.items()))
+            return ordered
+
+        origins = merge_taxonomy(origin_counts_raw, origin_taxonomy)
+        categories = merge_taxonomy(category_counts_raw, category_taxonomy)
+        deals = rows("SELECT id, title AS name FROM deals WHERE platform_id = ? ORDER BY title", (pid,))
+        props = rows("SELECT id, name FROM proponents WHERE platform_id = ? ORDER BY name", (pid,))
+        suppliers = rows("SELECT id, name FROM suppliers WHERE platform_id = ? ORDER BY name", (pid,))
+        people = rows(
+            """
+            SELECT name, MAX(role) AS role
+            FROM (
+              SELECT name, role FROM committee_members WHERE platform_id = ?
+              UNION ALL
+              SELECT name, role FROM users WHERE active = 1
+              UNION ALL
+              SELECT person_name AS name, role FROM person_agreements WHERE platform_id = ?
+              UNION ALL
+              SELECT person_name AS name, role FROM person_documents WHERE platform_id = ?
+            )
+            WHERE name != ''
+            GROUP BY name
+            ORDER BY name
+            """,
+            (pid, pid, pid),
+        )
+
+        where = ["doc.platform_id = ?"]
+        query_params = [pid]
+        if q:
+            needle = f"%{q}%"
+            where.append(
+                """(
+                  doc.title LIKE ? OR doc.category LIKE ? OR doc.origin LIKE ? OR doc.filename LIKE ?
+                  OR IFNULL(d.title, '') LIKE ? OR IFNULL(p.name, '') LIKE ?
+                  OR IFNULL(pd.person_name, '') LIKE ? OR IFNULL(s.name, '') LIKE ?
+                )"""
+            )
+            query_params.extend([needle] * 8)
+        if origin_filter:
+            where.append("doc.origin = ?")
+            query_params.append(origin_filter)
+        if category_filter:
+            where.append("(doc.category = ? OR IFNULL(pd.document_type, '') = ? OR IFNULL(sc.contract_type, '') = ?)")
+            query_params.extend([category_filter, category_filter, category_filter])
+        if context_filter and ":" in context_filter:
+            kind, value = context_filter.split(":", 1)
+            if kind == "deal" and value.isdigit():
+                where.append("doc.deal_id = ?")
+                query_params.append(int(value))
+            elif kind == "proponent" and value.isdigit():
+                where.append("doc.proponent_id = ?")
+                query_params.append(int(value))
+            elif kind == "supplier" and value.isdigit():
+                where.append("s.id = ?")
+                query_params.append(int(value))
+            elif kind == "person":
+                where.append("pd.person_name = ?")
+                query_params.append(value)
+
+        docs = rows(
+            f"""
+            SELECT doc.*, d.title AS deal_title, p.name AS proponent_name,
+                   pd.person_name, pd.role AS person_role, pd.document_type AS person_document_type,
+                   s.id AS supplier_id, s.name AS supplier_name,
+                   sc.contract_type, sc.status AS contract_status
+            FROM documents doc
+            LEFT JOIN deals d ON d.id = doc.deal_id
+            LEFT JOIN proponents p ON p.id = doc.proponent_id
+            LEFT JOIN person_documents pd ON pd.document_id = doc.id
+            LEFT JOIN supplier_contracts sc ON sc.document_id = doc.id
+            LEFT JOIN suppliers s ON s.id = sc.supplier_id
+            WHERE {" AND ".join(where)}
+            ORDER BY doc.created_at DESC
+            """,
+            tuple(query_params),
+        )
+        person_doc_count = row("SELECT COUNT(*) AS c FROM person_documents WHERE platform_id = ?", (pid,))["c"]
+        supplier_contract_count = row("SELECT COUNT(*) AS c FROM supplier_contracts WHERE platform_id = ?", (pid,))["c"]
+        compagine_doc_count = row("SELECT COUNT(*) AS c FROM documents WHERE platform_id = ? AND origin = 'Compagine'", (pid,))["c"]
+        deal_doc_count = row("SELECT COUNT(*) AS c FROM documents WHERE platform_id = ? AND deal_id IS NOT NULL", (pid,))["c"]
+        proponent_doc_count = row("SELECT COUNT(*) AS c FROM documents WHERE platform_id = ? AND proponent_id IS NOT NULL", (pid,))["c"]
+        general_doc_count = row(
+            """
+            SELECT COUNT(*) AS c
+            FROM documents
+            WHERE platform_id = ? AND deal_id IS NULL AND proponent_id IS NULL
+            """,
+            (pid,),
+        )["c"]
+        archive_counts = {
+            "Persone": person_doc_count,
+            "Fornitori": supplier_contract_count,
+            "Societari": compagine_doc_count,
+            "Deal": deal_doc_count,
+            "Proponenti": proponent_doc_count,
+            "Generale": general_doc_count,
+        }
+
+        def filtered_url(extra=None):
+            clean = {}
+            for key, value in {"q": q, "origin": origin_filter, "category": category_filter, "context": context_filter}.items():
+                if value:
+                    clean[key] = value
+            if extra:
+                clean.update(extra)
+            clean = {key: value for key, value in clean.items() if value}
+            return rel_url("/documents", ctx, clean)
+
+        def option_from_counts(items, selected, all_label):
+            opts = [f'<option value="">{esc(all_label)}</option>']
+            for item in items:
+                value = item["name"]
+                sel = " selected" if value == selected else ""
+                opts.append(f'<option value="{esc(value)}"{sel}>{esc(value)} ({item["count"]})</option>')
+            return "".join(opts)
+
+        context_entries = []
+        for person in people:
+            role_label = ROLE_LABELS.get(person["role"], person["role"])
+            label = f"Persona - {person['name']}{(' - ' + role_label) if role_label else ''}"
+            context_entries.append({"value": f"person:{person['name']}", "label": label})
+        for supplier in suppliers:
+            context_entries.append({"value": f"supplier:{supplier['id']}", "label": f"Fornitore - {supplier['name']}"})
+        for prop in props:
+            context_entries.append({"value": f"proponent:{prop['id']}", "label": f"Proponente - {prop['name']}"})
+        for deal in deals:
+            context_entries.append({"value": f"deal:{deal['id']}", "label": f"Deal - {deal['name']}"})
+        selected_context_label = next((item["label"] for item in context_entries if item["value"] == context_filter), "")
+
+        def context_datalist():
+            chunks = ['<datalist id="document-context-options">']
+            for item in context_entries:
+                chunks.append(f'<option value="{esc(item["label"])}" data-value="{esc(item["value"])}"></option>')
+            chunks.append("</datalist>")
+            return "".join(chunks)
+
+        def chip_links(items, filter_name, names=None, limit=8):
+            selected = set(names or [item["name"] for item in items])
+            selected_items = [item for item in items if item["name"] in selected]
+            if not selected_items:
+                return '<span class="classification-empty">Nessuna voce</span>'
+            chips = []
+            for item in selected_items[:limit]:
+                active = " active" if (filter_name == "origin" and origin_filter == item["name"]) or (filter_name == "category" and category_filter == item["name"]) else ""
+                chips.append(
+                    f'<a class="classification-chip{active}" href="{filtered_url({filter_name: item["name"]})}"><span>{esc(item["name"])}</span><strong>{item["count"]}</strong></a>'
+                )
+            return "".join(chips)
+
+        def context_quick_links():
+            rows_html = []
+            for label, count in archive_counts.items():
+                rows_html.append(f'<div class="archive-count"><span>{esc(label)}</span><strong>{count}</strong></div>')
+            return "".join(rows_html)
+
+        def context_options():
+            chunks = [f'<option value="">Tutti i collegamenti</option>']
+            chunks.append('<optgroup label="Persone">')
+            for person in people:
+                value = f"person:{person['name']}"
+                sel = " selected" if context_filter == value else ""
+                role_label = ROLE_LABELS.get(person["role"], person["role"])
+                label = f"{person['name']} - {role_label}" if role_label else person["name"]
+                chunks.append(f'<option value="{esc(value)}"{sel}>{esc(label)}</option>')
+            chunks.append("</optgroup><optgroup label=\"Fornitori\">")
+            for supplier in suppliers:
+                value = f"supplier:{supplier['id']}"
+                sel = " selected" if context_filter == value else ""
+                chunks.append(f'<option value="{esc(value)}"{sel}>{esc(supplier["name"])}</option>')
+            chunks.append("</optgroup><optgroup label=\"Proponenti\">")
+            for prop in props:
+                value = f"proponent:{prop['id']}"
+                sel = " selected" if context_filter == value else ""
+                chunks.append(f'<option value="{esc(value)}"{sel}>{esc(prop["name"])}</option>')
+            chunks.append("</optgroup><optgroup label=\"Deal\">")
+            for deal in deals:
+                value = f"deal:{deal['id']}"
+                sel = " selected" if context_filter == value else ""
+                chunks.append(f'<option value="{esc(value)}"{sel}>{esc(deal["name"])}</option>')
+            chunks.append("</optgroup>")
+            return "".join(chunks)
+
+        def taxonomy_links(items, filter_name):
+            if not items:
+                return '<li><span>Nessuna voce</span><strong>0</strong></li>'
+            links = []
+            for item in items[:8]:
+                url = filtered_url({filter_name: item["name"]})
+                links.append(f'<li><a href="{url}">{esc(item["name"])}</a><strong>{item["count"]}</strong></li>')
+            return "".join(links)
+
+        def document_context(doc):
+            if doc["person_name"]:
+                role = f" - {doc['person_role']}" if doc["person_role"] else ""
+                return "Persona", f"{doc['person_name']}{role}"
+            if doc["supplier_name"]:
+                ctype = f" - {doc['contract_type']}" if doc["contract_type"] else ""
+                return "Fornitore", f"{doc['supplier_name']}{ctype}"
+            if doc["deal_title"]:
+                return "Deal", doc["deal_title"]
+            if doc["proponent_name"]:
+                return "Proponente", doc["proponent_name"]
+            return "Archivio", "-"
+
+        rows_html = ""
+        for doc in docs:
+            ctx_label, ctx_value = document_context(doc)
+            source = "Generato" if doc["generated"] else "Caricato"
+            rows_html += f"""<tr>
+              <td>
+                <strong><a href="{rel_url('/documents/' + str(doc['id']) + '/download', ctx)}">{esc(doc['title'])}</a></strong>
+                <span class="archive-file">{esc(doc['filename'])}</span>
+              </td>
+              <td><span class="source-chip">{esc(doc['origin'])}</span><span class="source-chip">{esc(doc['category'])}</span></td>
+              <td><strong>{esc(ctx_label)}</strong><br><span class="muted">{esc(ctx_value)}</span></td>
+              <td>{esc(doc['proponent_name'] or '-')}</td>
+              <td><span class="badge {badge_class(source)}">{source}</span></td>
+              <td>{esc(nice_date(doc['created_at']))}</td>
+            </tr>"""
+        if not rows_html:
+            rows_html = '<tr><td colspan="6" class="empty-row">Nessun documento trovato con questi filtri.</td></tr>'
+
+        people_options = "".join(
+            f'<option value="{esc(person["name"] + "||" + (ROLE_LABELS.get(person["role"], person["role"]) or ""))}">{esc(person["name"])}{(" - " + esc(ROLE_LABELS.get(person["role"], person["role"]))) if person["role"] else ""}</option>'
+            for person in people
+        )
+        common_types = category_taxonomy
+        type_datalist = "".join(f'<option value="{esc(value)}"></option>' for value in common_types)
+        upload_modal = ""
+        if mode == "upload" and user_can(ctx["user"], "upload_document"):
+            upload_modal = f"""
+<div class="modal-backdrop">
+  <section class="person-modal archive-modal">
+    <div class="section-head">
+      <h2>Nuovo documento</h2>
+      <a class="modal-close" href="{filtered_url()}">x</a>
+    </div>
+    <form class="form-grid" method="post" action="/documents/upload" enctype="multipart/form-data">
+      {hidden_ctx(ctx)}
+      <label>Classe archivio
+        <select name="entity_kind">
+          <option value="">Archivio generale</option>
+          <option value="person">Persona / incarico</option>
+          <option value="supplier">Fornitore / contratto</option>
+          <option value="proponent">Proponente</option>
+          <option value="deal">Deal / offerta</option>
+        </select>
+      </label>
+      <label>Origine<select name="origin"><option{" selected" if origin_filter == "Archivio" or not origin_filter else ""}>Archivio</option><option{" selected" if origin_filter == "Compagine" else ""}>Compagine</option><option{" selected" if origin_filter == "CdA" else ""}>CdA</option><option{" selected" if origin_filter == "Proponente" else ""}>Proponente</option><option{" selected" if origin_filter == "Deal" else ""}>Deal</option><option{" selected" if origin_filter == "Persona" else ""}>Persona</option><option{" selected" if origin_filter == "Fornitore" else ""}>Fornitore</option><option{" selected" if origin_filter == "Contratto fornitore" else ""}>Contratto fornitore</option><option{" selected" if origin_filter == "Governance" else ""}>Governance</option><option{" selected" if origin_filter == "Autorita" else ""}>Autorita</option><option{" selected" if origin_filter == "Comunicazioni" else ""}>Comunicazioni</option><option{" selected" if origin_filter == "Altro" else ""}>Altro</option></select></label>
+      <label>Tipo documento<input name="category" list="document-type-options" value="{esc(category_filter or 'Documentazione')}"></label>
+      <datalist id="document-type-options">{type_datalist}</datalist>
+      <label>Titolo<input name="title" required></label>
+      <label>Persona collegata<select name="person_ref"><option value="">-</option>{people_options}</select></label>
+      <label>Nuova persona<input name="person_name" placeholder="nominativo non ancora censito"></label>
+      <label>Ruolo persona<input name="person_role" placeholder="es. delegato, consulente, sindaco"></label>
+      <label>Fornitore<select name="supplier_id"><option value="">-</option>{option_rows(suppliers, '')}</select></label>
+      <label>Nuovo fornitore<input name="supplier_name" placeholder="es. provider AML"></label>
+      <label>Area servizio<input name="service_area" placeholder="es. KYC, IT, legale"></label>
+      <label>Deal<select name="deal_id"><option value="">-</option>{option_rows(deals, '')}</select></label>
+      <label>Proponente<select name="proponent_id"><option value="">-</option>{option_rows(props, '')}</select></label>
+      <label>Controparte<input name="counterparty" placeholder="societa, fornitore, persona"></label>
+      <label>Scadenza / revisione<input name="expires_at" type="date"></label>
+      <label class="full-span">Note archivio<textarea name="notes" rows="3" placeholder="Ambito, poteri, vincoli, rinnovo, fonte dati..."></textarea></label>
+      <label class="full-span">File<input name="file" type="file" required></label>
+      <div class="form-actions left"><button class="button primary" type="submit">Carica documento</button><a class="button ghost" href="{filtered_url()}">Annulla</a></div>
+    </form>
+  </section>
+</div>"""
+
+        action_button = ""
+        if user_can(ctx["user"], "upload_document"):
+            action_button = f'<a class="button primary" href="{filtered_url({"mode": "upload"})}">+ Nuovo documento</a>'
+
+        body = f"""
+<p class="page-copy">Tutti i file della suite - caricati qui o nelle altre sezioni - confluiscono in un indice filtrabile per origine, tipo documento, soggetto collegato e contesto operativo.</p>
+<form class="archive-toolbar" method="get" action="/documents">
+  {hidden_ctx(ctx)}
+  <label>Cerca<input name="q" value="{esc(q)}" placeholder="titolo, persona, fornitore, deal..."></label>
+  <label>Origine<select name="origin">{option_from_counts(origins, origin_filter, "Tutte")}</select></label>
+  <label>Tipo documento<select name="category">{option_from_counts(categories, category_filter, "Tutti")}</select></label>
+  <label>Collegato a<input name="context_search" value="{esc(selected_context_label)}" list="document-context-options" placeholder="cerca persona, fornitore, proponente, deal" data-context-combobox></label>
+  <input type="hidden" name="context" value="{esc(context_filter)}" data-context-value>
+  {context_datalist()}
+  <button class="button ghost" type="submit">Cerca</button>
+  <a class="button secondary" href="{rel_url('/documents', ctx)}">Reset</a>
+  {action_button}
+</form>
+<section class="panel archive-classification">
+  <div class="section-head"><h2>Classificazione archivio</h2><span class="panel-kicker">filtri rapidi</span></div>
+  <div class="classification-grid">
+    <div>
+      <p class="panel-kicker">Origini operative</p>
+      <div class="classification-chips">{chip_links(origins, "origin", ["CdA", "Proponente", "Deal", "Compagine", "Persona", "Fornitore", "Autorita"])}</div>
+    </div>
+    <div>
+      <p class="panel-kicker">Documenti societari</p>
+      <div class="classification-chips">{chip_links(categories, "category", ["Statuto", "Atto societario", "Domanda autorizzazione ECSP", "Delibera CdA", "Verbale CdA", "Patti parasociali"])}</div>
+    </div>
+    <div>
+      <p class="panel-kicker">Documenti operativi</p>
+      <div class="classification-chips">{chip_links(categories, "category", ["Contratto fornitore", "Outsourcing", "Data processing agreement", "KYC / AML", "KIIS", "Business plan"])}</div>
+    </div>
+    <div>
+      <p class="panel-kicker">Copertura</p>
+      <div class="archive-count-grid">{context_quick_links()}</div>
+    </div>
+  </div>
+</section>
+<section class="panel archive-panel">
+  <div class="section-head"><h2>Archivio aggregato</h2><span class="panel-kicker">{len(docs)} documenti</span></div>
+  <div class="table-scroll">
+    <table class="data-table roomy document-index-table">
+      <thead><tr><th>Documento</th><th>Classificazione</th><th>Collegamento</th><th>Proponente</th><th>Fonte</th><th>Data</th></tr></thead>
+      <tbody>{rows_html}</tbody>
+    </table>
+  </div>
+</section>
+{upload_modal}
+"""
+        self.render("Documenti", body, "documents")
+
+    def page_architecture(self):
+        doc_path = BASE_DIR / "docs" / "ARCHITECTURE.md"
+        content = doc_path.read_text(encoding="utf-8") if doc_path.exists() else "Documento non trovato."
+        body = f'<section class="panel doc-panel"><pre>{esc(content)}</pre></section>'
+        self.render("Architettura", body, "architecture")
+
+    def page_assistant(self):
+        ctx = self.get_ctx()
+        pid = ctx["platform_id"]
+        open_deals = row(
+            "SELECT COUNT(*) AS c FROM deals WHERE platform_id = ? AND phase NOT IN ('pubblicato','raccolta_in_corso','concluso','respinta','archiviato')",
+            (pid,),
+        )["c"]
+        open_complaints = row("SELECT COUNT(*) AS c FROM complaints WHERE platform_id = ? AND status != 'Chiuso'", (pid,))["c"]
+        open_conflicts = row("SELECT COUNT(*) AS c FROM conflicts WHERE platform_id = ? AND status IN ('Aperto','In analisi')", (pid,))["c"]
+        body = f"""
+<p class="page-copy">Assistente operativo che leggerà stato del sistema, fascicoli, documenti indicizzati e quadro normativo. In questa fase è una superficie di design: nessuna risposta automatica viene ancora prodotta.</p>
+<section class="workspace-grid">
+  <div class="panel">
+    <div class="section-head"><h2>Contesto disponibile</h2><span class="panel-kicker">Read-only</span></div>
+    <div class="compact-metrics">
+      <div><span>Deal in preparazione</span><strong>{open_deals}</strong></div>
+      <div><span>Reclami aperti</span><strong>{open_complaints}</strong></div>
+      <div><span>Conflitti aperti</span><strong>{open_conflicts}</strong></div>
+      <div><span>Documenti</span><strong>{row("SELECT COUNT(*) AS c FROM documents WHERE platform_id = ?", (pid,))["c"]}</strong></div>
+    </div>
+  </div>
+  <div class="panel">
+    <div class="section-head"><h2>Bozza interazione</h2><span class="panel-kicker">Conferma umana</span></div>
+    <form class="stacked-form">
+      <label>Domanda<textarea rows="5" placeholder="Chiedi stato deal, adempimenti, documenti mancanti..."></textarea></label>
+      <button class="button primary disabled-button" type="button">Interroga assistente</button>
+    </form>
+    <p class="muted top-gap">Azioni dispositive, invii e generazioni finali dovranno sempre richiedere conferma e produrre audit.</p>
+  </div>
+</section>
+"""
+        self.render("Assistente IA", body, "assistant")
+
+    def post_deal_create(self, form):
+        ctx = self.ctx_from_form(form)
+        if not user_can(ctx["user"], "create_deal"):
+            self.redirect("/deals", ctx, "Ruolo non abilitato.")
+            return
+        with connect() as conn:
+            now = now_iso()
+            cur = conn.execute(
+                """
+                INSERT INTO deals(platform_id, proponent_id, title, funding_target, phase, technical_reviewer_id,
+                                  covi_reviewer_id, contract_required, kiis_state, created_by, created_at, updated_at)
+                VALUES (?, ?, ?, ?, 'appena_caricato', ?, ?, ?, 'Bozza', ?, ?, ?)
+                """,
+                (
+                    ctx["platform_id"],
+                    int(form["proponent_id"]),
+                    form["title"].strip(),
+                    float(form.get("funding_target") or 0),
+                    int(form.get("technical_reviewer_id") or 0) or None,
+                    int(form.get("covi_reviewer_id") or 0) or None,
+                    int(form.get("contract_required") or 0),
+                    ctx["user_id"],
+                    now,
+                    now,
+                ),
+            )
+            deal_id = cur.lastrowid
+            for category, label, required in REQUIREMENT_SEED:
+                conn.execute(
+                    "INSERT INTO deal_requirements(deal_id, kind, category, label, required) VALUES (?, 'onboarding', ?, ?, ?)",
+                    (deal_id, category, label, required),
+                )
+            for area in VERIFICATION_SEED:
+                conn.execute("INSERT INTO verifications(deal_id, area, owner_user_id) VALUES (?, ?, ?)", (deal_id, area, ctx["user_id"]))
+            log_audit(conn, ctx["platform_id"], ctx["user_id"], "deal", deal_id, "Creazione deal", "Fascicolo aperto in stato Appena caricato.")
+            conn.commit()
+        self.redirect(f"/deals/{deal_id}", ctx, "Deal creato.")
+
+    def post_requirement(self, deal_id, form):
+        ctx = self.ctx_from_form(form)
+        deal = fetch_deal(deal_id)
+        if not user_can(ctx["user"], "edit_requirement"):
+            self.redirect(f"/deals/{deal_id}", ctx, "Ruolo non abilitato.")
+            return
+        completed = int(form.get("completed") or 0)
+        req_id = int(form["requirement_id"])
+        with connect() as conn:
+            conn.execute(
+                """
+                UPDATE deal_requirements
+                SET completed = ?, completed_at = ?, completed_by = ?
+                WHERE id = ? AND deal_id = ?
+                """,
+                (completed, now_iso() if completed else "", ctx["user_id"] if completed else None, req_id, deal_id),
+            )
+            log_audit(conn, deal["platform_id"], ctx["user_id"], "deal", deal_id, "Aggiornamento requisito", f"Requisito #{req_id}: {'completato' if completed else 'riaperto'}.")
+            conn.commit()
+        self.redirect(f"/deals/{deal_id}", ctx, "Requisito aggiornato.")
+
+    def post_verification(self, deal_id, form):
+        ctx = self.ctx_from_form(form)
+        deal = fetch_deal(deal_id)
+        if not user_can(ctx["user"], "verify"):
+            self.redirect(f"/deals/{deal_id}", ctx, "Ruolo non abilitato.")
+            return
+        status = form.get("status") or "pending"
+        result = form.get("result") or ""
+        verification_id = int(form["verification_id"])
+        with connect() as conn:
+            conn.execute(
+                """
+                UPDATE verifications
+                SET status = ?, result = ?, owner_user_id = ?, completed_at = ?
+                WHERE id = ? AND deal_id = ?
+                """,
+                (status, result, ctx["user_id"], now_iso() if status in {"ok", "issue"} else "", verification_id, deal_id),
+            )
+            log_audit(conn, deal["platform_id"], ctx["user_id"], "deal", deal_id, "Aggiornamento verifica", f"Verifica #{verification_id}: {status}.")
+            conn.commit()
+        self.redirect(f"/deals/{deal_id}", ctx, "Verifica aggiornata.")
+
+    def post_opinion(self, deal_id, form):
+        ctx = self.ctx_from_form(form)
+        deal = fetch_deal(deal_id)
+        committee = form["committee"]
+        permission = "technical_opinion" if committee == "Comitato Tecnico" else "covi_opinion"
+        if not user_can(ctx["user"], permission):
+            self.redirect(f"/deals/{deal_id}", ctx, "Ruolo non abilitato.")
+            return
+        expected_phase = "comitato_tecnico" if committee == "Comitato Tecnico" else "covi"
+        if deal["phase"] != expected_phase:
+            self.redirect(f"/deals/{deal_id}", ctx, "Il deal non e in questa fase.")
+            return
+        reviewer = row("SELECT * FROM committee_members WHERE id = ?", (int(form["reviewer_member_id"]),))
+        outcome = form["outcome"]
+        summary = form["summary"]
+        content = build_opinion_html(deal, committee, reviewer, outcome, summary)
+        filename = f"parere-{committee.lower().replace(' ', '-')}-{deal_id}.html"
+        with connect() as conn:
+            doc_id = generated_document(
+                conn,
+                deal["platform_id"],
+                deal_id,
+                deal["proponent_id"],
+                committee,
+                "Parere",
+                f"Parere {committee} - {deal['title']}",
+                filename,
+                content,
+                ctx["user_id"],
+            )
+            conn.execute(
+                """
+                INSERT INTO committee_opinions(deal_id, committee, reviewer_member_id, outcome, summary, generated_document_id, created_by, created_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (deal_id, committee, reviewer["id"] if reviewer else None, outcome, summary, doc_id, ctx["user_id"], now_iso()),
+            )
+            next_phase = "covi" if committee == "Comitato Tecnico" else "cda"
+            update_deal_phase(conn, deal, next_phase, ctx["user_id"], f"Documento {committee} generato e trasmesso alla fase successiva.")
+            conn.commit()
+        self.redirect(f"/deals/{deal_id}", ctx, f"Parere {committee} generato.")
+
+    def post_board_decision(self, deal_id, form):
+        ctx = self.ctx_from_form(form)
+        deal = fetch_deal(deal_id)
+        if not user_can(ctx["user"], "board_decision"):
+            self.redirect(f"/deals/{deal_id}", ctx, "Ruolo non abilitato.")
+            return
+        if deal["phase"] != "cda":
+            self.redirect(f"/deals/{deal_id}", ctx, "Il deal non e in fase CdA.")
+            return
+        outcome = form["outcome"]
+        notes = form["notes"]
+        integration_required = 1 if outcome == "Approvato con integrazioni" else 0
+        content = build_board_html(deal, outcome, notes, integration_required)
+        with connect() as conn:
+            doc_id = generated_document(
+                conn,
+                deal["platform_id"],
+                deal_id,
+                deal["proponent_id"],
+                "CdA",
+                "Delibera",
+                f"Delibera CdA - {deal['title']}",
+                f"delibera-cda-{deal_id}.html",
+                content,
+                ctx["user_id"],
+            )
+            conn.execute(
+                """
+                INSERT INTO board_decisions(deal_id, outcome, notes, integration_required, generated_document_id, created_by, created_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+                """,
+                (deal_id, outcome, notes, integration_required, doc_id, ctx["user_id"], now_iso()),
+            )
+            if outcome == "Non approvato":
+                target = "respinta"
+                details = "CdA non favorevole; fascicolo respinto."
+            elif integration_required:
+                target = "integrazione_documenti"
+                details = "CdA approva con integrazioni documentali."
+                conn.execute(
+                    """
+                    INSERT INTO deal_requirements(deal_id, kind, category, label, required, due_date)
+                    VALUES (?, 'integration', 'Integrazione CdA', ?, 1, ?)
+                    """,
+                    (deal_id, notes[:180] or "Integrazione richiesta dal CdA", (date.today() + timedelta(days=10)).isoformat()),
+                )
+            else:
+                target = "contratto" if deal["contract_required"] else "pre_pubblicazione"
+                details = "CdA approva; fascicolo avanzato."
+            update_deal_phase(conn, deal, target, ctx["user_id"], details)
+            conn.commit()
+        self.redirect(f"/deals/{deal_id}", ctx, "Delibera registrata.")
+
+    def post_transition(self, deal_id, form):
+        ctx = self.ctx_from_form(form)
+        deal = fetch_deal(deal_id)
+        target = form["target_phase"]
+        if not user_can(ctx["user"], "finalize") and ctx["user"]["role"] not in {"compliance", "legal", "operator"}:
+            self.redirect(f"/deals/{deal_id}", ctx, "Ruolo non abilitato.")
+            return
+        notice = self.validate_transition(deal, target)
+        if notice:
+            self.redirect(f"/deals/{deal_id}", ctx, notice)
+            return
+        with connect() as conn:
+            update_deal_phase(conn, deal, target, ctx["user_id"], f"Avanzamento manuale da {phase_label(deal['phase'])} a {phase_label(target)}.")
+            if target == "pubblicato":
+                conn.execute("UPDATE deals SET kiis_state = 'Definitivo' WHERE id = ?", (deal_id,))
+            conn.commit()
+        self.redirect(f"/deals/{deal_id}", ctx, f"Fase aggiornata: {phase_label(target)}.")
+
+    def validate_transition(self, deal, target):
+        allowed = {
+            "appena_caricato": {"istruttoria_documentazione"},
+            "istruttoria_documentazione": {"verifiche"},
+            "verifiche": {"comitato_tecnico"},
+            "integrazione_documenti": {"contratto", "pre_pubblicazione"},
+            "contratto": {"pre_pubblicazione"},
+            "pre_pubblicazione": {"pubblicato"},
+        }
+        if target not in allowed.get(deal["phase"], set()):
+            return "Transizione non ammessa."
+        if target == "verifiche":
+            missing = row(
+                "SELECT COUNT(*) AS c FROM deal_requirements WHERE deal_id = ? AND kind = 'onboarding' AND required = 1 AND completed = 0",
+                (deal["id"],),
+            )["c"]
+            if missing:
+                return f"Documentazione incompleta: {missing} elementi aperti."
+        if target == "comitato_tecnico":
+            pending = row(
+                "SELECT COUNT(*) AS c FROM verifications WHERE deal_id = ? AND status != 'ok'",
+                (deal["id"],),
+            )["c"]
+            if pending:
+                return f"Verifiche non completate: {pending} elementi non OK."
+        if deal["phase"] == "integrazione_documenti":
+            open_items = row(
+                "SELECT COUNT(*) AS c FROM deal_requirements WHERE deal_id = ? AND kind = 'integration' AND required = 1 AND completed = 0",
+                (deal["id"],),
+            )["c"]
+            if open_items:
+                return f"Integrazioni aperte: {open_items}."
+        if target == "pubblicato":
+            kiis = row(
+                "SELECT COUNT(*) AS c FROM documents WHERE deal_id = ? AND category = 'KIIS'",
+                (deal["id"],),
+            )["c"]
+            if not kiis:
+                return "Caricare il KIIS definitivo prima della pubblicazione."
+        return ""
+
+    def post_deal_upload(self, deal_id, form, files):
+        ctx = self.ctx_from_form(form)
+        deal = fetch_deal(deal_id)
+        if not user_can(ctx["user"], "upload_document"):
+            self.redirect(f"/deals/{deal_id}", ctx, "Ruolo non abilitato.")
+            return
+        file_item = files.get("file")
+        if not file_item:
+            self.redirect(f"/deals/{deal_id}", ctx, "File mancante.")
+            return
+        with connect() as conn:
+            doc_id = save_uploaded_document(
+                conn,
+                file_item,
+                deal["platform_id"],
+                deal_id,
+                deal["proponent_id"],
+                "Deal",
+                form.get("category") or "Documentazione",
+                form.get("title") or file_item.filename,
+                ctx["user_id"],
+            )
+            if (form.get("category") or "").upper() == "KIIS":
+                conn.execute("UPDATE deals SET kiis_state = 'Definitivo', updated_at = ? WHERE id = ?", (now_iso(), deal_id))
+            log_audit(conn, deal["platform_id"], ctx["user_id"], "deal", deal_id, "Caricamento documento", f"Documento #{doc_id}: {form.get('title') or file_item.filename}.")
+            conn.commit()
+        self.redirect(f"/deals/{deal_id}", ctx, "Documento caricato.")
+
+    def post_generate_report(self, deal_id, form):
+        ctx = self.ctx_from_form(form)
+        deal = fetch_deal(deal_id)
+        content = build_iter_report(deal_id)
+        with connect() as conn:
+            doc_id = generated_document(
+                conn,
+                deal["platform_id"],
+                deal_id,
+                deal["proponent_id"],
+                "Deal",
+                "Report iter",
+                f"Report iter - {deal['title']}",
+                f"report-iter-{deal_id}.html",
+                content,
+                ctx["user_id"],
+            )
+            log_audit(conn, deal["platform_id"], ctx["user_id"], "deal", deal_id, "Generazione report iter", f"Documento #{doc_id} generato.")
+            conn.commit()
+        self.redirect(f"/deals/{deal_id}", ctx, "Report iter salvato nel fascicolo.")
+
+    def post_proponent_create(self, form):
+        ctx = self.ctx_from_form(form)
+        if not user_can(ctx["user"], "manage_proponents"):
+            self.redirect("/proponents", ctx, "Ruolo non abilitato.")
+            return
+        with connect() as conn:
+            cur = conn.execute(
+                """
+                INSERT INTO proponents(
+                    platform_id, name, legal_form, tax_id, contact_email, phone, website, sector,
+                    beneficial_owners, exposure, internal_score, crm_status, onboarding_status,
+                    owner_name, source_system, external_proponent_id, last_synced_at, next_action, notes, created_at
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    ctx["platform_id"],
+                    form["name"].strip(),
+                    form.get("legal_form", ""),
+                    form.get("tax_id", ""),
+                    form.get("contact_email", ""),
+                    form.get("phone", "").strip(),
+                    form.get("website", "").strip(),
+                    form.get("sector", "").strip(),
+                    form.get("beneficial_owners", ""),
+                    float(form.get("exposure") or 0),
+                    form.get("internal_score", "Da valutare"),
+                    form.get("crm_status", "In istruttoria"),
+                    form.get("onboarding_status", "Documenti da raccogliere"),
+                    form.get("owner_name", "").strip(),
+                    form.get("source_system", "Manuale"),
+                    form.get("external_proponent_id", "").strip(),
+                    now_iso() if form.get("source_system", "Manuale").startswith("adapter:") else "",
+                    form.get("next_action", "").strip(),
+                    form.get("notes", ""),
+                    now_iso(),
+                ),
+            )
+            proponent_id = cur.lastrowid
+            log_audit(conn, ctx["platform_id"], ctx["user_id"], "proponent", proponent_id, "Creazione proponente", form["name"].strip())
+            conn.commit()
+        self.redirect(f"/proponents/{proponent_id}", ctx, "Proponente creato.")
+
+    def post_proponent_update(self, proponent_id, form):
+        ctx = self.ctx_from_form(form)
+        if not user_can(ctx["user"], "manage_proponents"):
+            self.redirect(f"/proponents/{proponent_id}", ctx, "Ruolo non abilitato.")
+            return
+        with connect() as conn:
+            prop = conn.execute(
+                "SELECT * FROM proponents WHERE id = ? AND platform_id = ?",
+                (proponent_id, ctx["platform_id"]),
+            ).fetchone()
+            if not prop:
+                self.redirect("/proponents", ctx, "Proponente non trovato.")
+                return
+            source_system = form.get("source_system", "Manuale")
+            last_synced_at = prop["last_synced_at"]
+            if source_system != prop["source_system"] and source_system.startswith("adapter:"):
+                last_synced_at = now_iso()
+            conn.execute(
+                """
+                UPDATE proponents
+                SET name = ?,
+                    legal_form = ?,
+                    tax_id = ?,
+                    contact_email = ?,
+                    phone = ?,
+                    website = ?,
+                    sector = ?,
+                    beneficial_owners = ?,
+                    exposure = ?,
+                    internal_score = ?,
+                    crm_status = ?,
+                    onboarding_status = ?,
+                    owner_name = ?,
+                    source_system = ?,
+                    external_proponent_id = ?,
+                    last_synced_at = ?,
+                    manual_override_notes = ?,
+                    next_action = ?,
+                    notes = ?
+                WHERE id = ? AND platform_id = ?
+                """,
+                (
+                    form["name"].strip(),
+                    form.get("legal_form", ""),
+                    form.get("tax_id", ""),
+                    form.get("contact_email", ""),
+                    form.get("phone", "").strip(),
+                    form.get("website", "").strip(),
+                    form.get("sector", "").strip(),
+                    form.get("beneficial_owners", ""),
+                    float(form.get("exposure") or 0),
+                    form.get("internal_score", "Da valutare"),
+                    form.get("crm_status", "In istruttoria"),
+                    form.get("onboarding_status", "Documenti da raccogliere"),
+                    form.get("owner_name", "").strip(),
+                    source_system,
+                    form.get("external_proponent_id", "").strip(),
+                    last_synced_at,
+                    form.get("manual_override_notes", "").strip(),
+                    form.get("next_action", "").strip(),
+                    form.get("notes", ""),
+                    proponent_id,
+                    ctx["platform_id"],
+                ),
+            )
+            log_audit(conn, ctx["platform_id"], ctx["user_id"], "proponent", proponent_id, "Aggiornamento proponente", form["name"].strip())
+            conn.commit()
+        self.redirect(f"/proponents/{proponent_id}", ctx, "Proponente aggiornato.")
+
+    def post_committee_create(self, form):
+        ctx = self.ctx_from_form(form)
+        if not user_can(ctx["user"], "manage_compagine"):
+            self.redirect("/compagine", ctx, "Ruolo non abilitato.")
+            return
+        with connect() as conn:
+            cur = conn.execute(
+                """
+                INSERT INTO committee_members(platform_id, committee, name, role, email, active)
+                VALUES (?, ?, ?, ?, ?, 1)
+                """,
+                (ctx["platform_id"], form["committee"], form["name"], form["role"], form["email"]),
+            )
+            log_audit(conn, ctx["platform_id"], ctx["user_id"], "committee_member", cur.lastrowid, "Aggiornamento compagine", f"Aggiunto {form['name']} a {form['committee']}.")
+            conn.commit()
+        self.redirect("/compagine", ctx, "Membro aggiunto.")
+
+    def post_shareholder_create(self, form):
+        ctx = self.ctx_from_form(form)
+        if not user_can(ctx["user"], "manage_compagine"):
+            self.redirect("/compagine", ctx, "Ruolo non abilitato.")
+            return
+        with connect() as conn:
+            cur = conn.execute(
+                """
+                INSERT INTO shareholders(
+                    platform_id, name, subject_type, legal_form, tax_id, contact_email, phone,
+                    address, stake_percent, beneficial_owners, requisites_status, status, notes
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    ctx["platform_id"],
+                    form["name"].strip(),
+                    form.get("subject_type", "Societa / ente"),
+                    form.get("legal_form", "").strip(),
+                    form.get("tax_id", "").strip(),
+                    form.get("contact_email", "").strip(),
+                    form.get("phone", "").strip(),
+                    form.get("address", "").strip(),
+                    float(form.get("stake_percent") or 0),
+                    form.get("beneficial_owners", "").strip(),
+                    form.get("requisites_status", "Da verificare"),
+                    form.get("status", "Attivo"),
+                    form.get("notes", "").strip(),
+                ),
+            )
+            log_audit(conn, ctx["platform_id"], ctx["user_id"], "shareholder", cur.lastrowid, "Aggiornamento partecipogramma", form["name"])
+            conn.commit()
+            shareholder_id = cur.lastrowid
+        self.redirect("/compagine", ctx, "Partecipante aggiunto.", {"shareholder": shareholder_id})
+
+    def post_shareholder_update(self, shareholder_id, form):
+        ctx = self.ctx_from_form(form)
+        if not user_can(ctx["user"], "manage_compagine"):
+            self.redirect("/compagine", ctx, "Ruolo non abilitato.")
+            return
+        with connect() as conn:
+            shareholder = conn.execute(
+                "SELECT * FROM shareholders WHERE id = ? AND platform_id = ?",
+                (shareholder_id, ctx["platform_id"]),
+            ).fetchone()
+            if not shareholder:
+                self.redirect("/compagine", ctx, "Partecipante non trovato.")
+                return
+            conn.execute(
+                """
+                UPDATE shareholders
+                SET name = ?,
+                    subject_type = ?,
+                    legal_form = ?,
+                    tax_id = ?,
+                    contact_email = ?,
+                    phone = ?,
+                    address = ?,
+                    stake_percent = ?,
+                    beneficial_owners = ?,
+                    requisites_status = ?,
+                    status = ?,
+                    notes = ?
+                WHERE id = ? AND platform_id = ?
+                """,
+                (
+                    form.get("name", shareholder["name"]).strip(),
+                    form.get("subject_type", shareholder["subject_type"]),
+                    form.get("legal_form", "").strip(),
+                    form.get("tax_id", "").strip(),
+                    form.get("contact_email", "").strip(),
+                    form.get("phone", "").strip(),
+                    form.get("address", "").strip(),
+                    float(form.get("stake_percent") or 0),
+                    form.get("beneficial_owners", "").strip(),
+                    form.get("requisites_status", "Da verificare"),
+                    form.get("status", "Attivo"),
+                    form.get("notes", "").strip(),
+                    shareholder_id,
+                    ctx["platform_id"],
+                ),
+            )
+            log_audit(conn, ctx["platform_id"], ctx["user_id"], "shareholder", shareholder_id, "Aggiornamento partecipante qualificato", form.get("name", shareholder["name"]))
+            conn.commit()
+        self.redirect("/compagine", ctx, "Partecipante aggiornato.", {"shareholder": shareholder_id})
+
+    def post_shareholder_document_upload(self, shareholder_id, form, files):
+        ctx = self.ctx_from_form(form)
+        if not user_can(ctx["user"], "manage_compagine") and not user_can(ctx["user"], "upload_document"):
+            self.redirect("/compagine", ctx, "Ruolo non abilitato.")
+            return
+        file_item = files.get("file")
+        if file_item is None or not getattr(file_item, "filename", ""):
+            self.redirect("/compagine", ctx, "File mancante.", {"shareholder": shareholder_id})
+            return
+        with connect() as conn:
+            shareholder = conn.execute(
+                "SELECT * FROM shareholders WHERE id = ? AND platform_id = ?",
+                (shareholder_id, ctx["platform_id"]),
+            ).fetchone()
+            if not shareholder:
+                self.redirect("/compagine", ctx, "Partecipante non trovato.")
+                return
+            doc_type = form.get("document_type") or "Documento societario"
+            title = (form.get("title") or file_item.filename).strip()
+            doc_id = save_uploaded_document(
+                conn,
+                file_item,
+                ctx["platform_id"],
+                None,
+                None,
+                "Partecipante qualificato",
+                doc_type,
+                title,
+                ctx["user_id"],
+            )
+            cur = conn.execute(
+                """
+                INSERT INTO shareholder_documents(
+                    platform_id, shareholder_id, document_type, title, notes,
+                    issued_at, expires_at, document_id, created_by, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    ctx["platform_id"],
+                    shareholder_id,
+                    doc_type,
+                    title,
+                    form.get("notes", "").strip(),
+                    form.get("issued_at", ""),
+                    form.get("expires_at", ""),
+                    doc_id,
+                    ctx["user_id"],
+                    now_iso(),
+                ),
+            )
+            log_audit(conn, ctx["platform_id"], ctx["user_id"], "shareholder_document", cur.lastrowid, "Caricamento documento partecipante", f"{shareholder['name']}: {title}")
+            conn.commit()
+        self.redirect("/compagine", ctx, "Documento partecipante caricato.", {"shareholder": shareholder_id})
+
+    def org_kind_for_area(self, area):
+        normalized = (area or "").lower()
+        if "governance" in normalized:
+            return "governance"
+        if "controllo" in normalized:
+            return "control"
+        if "outsourcing" in normalized:
+            return "outsourcing"
+        if "comitato tecnico" in normalized:
+            return "committee"
+        if "advisory" in normalized:
+            return "advisory"
+        if "operativa" in normalized:
+            return "operational"
+        return "function"
+
+    def post_org_function_save(self, form):
+        ctx = self.ctx_from_form(form)
+        if not user_can(ctx["user"], "manage_compagine"):
+            self.redirect("/compagine", ctx, "Ruolo non abilitato.")
+            return
+        area = (form.get("group_name") or form.get("new_function_group") or "Funzioni responsabili").strip()
+        function_name = (form.get("block_title") or form.get("new_function_title") or "").strip()
+        note = (form.get("block_note") or form.get("notes") or "").strip()
+        if not function_name:
+            self.redirect("/compagine", ctx, "Titolo funzione mancante.")
+            return
+        with connect() as conn:
+            existing = conn.execute(
+                """
+                SELECT id FROM org_functions
+                WHERE platform_id = ? AND function_name = ?
+                """,
+                (ctx["platform_id"], function_name),
+            ).fetchone()
+            if existing:
+                conn.execute(
+                    """
+                    UPDATE org_functions
+                    SET area = ?, kind = ?, note = ?, active = 1, updated_at = ?
+                    WHERE id = ?
+                    """,
+                    (area, self.org_kind_for_area(area), note, now_iso(), existing["id"]),
+                )
+                function_id = existing["id"]
+            else:
+                cur = conn.execute(
+                    """
+                    INSERT INTO org_functions(platform_id, area, function_name, kind, note, active, created_by, created_at, updated_at)
+                    VALUES (?, ?, ?, ?, ?, 1, ?, ?, ?)
+                    """,
+                    (ctx["platform_id"], area, function_name, self.org_kind_for_area(area), note, ctx["user_id"], now_iso(), now_iso()),
+                )
+                function_id = cur.lastrowid
+            log_audit(conn, ctx["platform_id"], ctx["user_id"], "org_function", function_id, "Salvataggio funzione organigramma", function_name)
+            conn.commit()
+        self.redirect("/compagine", ctx, "Funzione aggiunta all'organigramma.")
+
+    def post_org_assignment_save(self, form, files):
+        ctx = self.ctx_from_form(form)
+        if not user_can(ctx["user"], "manage_compagine"):
+            self.redirect("/compagine", ctx, "Ruolo non abilitato.")
+            return
+        function_name = (form.get("function_name") or "").strip()
+        area = (form.get("function_area") or "").strip()
+        if function_name == "__new__":
+            function_name = (form.get("new_function_title") or "").strip()
+            area = (form.get("new_function_group") or area or "Funzioni responsabili").strip()
+        if not function_name:
+            self.redirect("/compagine", ctx, "Seleziona o crea una funzione.")
+            return
+        if not area:
+            area = "Funzioni responsabili"
+
+        mode = form.get("assignment_mode") or "existing"
+        subject_name = (form.get("subject_name") or "").strip()
+        subject_type = (form.get("subject_type") or "").strip()
+        if not subject_name and mode == "existing":
+            subject_name = (form.get("existing_subject") or "").strip()
+            subject_type = (form.get("existing_subject_type") or subject_type or "Persona fisica").strip()
+        if not subject_name:
+            self.redirect("/compagine", ctx, "Seleziona o inserisci un soggetto.")
+            return
+        if not subject_type:
+            subject_type = "Persona fisica"
+
+        role = (form.get("role") or "").strip()
+        start_date = form.get("start_date", "")
+        end_date = form.get("end_date", "")
+        notes = (form.get("notes") or "").strip()
+        linked_document = form.get("linked_document") or ""
+        document_id = None
+        linked_document_title = "" if linked_document in {"", "__upload__"} else linked_document
+
+        with connect() as conn:
+            function_exists = conn.execute(
+                "SELECT id FROM org_functions WHERE platform_id = ? AND function_name = ?",
+                (ctx["platform_id"], function_name),
+            ).fetchone()
+            if not function_exists and (form.get("function_name") == "__new__" or form.get("new_function_title")):
+                conn.execute(
+                    """
+                    INSERT INTO org_functions(platform_id, area, function_name, kind, note, active, created_by, created_at, updated_at)
+                    VALUES (?, ?, ?, ?, ?, 1, ?, ?, ?)
+                    """,
+                    (ctx["platform_id"], area, function_name, self.org_kind_for_area(area), notes, ctx["user_id"], now_iso(), now_iso()),
+                )
+
+            file_item = files.get("new_document_file")
+            if linked_document == "__upload__" and file_item is not None and getattr(file_item, "filename", ""):
+                doc_type = form.get("new_document_type") or "Contratto"
+                linked_document_title = (form.get("new_document_title") or file_item.filename or f"{doc_type} - {subject_name}").strip()
+                document_id = save_uploaded_document(
+                    conn,
+                    file_item,
+                    ctx["platform_id"],
+                    None,
+                    None,
+                    "Compagine",
+                    doc_type,
+                    linked_document_title,
+                    ctx["user_id"],
+                )
+                conn.execute(
+                    """
+                    INSERT INTO person_documents(
+                        platform_id, person_name, role, document_type, counterparty, title, notes,
+                        signed_at, expires_at, document_id, created_by, created_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        ctx["platform_id"],
+                        subject_name,
+                        function_name,
+                        doc_type,
+                        "",
+                        linked_document_title,
+                        notes,
+                        start_date,
+                        end_date,
+                        document_id,
+                        ctx["user_id"],
+                        now_iso(),
+                    ),
+                )
+            elif linked_document_title:
+                doc = conn.execute(
+                    """
+                    SELECT id FROM documents
+                    WHERE platform_id = ? AND title = ?
+                    ORDER BY created_at DESC LIMIT 1
+                    """,
+                    (ctx["platform_id"], linked_document_title),
+                ).fetchone()
+                if doc:
+                    document_id = doc["id"]
+                else:
+                    contract = conn.execute(
+                        """
+                        SELECT document_id FROM supplier_contracts
+                        WHERE platform_id = ? AND title = ?
+                        ORDER BY created_at DESC LIMIT 1
+                        """,
+                        (ctx["platform_id"], linked_document_title),
+                    ).fetchone()
+                    if contract and contract["document_id"]:
+                        document_id = contract["document_id"]
+
+            existing = conn.execute(
+                """
+                SELECT id FROM org_assignments
+                WHERE platform_id = ? AND subject_name = ? AND function_name = ?
+                """,
+                (ctx["platform_id"], subject_name, function_name),
+            ).fetchone()
+            if existing:
+                assignment_id = existing["id"]
+                conn.execute(
+                    """
+                    UPDATE org_assignments
+                    SET subject_type = ?, area = ?, role = ?, start_date = ?, end_date = ?,
+                        linked_document_title = ?, document_id = ?, status = 'Attivo',
+                        notes = ?, updated_at = ?
+                    WHERE id = ?
+                    """,
+                    (
+                        subject_type,
+                        area,
+                        role,
+                        start_date,
+                        end_date,
+                        linked_document_title,
+                        document_id,
+                        notes,
+                        now_iso(),
+                        assignment_id,
+                    ),
+                )
+            else:
+                cur = conn.execute(
+                    """
+                    INSERT INTO org_assignments(
+                        platform_id, subject_name, subject_type, function_name, area, role,
+                        start_date, end_date, linked_document_title, document_id, status,
+                        notes, created_by, created_at, updated_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'Attivo', ?, ?, ?, ?)
+                    """,
+                    (
+                        ctx["platform_id"],
+                        subject_name,
+                        subject_type,
+                        function_name,
+                        area,
+                        role,
+                        start_date,
+                        end_date,
+                        linked_document_title,
+                        document_id,
+                        notes,
+                        ctx["user_id"],
+                        now_iso(),
+                        now_iso(),
+                    ),
+                )
+                assignment_id = cur.lastrowid
+            log_audit(conn, ctx["platform_id"], ctx["user_id"], "org_assignment", assignment_id, "Salvataggio assegnazione organigramma", f"{subject_name} - {function_name}")
+            conn.commit()
+
+        self.redirect("/compagine", ctx, "Collegamento funzione salvato.", {"person": subject_name, "role": function_name})
+
+    def post_org_assignment_delete(self, form):
+        ctx = self.ctx_from_form(form)
+        if not user_can(ctx["user"], "manage_compagine"):
+            self.redirect("/compagine", ctx, "Ruolo non abilitato.")
+            return
+        subject_name = (form.get("subject_name") or "").strip()
+        function_name = (form.get("function_name") or "").strip()
+        status = form.get("status") or "Rimosso"
+        if status not in {"Archiviato", "Rimosso"}:
+            status = "Rimosso"
+        if not subject_name or not function_name:
+            self.redirect("/compagine", ctx, "Collegamento non valido.")
+            return
+        with connect() as conn:
+            existing = conn.execute(
+                """
+                SELECT id FROM org_assignments
+                WHERE platform_id = ? AND subject_name = ? AND function_name = ?
+                """,
+                (ctx["platform_id"], subject_name, function_name),
+            ).fetchone()
+            if existing:
+                assignment_id = existing["id"]
+                conn.execute(
+                    """
+                    UPDATE org_assignments
+                    SET status = ?, updated_at = ?
+                    WHERE id = ?
+                    """,
+                    (status, now_iso(), assignment_id),
+                )
+            else:
+                cur = conn.execute(
+                    """
+                    INSERT INTO org_assignments(
+                        platform_id, subject_name, subject_type, function_name, area, status,
+                        created_by, created_at, updated_at
+                    ) VALUES (?, ?, 'Persona fisica', ?, '', ?, ?, ?, ?)
+                    """,
+                    (ctx["platform_id"], subject_name, function_name, status, ctx["user_id"], now_iso(), now_iso()),
+                )
+                assignment_id = cur.lastrowid
+            log_audit(conn, ctx["platform_id"], ctx["user_id"], "org_assignment", assignment_id, status, f"{subject_name} - {function_name}")
+            conn.commit()
+        self.redirect("/compagine", ctx, f"Funzione {status.lower()}.", {"person": subject_name, "role": function_name})
+
+    def post_board_meeting_create(self, form):
+        ctx = self.ctx_from_form(form)
+        if not user_can(ctx["user"], "manage_governance"):
+            self.redirect("/governance", ctx, "Ruolo non abilitato.")
+            return
+        title = (form.get("title") or "CdA - (data da definire)").strip()
+        meeting_date = form.get("meeting_date") or today_iso()
+        agenda = form.get("agenda", "")
+        meta = []
+        if form.get("meeting_time"):
+            meta.append(f"Ora: {form.get('meeting_time')}")
+        if form.get("meeting_mode"):
+            meta.append(f"Modalita: {form.get('meeting_mode')}")
+        if form.get("meeting_place"):
+            meta.append(f"Luogo: {form.get('meeting_place')}")
+        if meta:
+            agenda = (agenda + "\n\n" if agenda else "") + " / ".join(meta)
+        with connect() as conn:
+            cur = conn.execute(
+                """
+                INSERT INTO board_meetings(platform_id, title, meeting_date, meeting_link, agenda, status, created_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    ctx["platform_id"],
+                    title,
+                    meeting_date,
+                    form.get("meeting_link", ""),
+                    agenda,
+                    form.get("status", "Pianificata"),
+                    now_iso(),
+                ),
+            )
+            log_audit(conn, ctx["platform_id"], ctx["user_id"], "board_meeting", cur.lastrowid, "Creazione seduta CdA", title)
+            conn.commit()
+        target_tab = "sedute" if "seduta" in title.lower() or form.get("meeting_type") else "convocazioni"
+        params = {"platform": ctx["platform_id"], "user": ctx["user_id"], "tab": target_tab, "notice": "Elemento CdA creato."}
+        self.send_response(303)
+        self.send_header("Location", f"/governance?{urlencode(params)}")
+        self.end_headers()
+
+    def post_investor_create(self, form):
+        ctx = self.ctx_from_form(form)
+        if not user_can(ctx["user"], "manage_investors"):
+            self.redirect("/investors", ctx, "Ruolo non abilitato.")
+            return
+        with connect() as conn:
+            cur = conn.execute(
+                """
+                INSERT INTO investors(
+                    platform_id, name, email, phone, investor_type, total_invested, onboarding_status,
+                    entry_test_status, loss_simulation_status, threshold_status, reflection_status,
+                    crm_status, preferred_categories, risk_profile, preferred_ticket_min, preferred_ticket_max,
+                    preferred_channel, recurrence_status, source_system, external_investor_id, last_synced_at,
+                    crm_notes, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    ctx["platform_id"],
+                    form["name"].strip(),
+                    form["email"].strip(),
+                    form.get("phone", "").strip(),
+                    form.get("investor_type", "Non sofisticato"),
+                    float(form.get("total_invested") or 0),
+                    form.get("onboarding_status", "Da completare"),
+                    form.get("entry_test_status", "Da completare"),
+                    form.get("loss_simulation_status", "Da completare"),
+                    form.get("threshold_status", "Da verificare"),
+                    form.get("reflection_status", "Non applicabile"),
+                    form.get("crm_status", "Attivo"),
+                    form.get("preferred_categories", "").strip(),
+                    form.get("risk_profile", "Da profilare"),
+                    float(form.get("preferred_ticket_min") or 0),
+                    float(form.get("preferred_ticket_max") or 0),
+                    form.get("preferred_channel", "Email"),
+                    form.get("recurrence_status", "Da valutare"),
+                    form.get("source_system", "Manuale"),
+                    form.get("external_investor_id", "").strip(),
+                    now_iso() if form.get("source_system", "Manuale").startswith("adapter:") else "",
+                    form.get("crm_notes", "").strip(),
+                    now_iso(),
+                ),
+            )
+            log_audit(conn, ctx["platform_id"], ctx["user_id"], "investor", cur.lastrowid, "Creazione investitore", form["name"].strip())
+            conn.commit()
+        self.redirect("/investors", ctx, "Investitore creato.")
+
+    def post_investor_update(self, investor_id, form):
+        ctx = self.ctx_from_form(form)
+        if not user_can(ctx["user"], "manage_investors"):
+            self.redirect(f"/investors/{investor_id}", ctx, "Ruolo non abilitato.")
+            return
+        with connect() as conn:
+            investor = conn.execute(
+                "SELECT * FROM investors WHERE id = ? AND platform_id = ?",
+                (investor_id, ctx["platform_id"]),
+            ).fetchone()
+            if not investor:
+                self.redirect("/investors", ctx, "Investitore non trovato.")
+                return
+            source_system = form.get("source_system", "Manuale")
+            last_synced_at = investor["last_synced_at"]
+            if source_system != investor["source_system"] and source_system.startswith("adapter:"):
+                last_synced_at = now_iso()
+            conn.execute(
+                """
+                UPDATE investors
+                SET name = ?,
+                    email = ?,
+                    phone = ?,
+                    investor_type = ?,
+                    total_invested = ?,
+                    onboarding_status = ?,
+                    entry_test_status = ?,
+                    loss_simulation_status = ?,
+                    threshold_status = ?,
+                    reflection_status = ?,
+                    crm_status = ?,
+                    preferred_categories = ?,
+                    risk_profile = ?,
+                    preferred_ticket_min = ?,
+                    preferred_ticket_max = ?,
+                    preferred_channel = ?,
+                    recurrence_status = ?,
+                    source_system = ?,
+                    external_investor_id = ?,
+                    last_synced_at = ?,
+                    manual_override_notes = ?,
+                    crm_notes = ?
+                WHERE id = ? AND platform_id = ?
+                """,
+                (
+                    form["name"].strip(),
+                    form["email"].strip(),
+                    form.get("phone", "").strip(),
+                    form.get("investor_type", "Non sofisticato"),
+                    float(form.get("total_invested") or 0),
+                    form.get("onboarding_status", "Da completare"),
+                    form.get("entry_test_status", "Da completare"),
+                    form.get("loss_simulation_status", "Da completare"),
+                    form.get("threshold_status", "Da verificare"),
+                    form.get("reflection_status", "Non applicabile"),
+                    form.get("crm_status", "Attivo"),
+                    form.get("preferred_categories", "").strip(),
+                    form.get("risk_profile", "Da profilare"),
+                    float(form.get("preferred_ticket_min") or 0),
+                    float(form.get("preferred_ticket_max") or 0),
+                    form.get("preferred_channel", "Email"),
+                    form.get("recurrence_status", "Da valutare"),
+                    source_system,
+                    form.get("external_investor_id", "").strip(),
+                    last_synced_at,
+                    form.get("manual_override_notes", "").strip(),
+                    form.get("crm_notes", "").strip(),
+                    investor_id,
+                    ctx["platform_id"],
+                ),
+            )
+            log_audit(conn, ctx["platform_id"], ctx["user_id"], "investor", investor_id, "Aggiornamento investitore", form["name"].strip())
+            conn.commit()
+        self.redirect(f"/investors/{investor_id}", ctx, "Investitore aggiornato.")
+
+    def post_conflict_create(self, form):
+        ctx = self.ctx_from_form(form)
+        if not user_can(ctx["user"], "manage_registers"):
+            self.redirect("/conflicts", ctx, "Ruolo non abilitato.")
+            return
+        deal_id = int(form["deal_id"]) if form.get("deal_id") else None
+        with connect() as conn:
+            cur = conn.execute(
+                """
+                INSERT INTO conflicts(platform_id, subject, related_party, deal_id, description, mitigation, status, opened_at, closed_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    ctx["platform_id"],
+                    form["subject"].strip(),
+                    form.get("related_party", ""),
+                    deal_id,
+                    form.get("description", ""),
+                    form.get("mitigation", ""),
+                    form.get("status", "Aperto"),
+                    today_iso(),
+                    today_iso() if form.get("status") == "Chiuso" else "",
+                ),
+            )
+            log_audit(conn, ctx["platform_id"], ctx["user_id"], "conflict", cur.lastrowid, "Registrazione conflitto", form["subject"].strip())
+            conn.commit()
+        self.redirect("/conflicts", ctx, "Conflitto registrato.")
+
+    def post_complaint_create(self, form):
+        ctx = self.ctx_from_form(form)
+        if not user_can(ctx["user"], "manage_registers"):
+            self.redirect("/complaints", ctx, "Ruolo non abilitato.")
+            return
+        with connect() as conn:
+            cur = conn.execute(
+                """
+                INSERT INTO complaints(platform_id, received_at, complainant, channel, object, status, outcome, owner_user_id)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    ctx["platform_id"],
+                    form.get("received_at") or today_iso(),
+                    form["complainant"].strip(),
+                    form.get("channel", "Email"),
+                    form["object"].strip(),
+                    form.get("status", "Aperto"),
+                    form.get("outcome", ""),
+                    int(form.get("owner_user_id") or ctx["user_id"]),
+                ),
+            )
+            log_audit(conn, ctx["platform_id"], ctx["user_id"], "complaint", cur.lastrowid, "Registrazione reclamo", form["complainant"].strip())
+            conn.commit()
+        self.redirect("/complaints", ctx, "Reclamo registrato.")
+
+    def post_person_document_upload(self, form, files):
+        ctx = self.ctx_from_form(form)
+        if not user_can(ctx["user"], "manage_compagine") and not user_can(ctx["user"], "upload_document"):
+            self.redirect("/compagine", ctx, "Ruolo non abilitato.")
+            return
+        file_item = files.get("file")
+        person_name = (form.get("person_name") or "").strip()
+        role_name = form.get("role", "")
+        if not file_item or not person_name:
+            self.redirect("/compagine", ctx, "Persona o file mancante.")
+            return
+        doc_type = form.get("document_type") or "Accordo"
+        title = form.get("title") or f"{doc_type} - {person_name}"
+        with connect() as conn:
+            doc_id = save_uploaded_document(
+                conn,
+                file_item,
+                ctx["platform_id"],
+                None,
+                None,
+                "Compagine",
+                doc_type,
+                title,
+                ctx["user_id"],
+            )
+            cur = conn.execute(
+                """
+                INSERT INTO person_documents(
+                    platform_id, person_name, role, document_type, counterparty, title, notes,
+                    signed_at, expires_at, document_id, created_by, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    ctx["platform_id"],
+                    person_name,
+                    role_name,
+                    doc_type,
+                    form.get("counterparty", ""),
+                    title,
+                    form.get("notes", ""),
+                    form.get("signed_at", ""),
+                    form.get("expires_at", ""),
+                    doc_id,
+                    ctx["user_id"],
+                    now_iso(),
+                ),
+            )
+            log_audit(conn, ctx["platform_id"], ctx["user_id"], "person_document", cur.lastrowid, "Caricamento documento persona", f"{person_name}: {title}")
+            conn.commit()
+        params = {"platform": ctx["platform_id"], "user": ctx["user_id"], "person": person_name, "role": role_name, "notice": "Documento collegato alla persona."}
+        self.send_response(303)
+        self.send_header("Location", f"/compagine?{urlencode(params)}")
+        self.end_headers()
+
+    def post_supplier_contract_upload(self, form, files):
+        ctx = self.ctx_from_form(form)
+        if not user_can(ctx["user"], "manage_compagine") and not user_can(ctx["user"], "upload_document"):
+            self.redirect("/compagine", ctx, "Ruolo non abilitato.")
+            return
+        title = (form.get("title") or "").strip()
+        if not title:
+            self.redirect("/compagine", ctx, "Titolo contratto mancante.")
+            return
+        supplier_id = int(form["supplier_id"]) if form.get("supplier_id") else None
+        supplier_name = (form.get("supplier_name") or "").strip()
+        service_area = form.get("service_area", "")
+        doc_id = None
+        with connect() as conn:
+            if not supplier_id:
+                if not supplier_name:
+                    self.redirect("/compagine", ctx, "Seleziona o inserisci un fornitore.")
+                    return
+                cur = conn.execute(
+                    """
+                    INSERT INTO suppliers(platform_id, name, service_area, owner_role, status, notes, created_at)
+                    VALUES (?, ?, ?, ?, 'Attivo', '', ?)
+                    """,
+                    (ctx["platform_id"], supplier_name, service_area, ctx["user"]["role"], now_iso()),
+                )
+                supplier_id = cur.lastrowid
+            else:
+                supplier = conn.execute(
+                    "SELECT id FROM suppliers WHERE id = ? AND platform_id = ?",
+                    (supplier_id, ctx["platform_id"]),
+                ).fetchone()
+                if not supplier:
+                    self.redirect("/compagine", ctx, "Fornitore non valido per questa piattaforma.")
+                    return
+            if supplier_id and service_area:
+                conn.execute(
+                    "UPDATE suppliers SET service_area = COALESCE(NULLIF(service_area, ''), ?) WHERE id = ? AND platform_id = ?",
+                    (service_area, supplier_id, ctx["platform_id"]),
+                )
+            file_item = files.get("file")
+            if file_item:
+                doc_id = save_uploaded_document(
+                    conn,
+                    file_item,
+                    ctx["platform_id"],
+                    None,
+                    None,
+                    "Compagine",
+                    form.get("contract_type") or "Contratto fornitore",
+                    title,
+                    ctx["user_id"],
+                )
+            cur = conn.execute(
+                """
+                INSERT INTO supplier_contracts(
+                    platform_id, supplier_id, contract_type, title, counterparty, value,
+                    start_date, end_date, renewal_notice, status, document_id, created_by, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    ctx["platform_id"],
+                    supplier_id,
+                    form.get("contract_type") or "Contratto fornitore",
+                    title,
+                    form.get("counterparty", ""),
+                    float(form.get("value") or 0),
+                    form.get("start_date", ""),
+                    form.get("end_date", ""),
+                    form.get("renewal_notice", ""),
+                    form.get("status", "Attivo"),
+                    doc_id,
+                    ctx["user_id"],
+                    now_iso(),
+                ),
+            )
+            log_audit(conn, ctx["platform_id"], ctx["user_id"], "supplier_contract", cur.lastrowid, "Registrazione contratto fornitore", title)
+            conn.commit()
+        self.redirect("/compagine", ctx, "Contratto fornitore registrato.")
+
+    def post_finance_cost_save(self, form):
+        ctx = self.ctx_from_form(form)
+        if not user_can(ctx["user"], "manage_finance"):
+            self.redirect("/finance", ctx, "Ruolo non abilitato.")
+            return
+        try:
+            cost_id = int(form.get("cost_id") or 0)
+        except ValueError:
+            cost_id = 0
+        title = (form.get("title") or "").strip()
+        if not title:
+            self.redirect("/finance", ctx, "Titolo costo mancante.")
+            return
+        try:
+            amount = float(form.get("amount") or 0)
+        except ValueError:
+            amount = 0
+        periodicity = form.get("periodicity") or "Annuale"
+        if periodicity not in {"Mensile", "Trimestrale", "Semestrale", "Annuale", "Una tantum"}:
+            periodicity = "Annuale"
+        status = form.get("status") or "Attivo"
+        if status not in {"Attivo", "Da pagare", "Pagato", "Stimato", "Archiviato"}:
+            status = "Attivo"
+        with connect() as conn:
+            existing = conn.execute(
+                "SELECT id FROM finance_costs WHERE id = ? AND platform_id = ?",
+                (cost_id, ctx["platform_id"]),
+            ).fetchone() if cost_id else None
+            if existing:
+                conn.execute(
+                    """
+                    UPDATE finance_costs
+                    SET title = ?, category = ?, amount = ?, periodicity = ?, due_date = ?,
+                        status = ?, notes = ?, updated_at = ?
+                    WHERE id = ? AND platform_id = ?
+                    """,
+                    (
+                        title,
+                        form.get("category") or "Altro costo",
+                        amount,
+                        periodicity,
+                        form.get("due_date", ""),
+                        status,
+                        (form.get("notes") or "").strip(),
+                        now_iso(),
+                        cost_id,
+                        ctx["platform_id"],
+                    ),
+                )
+                finance_cost_id = cost_id
+                action = "Aggiornamento costo finance"
+                notice = "Costo aggiornato."
+            else:
+                cur = conn.execute(
+                    """
+                    INSERT INTO finance_costs(
+                        platform_id, title, category, amount, periodicity, due_date,
+                        status, source, notes, created_by, created_at, updated_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, 'Manuale', ?, ?, ?, ?)
+                    """,
+                    (
+                        ctx["platform_id"],
+                        title,
+                        form.get("category") or "Altro costo",
+                        amount,
+                        periodicity,
+                        form.get("due_date", ""),
+                        status,
+                        (form.get("notes") or "").strip(),
+                        ctx["user_id"],
+                        now_iso(),
+                        now_iso(),
+                    ),
+                )
+                finance_cost_id = cur.lastrowid
+                action = "Nuovo costo finance"
+                notice = "Costo aggiunto al quadro finance."
+            log_audit(conn, ctx["platform_id"], ctx["user_id"], "finance_cost", finance_cost_id, action, title)
+            conn.commit()
+        self.redirect("/finance", ctx, notice)
+
+    def post_finance_contract_update(self, form):
+        ctx = self.ctx_from_form(form)
+        if not user_can(ctx["user"], "manage_finance"):
+            self.redirect("/finance", ctx, "Ruolo non abilitato.")
+            return
+        try:
+            contract_id = int(form.get("contract_id") or 0)
+        except ValueError:
+            contract_id = 0
+        title = (form.get("title") or "").strip()
+        if not contract_id or not title:
+            self.redirect("/finance", ctx, "Contratto non valido.")
+            return
+        try:
+            value = float(form.get("value") or 0)
+        except ValueError:
+            value = 0
+        status = form.get("status") or "Attivo"
+        if status not in {"Attivo", "In rinnovo", "Da firmare", "Scaduto", "Chiuso", "Archiviato"}:
+            status = "Attivo"
+        with connect() as conn:
+            contract = conn.execute(
+                """
+                SELECT sc.*, s.name AS supplier_name
+                FROM supplier_contracts sc
+                JOIN suppliers s ON s.id = sc.supplier_id
+                WHERE sc.id = ? AND sc.platform_id = ?
+                """,
+                (contract_id, ctx["platform_id"]),
+            ).fetchone()
+            if not contract:
+                self.redirect("/finance", ctx, "Contratto non trovato.")
+                return
+            conn.execute(
+                """
+                UPDATE supplier_contracts
+                SET title = ?, contract_type = ?, value = ?, start_date = ?, end_date = ?,
+                    renewal_notice = ?, status = ?
+                WHERE id = ? AND platform_id = ?
+                """,
+                (
+                    title,
+                    form.get("contract_type") or "Contratto fornitore",
+                    value,
+                    form.get("start_date", ""),
+                    form.get("end_date", ""),
+                    (form.get("renewal_notice") or "").strip(),
+                    status,
+                    contract_id,
+                    ctx["platform_id"],
+                ),
+            )
+            service_area = (form.get("service_area") or "").strip()
+            if service_area:
+                conn.execute(
+                    "UPDATE suppliers SET service_area = ? WHERE id = ? AND platform_id = ?",
+                    (service_area, contract["supplier_id"], ctx["platform_id"]),
+                )
+            log_audit(conn, ctx["platform_id"], ctx["user_id"], "supplier_contract", contract_id, "Aggiornamento costo contratto", title)
+            conn.commit()
+        self.redirect("/finance", ctx, "Costo da contratto aggiornato.")
+
+    def post_finance_contract_to_manual(self, form):
+        ctx = self.ctx_from_form(form)
+        if not user_can(ctx["user"], "manage_finance"):
+            self.redirect("/finance", ctx, "Ruolo non abilitato.")
+            return
+        try:
+            contract_id = int(form.get("contract_id") or 0)
+        except ValueError:
+            contract_id = 0
+        with connect() as conn:
+            contract = conn.execute(
+                """
+                SELECT sc.*, s.name AS supplier_name, s.service_area
+                FROM supplier_contracts sc
+                JOIN suppliers s ON s.id = sc.supplier_id
+                WHERE sc.id = ? AND sc.platform_id = ?
+                """,
+                (contract_id, ctx["platform_id"]),
+            ).fetchone()
+            if not contract:
+                self.redirect("/finance", ctx, "Contratto non trovato.")
+                return
+            existing = conn.execute(
+                """
+                SELECT id FROM finance_costs
+                WHERE platform_id = ? AND linked_contract_id = ?
+                """,
+                (ctx["platform_id"], contract_id),
+            ).fetchone()
+            if existing:
+                self.redirect("/finance", ctx, "Costo manuale gia' presente.", {"mode": "cost", "cost_id": existing["id"]})
+                return
+            cur = conn.execute(
+                """
+                INSERT INTO finance_costs(
+                    platform_id, title, category, amount, periodicity, due_date,
+                    status, source, notes, linked_contract_id, created_by, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, 'Annuale', ?, ?, 'Manuale da contratto', ?, ?, ?, ?, ?)
+                """,
+                (
+                    ctx["platform_id"],
+                    contract["title"],
+                    contract["service_area"] or contract["contract_type"] or "Fornitore",
+                    float(contract["value"] or 0),
+                    contract["end_date"],
+                    contract["status"],
+                    f"Origine contratto: {contract['supplier_name']} - {contract['contract_type']}",
+                    contract_id,
+                    ctx["user_id"],
+                    now_iso(),
+                    now_iso(),
+                ),
+            )
+            log_audit(conn, ctx["platform_id"], ctx["user_id"], "finance_cost", cur.lastrowid, "Costo manuale da contratto", contract["title"])
+            conn.commit()
+            cost_id = cur.lastrowid
+        self.redirect("/finance", ctx, "Costo copiato tra le voci manuali.", {"mode": "cost", "cost_id": cost_id})
+
+    def post_campaign_update(self, form):
+        ctx = self.ctx_from_form(form)
+        if not user_can(ctx["user"], "manage_finance"):
+            self.redirect("/finance", ctx, "Ruolo non abilitato.")
+            return
+        try:
+            update_id = int(form.get("update_id") or 0)
+        except ValueError:
+            update_id = 0
+        try:
+            deal_id = int(form.get("deal_id") or 0)
+        except ValueError:
+            deal_id = 0
+        try:
+            funding_target = float(form.get("funding_target") or 0)
+        except ValueError:
+            funding_target = 0
+        try:
+            platform_fee_percent = float(form.get("platform_fee_percent") or 5)
+        except ValueError:
+            platform_fee_percent = 5
+        raised_raw = (form.get("raised_amount") or "").strip()
+        try:
+            raised_amount = float(raised_raw) if raised_raw else 0
+        except ValueError:
+            raised_amount = 0
+        try:
+            investors_count = int(form.get("investors_count") or 0)
+        except ValueError:
+            investors_count = 0
+        status = form.get("status") or "Rilevazione"
+        if status not in {"Rilevazione", "In crescita", "Sotto target", "Target raggiunto", "Chiusa"}:
+            status = "Rilevazione"
+        as_of_date = form.get("as_of_date") or today_iso()
+        with connect() as conn:
+            deal = conn.execute(
+                "SELECT id, title FROM deals WHERE id = ? AND platform_id = ?",
+                (deal_id, ctx["platform_id"]),
+            ).fetchone()
+            if not deal:
+                self.redirect("/finance", ctx, "Campagna non valida.")
+                return
+            if funding_target >= 0:
+                conn.execute(
+                    "UPDATE deals SET funding_target = ?, platform_fee_percent = ?, updated_at = ? WHERE id = ? AND platform_id = ?",
+                    (funding_target, platform_fee_percent, today_iso(), deal_id, ctx["platform_id"]),
+                )
+            existing = conn.execute(
+                "SELECT id FROM campaign_updates WHERE id = ? AND platform_id = ?",
+                (update_id, ctx["platform_id"]),
+            ).fetchone() if update_id else None
+            if existing:
+                conn.execute(
+                    """
+                    UPDATE campaign_updates
+                    SET deal_id = ?, as_of_date = ?, raised_amount = ?, investors_count = ?,
+                        status = ?, notes = ?
+                    WHERE id = ? AND platform_id = ?
+                    """,
+                    (
+                        deal_id,
+                        as_of_date,
+                        raised_amount,
+                        investors_count,
+                        status,
+                        (form.get("notes") or "").strip(),
+                        update_id,
+                        ctx["platform_id"],
+                    ),
+                )
+                campaign_update_id = update_id
+                action = "Aggiornamento rilevazione campagna"
+                notice = "Andamento campagna aggiornato."
+            else:
+                cur = conn.execute(
+                    """
+                    INSERT INTO campaign_updates(
+                        platform_id, deal_id, as_of_date, raised_amount, investors_count,
+                        status, source, notes, created_by, created_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, 'Manuale', ?, ?, ?)
+                    """,
+                    (
+                        ctx["platform_id"],
+                        deal_id,
+                        as_of_date,
+                        raised_amount,
+                        investors_count,
+                        status,
+                        (form.get("notes") or "").strip(),
+                        ctx["user_id"],
+                        now_iso(),
+                    ),
+                )
+                campaign_update_id = cur.lastrowid
+                action = "Rilevazione andamento campagna"
+                notice = "Andamento campagna registrato."
+            log_audit(conn, ctx["platform_id"], ctx["user_id"], "campaign_update", campaign_update_id, action, deal["title"])
+            conn.commit()
+        self.redirect("/finance", ctx, notice)
+
+    def post_communication_generate(self, form):
+        ctx = self.ctx_from_form(form)
+        workflow_id = form.get("workflow_id") or COMMUNICATION_WORKFLOWS[0]["id"]
+        item = next((w for w in COMMUNICATION_WORKFLOWS if w["id"] == workflow_id), COMMUNICATION_WORKFLOWS[0])
+        field_rows = []
+        for index, field in enumerate(item["fields"]):
+            field_rows.append((field[0], form.get(f"field_{index}", "")))
+        payload = {
+            "workflow_id": item["id"],
+            "source_output_id": form.get("source_output_id", ""),
+            "fields": [{"label": label, "value": value} for label, value in field_rows],
+            "reviewer": form.get("reviewer", ctx["user"]["name"]),
+            "manual_notes": form.get("manual_notes", ""),
+            "generated_at": now_iso(),
+        }
+        missing_cell = '<span class="missing">Da completare</span>'
+        field_html = "".join(
+            f"<tr><th>{esc(label)}</th><td>{esc(value) if value else missing_cell}</td></tr>"
+            for label, value in field_rows
+        )
+        required_docs = "".join(f"<li>{esc(doc)}</li>" for doc in item["required_docs"])
+        prefill = "".join(f"<li>{esc(src)}</li>" for src in item["prefill"])
+        content = f"""<!doctype html>
+<html lang="it">
+<head><meta charset="utf-8"><title>{esc(item['title'])}</title>
+<style>
+body{{font-family: Georgia, 'Times New Roman', serif; margin:42px; color:#1f2528;}}
+h1{{font-size:24px; margin-bottom:4px;}} h2{{font-size:16px; margin-top:28px;}}
+.meta{{color:#666; font-family: Arial, sans-serif; font-size:12px;}}
+table{{border-collapse:collapse; width:100%; margin-top:12px;}}
+th,td{{border:1px solid #d8d1c7; padding:9px; text-align:left; vertical-align:top;}}
+th{{width:32%; background:#f7f4ef;}}
+.missing{{color:#a33; font-style:italic;}}
+li{{margin:5px 0;}}
+</style></head>
+<body>
+<p class="meta">Bozza generata dalla compliance suite - {esc(now_iso())}</p>
+<h1>{esc(item['title'])}</h1>
+<p><strong>Autorita:</strong> {esc(item['authority'])}<br>
+<strong>Canale:</strong> {esc(item['channel'])}<br>
+<strong>Scadenza:</strong> {esc(item['deadline'])}<br>
+<strong>Riferimento:</strong> {esc(item['reference'])}<br>
+<strong>Output atteso:</strong> {esc(item['output'])}</p>
+<h2>Campi compilati</h2>
+<table>{field_html}</table>
+<h2>Precompilazione suggerita</h2>
+<ul>{prefill}</ul>
+<h2>Allegati richiesti</h2>
+<ul>{required_docs}</ul>
+<h2>Note operative</h2>
+<p>{esc(form.get('manual_notes', '')) or 'Nessuna nota.'}</p>
+<p class="meta">Fonte normativa/template: {esc(item['source'])}</p>
+<p class="meta">Responsabile validazione: {esc(form.get('reviewer', ctx['user']['name']))}</p>
+</body></html>"""
+        with connect() as conn:
+            doc_id = generated_document(
+                conn,
+                ctx["platform_id"],
+                None,
+                None,
+                "Comunicazioni",
+                "Comunicazione autorita",
+                f"Bozza - {item['title']}",
+                f"{item['id']}.html",
+                content,
+                ctx["user_id"],
+            )
+            log_audit(conn, ctx["platform_id"], ctx["user_id"], "communication", doc_id, "Generazione bozza comunicazione", item["title"])
+            cur = conn.execute(
+                """
+                INSERT INTO communication_outputs(platform_id, workflow_id, period, status, document_id, reviewer, notes, payload_json, created_by, created_at, updated_at)
+                VALUES (?, ?, ?, 'Bozza generata', ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    ctx["platform_id"],
+                    item["id"],
+                    field_rows[0][1] if field_rows else item["reference"],
+                    doc_id,
+                    form.get("reviewer", ctx["user"]["name"]),
+                    form.get("manual_notes", ""),
+                    json.dumps(payload, ensure_ascii=True),
+                    ctx["user_id"],
+                    now_iso(),
+                    now_iso(),
+                ),
+            )
+            output_id = cur.lastrowid
+            conn.commit()
+        self.redirect("/communications", ctx, "Bozza comunicazione generata e censita nel flusso.", {"tab": "generatore", "comm": item["id"], "output": output_id})
+
+    def post_communication_output_status(self, form):
+        ctx = self.ctx_from_form(form)
+        output_id = int(form.get("output_id", 0) or 0)
+        workflow_id = form.get("workflow_id") or COMMUNICATION_WORKFLOWS[0]["id"]
+        allowed = {"Bozza generata", "Validata - da inviare", "Inviata", "Approvata", "Respinta"}
+        status = form.get("status") or "Bozza generata"
+        if status not in allowed:
+            status = "Bozza generata"
+        with connect() as conn:
+            output = row("SELECT * FROM communication_outputs WHERE id = ? AND platform_id = ?", (output_id, ctx["platform_id"]))
+            if output:
+                conn.execute(
+                    "UPDATE communication_outputs SET status = ?, updated_at = ? WHERE id = ?",
+                    (status, now_iso(), output_id),
+                )
+                log_audit(conn, ctx["platform_id"], ctx["user_id"], "communication", output_id, f"Stato output: {status}", workflow_id)
+                conn.commit()
+        self.redirect("/communications", ctx, "Stato comunicazione aggiornato.", {"tab": "generatore", "comm": workflow_id})
+
+    def post_communication_output_delete(self, form):
+        ctx = self.ctx_from_form(form)
+        output_id = int(form.get("output_id", 0) or 0)
+        workflow_id = form.get("workflow_id") or COMMUNICATION_WORKFLOWS[0]["id"]
+        with connect() as conn:
+            output = row(
+                """
+                SELECT co.*, doc.storage_path
+                FROM communication_outputs co
+                LEFT JOIN documents doc ON doc.id = co.document_id
+                WHERE co.id = ? AND co.platform_id = ?
+                """,
+                (output_id, ctx["platform_id"]),
+            )
+            if output:
+                if output["document_id"]:
+                    conn.execute("DELETE FROM documents WHERE id = ? AND platform_id = ?", (output["document_id"], ctx["platform_id"]))
+                    if output["storage_path"]:
+                        file_path = (BASE_DIR / output["storage_path"]).resolve()
+                        if str(file_path).startswith(str(BASE_DIR.resolve())) and file_path.exists():
+                            file_path.unlink()
+                conn.execute("DELETE FROM communication_outputs WHERE id = ?", (output_id,))
+                log_audit(conn, ctx["platform_id"], ctx["user_id"], "communication", output_id, "Rimozione output comunicazione", workflow_id)
+                conn.commit()
+        self.redirect("/communications", ctx, "Output comunicazione rimosso.", {"tab": "generatore", "comm": workflow_id})
+
+    def post_document_upload(self, form, files):
+        ctx = self.ctx_from_form(form)
+        if not user_can(ctx["user"], "upload_document"):
+            self.redirect("/documents", ctx, "Ruolo non abilitato.")
+            return
+        file_item = files.get("file")
+        if file_item is None or not getattr(file_item, "filename", ""):
+            self.redirect("/documents", ctx, "File mancante.")
+            return
+        deal_id = int(form["deal_id"]) if form.get("deal_id") else None
+        proponent_id = int(form["proponent_id"]) if form.get("proponent_id") else None
+        if deal_id and not proponent_id:
+            d = fetch_deal(deal_id)
+            proponent_id = d["proponent_id"] if d else None
+        entity_kind = form.get("entity_kind") or ""
+        category = form.get("category") or "Documentazione"
+        title = form.get("title") or file_item.filename
+        origin = form.get("origin") or "Archivio"
+        if entity_kind == "person":
+            origin = "Persona"
+        elif entity_kind == "supplier":
+            origin = "Fornitore"
+        elif entity_kind == "deal":
+            origin = "Deal"
+        elif entity_kind == "proponent":
+            origin = "Proponente"
+        with connect() as conn:
+            doc_id = save_uploaded_document(
+                conn,
+                file_item,
+                ctx["platform_id"],
+                deal_id,
+                proponent_id,
+                origin,
+                category,
+                title,
+                ctx["user_id"],
+            )
+            if entity_kind == "person":
+                person_ref = form.get("person_ref") or ""
+                person_name = (form.get("person_name") or "").strip()
+                person_role = (form.get("person_role") or "").strip()
+                if person_ref:
+                    parts = person_ref.split("||", 1)
+                    person_name = parts[0].strip()
+                    if len(parts) > 1 and not person_role:
+                        person_role = parts[1].strip()
+                if person_name:
+                    conn.execute(
+                        """
+                        INSERT INTO person_documents(
+                            platform_id, person_name, role, document_type, counterparty, title, notes,
+                            signed_at, expires_at, document_id, created_by, created_at
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        """,
+                        (
+                            ctx["platform_id"],
+                            person_name,
+                            person_role,
+                            category,
+                            form.get("counterparty", ""),
+                            title,
+                            form.get("notes", ""),
+                            "",
+                            form.get("expires_at", ""),
+                            doc_id,
+                            ctx["user_id"],
+                            now_iso(),
+                        ),
+                    )
+            elif entity_kind == "supplier":
+                supplier_id = int(form["supplier_id"]) if form.get("supplier_id") else None
+                supplier_name = (form.get("supplier_name") or "").strip()
+                service_area = form.get("service_area", "")
+                if not supplier_id and supplier_name:
+                    cur = conn.execute(
+                        """
+                        INSERT INTO suppliers(platform_id, name, service_area, owner_role, status, notes, created_at)
+                        VALUES (?, ?, ?, ?, 'Attivo', '', ?)
+                        """,
+                        (ctx["platform_id"], supplier_name, service_area, ctx["user"]["role"], now_iso()),
+                    )
+                    supplier_id = cur.lastrowid
+                if supplier_id:
+                    if service_area:
+                        conn.execute(
+                            "UPDATE suppliers SET service_area = COALESCE(NULLIF(service_area, ''), ?) WHERE id = ? AND platform_id = ?",
+                            (service_area, supplier_id, ctx["platform_id"]),
+                        )
+                    conn.execute(
+                        """
+                        INSERT INTO supplier_contracts(
+                            platform_id, supplier_id, contract_type, title, counterparty, value,
+                            start_date, end_date, renewal_notice, status, document_id, created_by, created_at
+                        ) VALUES (?, ?, ?, ?, ?, 0, '', ?, ?, 'Da classificare', ?, ?, ?)
+                        """,
+                        (
+                            ctx["platform_id"],
+                            supplier_id,
+                            category,
+                            title,
+                            form.get("counterparty", ""),
+                            form.get("expires_at", ""),
+                            form.get("notes", ""),
+                            doc_id,
+                            ctx["user_id"],
+                            now_iso(),
+                        ),
+                    )
+            log_audit(conn, ctx["platform_id"], ctx["user_id"], "document", doc_id, "Caricamento documento", title)
+            conn.commit()
+        if entity_kind == "proponent" and proponent_id:
+            self.redirect(f"/proponents/{proponent_id}", ctx, "Documento caricato.")
+        elif entity_kind == "deal" and deal_id:
+            self.redirect(f"/deals/{deal_id}", ctx, "Documento caricato.")
+        elif entity_kind in {"person", "supplier"}:
+            self.redirect("/compagine", ctx, "Documento caricato.")
+        else:
+            self.redirect("/documents", ctx, "Documento caricato.")
+
+    def download_document(self, document_id):
+        doc = row("SELECT * FROM documents WHERE id = ?", (document_id,))
+        if not doc:
+            self.not_found()
+            return
+        file_path = (BASE_DIR / doc["storage_path"]).resolve()
+        if not str(file_path).startswith(str(BASE_DIR.resolve())) or not file_path.exists():
+            self.not_found()
+            return
+        data = file_path.read_bytes()
+        self.send_response(200)
+        self.send_header("Content-Type", mimetypes.guess_type(doc["filename"])[0] or "application/octet-stream")
+        self.send_header("Content-Disposition", f'inline; filename="{sanitize_filename(doc["filename"])}"')
+        self.send_header("Content-Length", str(len(data)))
+        self.end_headers()
+        self.wfile.write(data)
+
+    def download_official_template(self, path):
+        filename = sanitize_filename(path.removeprefix("/official-templates/"))
+        allowed = {item["filename"] for item in OFFICIAL_TEMPLATES}
+        if filename not in allowed:
+            self.not_found()
+            return
+        file_path = (TEMPLATE_DIR / filename).resolve()
+        if not str(file_path).startswith(str(TEMPLATE_DIR.resolve())) or not file_path.exists():
+            self.not_found()
+            return
+        data = file_path.read_bytes()
+        self.send_response(200)
+        self.send_header("Content-Type", mimetypes.guess_type(filename)[0] or "application/octet-stream")
+        self.send_header("Content-Disposition", f'inline; filename="{filename}"')
+        self.send_header("Content-Length", str(len(data)))
+        self.end_headers()
+        self.wfile.write(data)
+
+    def not_found(self):
+        self.send_html("<h1>404</h1><p>Pagina non trovata.</p>", status=404)
+
+    def error_page(self, exc):
+        self.send_html(f"<h1>Errore</h1><pre>{esc(type(exc).__name__)}: {esc(exc)}</pre>", status=500)
+
+    def log_message(self, fmt, *args):
+        sys.stderr.write("[%s] %s\n" % (self.log_date_time_string(), fmt % args))
+
+
+def main():
+    init_db()
+    port = int(sys.argv[1]) if len(sys.argv) > 1 else 8772
+    server = ThreadingHTTPServer(("127.0.0.1", port), App)
+    print(f"ECSP Suite running at http://127.0.0.1:{port}")
+    try:
+        server.serve_forever()
+    except KeyboardInterrupt:
+        pass
+    finally:
+        server.server_close()
+
+
+if __name__ == "__main__":
+    main()
