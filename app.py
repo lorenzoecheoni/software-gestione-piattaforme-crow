@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 import cgi
 import html
+import io
 import json
 import mimetypes
 import re
@@ -8,6 +9,7 @@ import shutil
 import sqlite3
 import sys
 import uuid
+import zipfile
 from datetime import date, datetime, timedelta
 from pathlib import Path
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -29,6 +31,7 @@ ROLE_LABELS = {
     "covi_opinion": "Advisory Committee",
     "board": "CdA",
     "operator": "Operatore",
+    "admin": "Amministratore",
 }
 
 PHASES = [
@@ -50,6 +53,192 @@ PHASES = [
 
 PHASE_LABELS = dict(PHASES)
 PHASE_INDEX = {key: idx for idx, (key, _) in enumerate(PHASES)}
+
+# --- Istruttoria Pariter: macchina a stati delle pratiche (spec sez. 4) ---
+PRACTICE_STATUSES = [
+    ("dossier_ricevuto", "Dossier ricevuto"),
+    ("verifica_documentale", "Verifica documentale in corso"),
+    ("da_integrare", "Da integrare"),
+    ("fase1_validata", "Fase 1 validata"),
+    ("fase2_completata", "Fase 2 completata dal proponente"),
+    ("bozza_kiis_ricevuta", "Bozza KIIS ricevuta"),
+    ("verifiche_interne", "Verifiche interne Pariter in corso"),
+    ("pronto_cvoi", "Pronto per CVOI"),
+    ("cvoi_generato", "Report CVOI generato"),
+    ("attesa_cda1", "In attesa prima delibera CdA"),
+    ("cda1_positiva", "Prima delibera CdA positiva"),
+    ("cda1_positiva_condizioni", "Prima delibera CdA positiva con condizioni"),
+    ("cda1_negativa", "Prima delibera CdA negativa"),
+    ("in_advisory", "In Advisory Committee"),
+    ("advisory_ricevuto", "Parere Advisory Committee ricevuto"),
+    ("attesa_cda2", "In attesa seconda delibera CdA"),
+    ("cda2_positiva", "Seconda delibera CdA positiva"),
+    ("cda2_positiva_condizioni", "Seconda delibera CdA positiva con condizioni"),
+    ("cda2_negativa", "Seconda delibera CdA negativa"),
+    ("in_pre_golive", "In pre go-live"),
+    ("pronta_verifica_finale", "Pronta per verifica finale"),
+    ("pronta_golive", "Pronta per go-live"),
+    ("pubblicata", "Pubblicata"),
+    ("respinta", "Respinta"),
+    ("archiviata", "Archiviata"),
+]
+PRACTICE_STATUS_LABELS = dict(PRACTICE_STATUSES)
+PRACTICE_STATUS_INDEX = {key: idx for idx, (key, _) in enumerate(PRACTICE_STATUSES)}
+
+# Transizioni ammesse. Regola cardine: Advisory Committee tra prima e seconda
+# delibera CdA; nessun salto di fase. Gli esiti negativi confluiscono in "respinta".
+PRACTICE_FLOW = {
+    "dossier_ricevuto": {"verifica_documentale", "respinta"},
+    "verifica_documentale": {"da_integrare", "fase1_validata", "respinta"},
+    "da_integrare": {"verifica_documentale", "fase1_validata", "respinta"},
+    "fase1_validata": {"fase2_completata", "respinta"},
+    "fase2_completata": {"bozza_kiis_ricevuta", "respinta"},
+    "bozza_kiis_ricevuta": {"verifiche_interne", "respinta"},
+    "verifiche_interne": {"pronto_cvoi", "da_integrare", "respinta"},
+    "pronto_cvoi": {"cvoi_generato", "respinta"},
+    "cvoi_generato": {"attesa_cda1", "respinta"},
+    "attesa_cda1": {"cda1_positiva", "cda1_positiva_condizioni", "cda1_negativa"},
+    "cda1_positiva": {"in_advisory"},
+    "cda1_positiva_condizioni": {"in_advisory"},
+    "cda1_negativa": {"respinta"},
+    "in_advisory": {"advisory_ricevuto"},
+    "advisory_ricevuto": {"attesa_cda2"},
+    "attesa_cda2": {"cda2_positiva", "cda2_positiva_condizioni", "cda2_negativa"},
+    "cda2_positiva": {"in_pre_golive"},
+    "cda2_positiva_condizioni": {"in_pre_golive"},
+    "cda2_negativa": {"respinta"},
+    "in_pre_golive": {"pronta_verifica_finale", "da_integrare"},
+    "pronta_verifica_finale": {"pronta_golive", "in_pre_golive"},
+    "pronta_golive": {"pubblicata"},
+    "pubblicata": {"archiviata"},
+    "respinta": {"archiviata"},
+}
+
+# Bucket per il Deal-hub Pariter (vista istruttoria / in corso / conclusi).
+PRACTICE_BUCKET_CONCLUSI = {"respinta", "archiviata"}
+PRACTICE_BUCKET_IN_CORSO = {"pubblicata"}
+
+
+def practice_bucket(status):
+    if status in PRACTICE_BUCKET_CONCLUSI:
+        return "conclusi"
+    if status in PRACTICE_BUCKET_IN_CORSO:
+        return "in_corso"
+    return "istruttoria"
+
+
+# Aree di scoring CVOI (spec sez. 9): chiave, etichetta, peso, max, soglia minima.
+CVOI_AREAS = [
+    ("area1", "Completezza documentazione e valutazione management", 0.35, 30, 18),
+    ("area2", "Strategia, prodotto/servizio e mercato", 0.35, 35, 21),
+    ("area3", "Business Model & Financial Plan", 0.30, 30, 18),
+]
+CVOI_OVERALL_THRESHOLD = round(sum(thr * w for _, _, w, _, thr in CVOI_AREAS), 2)  # 19.05
+
+# Criteri di valutazione per area, dal template reale "Report valutazione del progetto".
+# Ogni criterio vale max 5 punti: area1=6 (30), area2=7 (35), area3=6 (30), totale 95.
+CVOI_CRITERIA = {
+    "area1": [
+        "Il soggetto proponente conosce il mercato oggetto della proposta ed ha maturato esperienza nello stesso",
+        "Il soggetto proponente ha gia' maturato esperienze simili significative di successo",
+        "Il livello di scolarizzazione e' elevato",
+        "Il soggetto proponente e' composto da un team iniziale sufficientemente completo",
+        "Esiste una strategia per integrare le figure chiave mancanti (assunzioni, sub-contracting, partnership)",
+        "Compagine societaria e ripartizione quote congrue rispetto all'operazione da realizzare",
+    ],
+    "area2": [
+        "La proposta illustra la domanda ed il mercato (disponibile a pagare) per il prodotto/servizio",
+        "Sono in essere accordi commerciali remunerativi per l'azienda",
+        "Dati e analisi di mercato evidenziano opportunita' di crescita, competizione e redditivita'",
+        "Tecnologia differenziale con vantaggio competitivo difendibile nel medio-lungo periodo",
+        "La strategia di commercializzazione appare appropriata",
+        "Analisi liberta' di operare/anteriorita' (IP) e strategia di protezione, se applicabile",
+        "Buona comprensione dei rischi e delle opportunita' tecniche e commerciali",
+    ],
+    "area3": [
+        "Il modello prevede la vendita di un prodotto/servizio che porta sostanziali benefici agli acquirenti",
+        "Il bene o servizio genera margini difendibili nel medio-lungo termine",
+        "Serve un mercato ampio e raggiungibile in maniera finanziariamente sostenibile",
+        "Modello potenzialmente scalabile con risorse incrementali contenute",
+        "Ipotesi del business plan supportate da dati quantitativi e verificabili",
+        "Proiezioni economiche accurate; fabbisogni finanziari e impieghi coerenti",
+    ],
+}
+CVOI_CRITERION_MAX = 5
+
+# Tab del fascicolo istruttoria (dettaglio pratica).
+PRACTICE_TABS = [
+    ("riepilogo", "Riepilogo"),
+    ("documentale", "Verifica documentale"),
+    ("interne", "Verifiche interne"),
+    ("cvoi", "CVOI"),
+    ("cda1", "Prima delibera CdA"),
+    ("advisory", "Advisory Committee"),
+    ("cda2", "Seconda delibera CdA"),
+    ("condizioni", "Condizioni pre go-live"),
+    ("validazione", "Validazione Fase 4"),
+    ("campagna", "Pagina campagna"),
+    ("storico", "Storico"),
+]
+PRACTICE_TAB_LABELS = dict(PRACTICE_TABS)
+
+# Documenti attesi nel dossier proponente, per fase (spec sez. 2/7).
+PRACTICE_DOC_SEED = [
+    ("fase1", "Societaria", "Visura camerale", 1),
+    ("fase1", "Societaria", "Statuto", 1),
+    ("fase1", "Identita", "Documento identita legale rappresentante", 1),
+    ("fase1", "Identita", "Codice fiscale legale rappresentante", 1),
+    ("fase1", "Identita", "Procura/delega", 0),
+    ("fase1", "Economico", "Bilancio o situazione contabile", 1),
+    ("fase1", "Economico", "Business plan / piano economico-finanziario", 1),
+    ("fase1", "Progetto", "Pitch deck / executive summary", 1),
+    ("fase1", "Offerta", "Piano utilizzo fondi", 1),
+    ("fase1", "Compliance", "Assetto proprietario e titolare effettivo", 1),
+    ("fase1", "Compliance", "Dichiarazioni (crisi/contenziosi/conflitti/veridicita)", 1),
+    ("fase2", "Offerta", "Scheda approfondita progetto", 1),
+    ("fase2", "Offerta", "Scheda economico-finanziaria", 1),
+    ("fase2", "Offerta", "Termini preliminari offerta", 1),
+    ("fase3", "KIIS", "Bozza KIIS secondo modello ufficiale", 1),
+    ("fase4", "KIIS", "KIIS definitivo", 1),
+    ("fase4", "Societaria", "Delibera aumento capitale", 1),
+    ("fase4", "Societaria", "Statuto aggiornato o conferma statuto vigente", 1),
+    ("fase4", "Contratto", "Contratto Pariter-proponente firmato", 1),
+    ("fase4", "Campagna", "Pagina campagna validata", 1),
+]
+
+# Relazioni interne Pariter (spec sez. 8).
+INTERNAL_REVIEW_TYPES = [
+    ("aml_art5", "Relazione art. 5 / AML"),
+    ("conflitti", "Relazione conflitti di interesse"),
+    ("coerenza_kiis", "Report coerenza KIIS / offerta / documenti"),
+]
+INTERNAL_REVIEW_LABELS = dict(INTERNAL_REVIEW_TYPES)
+
+DOC_STATUS_LABELS = {
+    "presente": "Presente",
+    "mancante": "Mancante",
+    "da_verificare": "Da verificare",
+    "verificato": "Verificato",
+    "da_integrare": "Da integrare",
+    "incoerente": "Incoerente",
+    "non_utilizzabile": "Non utilizzabile",
+}
+
+
+def practice_status_label(status):
+    return PRACTICE_STATUS_LABELS.get(status, status)
+
+
+def practice_next_steps(status):
+    return PRACTICE_FLOW.get(status, set())
+
+
+def next_step_summary(status):
+    nxt = [s for s in practice_next_steps(status) if s not in {"respinta", "archiviata"}]
+    if not nxt:
+        return "-"
+    nxt.sort(key=lambda s: PRACTICE_STATUS_INDEX.get(s, 99))
+    return ", ".join(practice_status_label(s) for s in nxt)
 
 REQUIREMENT_SEED = [
     ("Documentazione", "Visura camerale aggiornata", 1),
@@ -1046,10 +1235,251 @@ def init_db():
                 details TEXT NOT NULL DEFAULT '',
                 created_at TEXT NOT NULL
             );
+
+            -- === Istruttoria Pariter ===
+            CREATE TABLE IF NOT EXISTS practices (
+                id INTEGER PRIMARY KEY,
+                platform_id INTEGER NOT NULL REFERENCES platforms(id),
+                proponent_id INTEGER REFERENCES proponents(id) ON DELETE SET NULL,
+                deal_id INTEGER REFERENCES deals(id) ON DELETE SET NULL,
+                project_title TEXT NOT NULL,
+                proponent_name TEXT NOT NULL DEFAULT '',
+                status TEXT NOT NULL DEFAULT 'dossier_ricevuto',
+                instrument TEXT NOT NULL DEFAULT '',
+                target_amount REAL NOT NULL DEFAULT 0,
+                max_amount REAL NOT NULL DEFAULT 0,
+                pre_money REAL NOT NULL DEFAULT 0,
+                equity_percent TEXT NOT NULL DEFAULT '',
+                source_system TEXT NOT NULL DEFAULT 'Import file',
+                external_ref TEXT NOT NULL DEFAULT '',
+                dossier_json TEXT NOT NULL DEFAULT '',
+                kiis_state TEXT NOT NULL DEFAULT '',
+                internal_owner TEXT NOT NULL DEFAULT '',
+                created_by INTEGER REFERENCES users(id),
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS practice_status_history (
+                id INTEGER PRIMARY KEY,
+                practice_id INTEGER NOT NULL REFERENCES practices(id) ON DELETE CASCADE,
+                from_status TEXT NOT NULL DEFAULT '',
+                to_status TEXT NOT NULL,
+                actor_id INTEGER REFERENCES users(id),
+                notes TEXT NOT NULL DEFAULT '',
+                conditions TEXT NOT NULL DEFAULT '',
+                created_at TEXT NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS practice_documents (
+                id INTEGER PRIMARY KEY,
+                practice_id INTEGER NOT NULL REFERENCES practices(id) ON DELETE CASCADE,
+                phase TEXT NOT NULL DEFAULT '',
+                category TEXT NOT NULL DEFAULT '',
+                label TEXT NOT NULL,
+                required INTEGER NOT NULL DEFAULT 1,
+                doc_status TEXT NOT NULL DEFAULT 'mancante',
+                document_id INTEGER REFERENCES documents(id) ON DELETE SET NULL,
+                reviewer_notes TEXT NOT NULL DEFAULT '',
+                integration_requested INTEGER NOT NULL DEFAULT 0,
+                updated_by INTEGER REFERENCES users(id),
+                updated_at TEXT NOT NULL DEFAULT ''
+            );
+
+            CREATE TABLE IF NOT EXISTS internal_reviews (
+                id INTEGER PRIMARY KEY,
+                practice_id INTEGER NOT NULL REFERENCES practices(id) ON DELETE CASCADE,
+                review_type TEXT NOT NULL,
+                review_status TEXT NOT NULL DEFAULT 'non_generata',
+                outcome TEXT NOT NULL DEFAULT '',
+                body TEXT NOT NULL DEFAULT '',
+                generated_document_id INTEGER REFERENCES documents(id) ON DELETE SET NULL,
+                updated_by INTEGER REFERENCES users(id),
+                updated_at TEXT NOT NULL DEFAULT ''
+            );
+
+            CREATE TABLE IF NOT EXISTS cvoi_reports (
+                id INTEGER PRIMARY KEY,
+                practice_id INTEGER NOT NULL REFERENCES practices(id) ON DELETE CASCADE,
+                weighted_score REAL NOT NULL DEFAULT 0,
+                outcome TEXT NOT NULL DEFAULT 'da_integrare',
+                conditions TEXT NOT NULL DEFAULT '',
+                review_status TEXT NOT NULL DEFAULT 'bozza',
+                generated_document_id INTEGER REFERENCES documents(id) ON DELETE SET NULL,
+                created_by INTEGER REFERENCES users(id),
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS cvoi_scores (
+                id INTEGER PRIMARY KEY,
+                cvoi_report_id INTEGER NOT NULL REFERENCES cvoi_reports(id) ON DELETE CASCADE,
+                area_key TEXT NOT NULL,
+                weight REAL NOT NULL,
+                max_score REAL NOT NULL,
+                threshold REAL NOT NULL,
+                raw_score REAL NOT NULL DEFAULT 0,
+                notes TEXT NOT NULL DEFAULT ''
+            );
+
+            CREATE TABLE IF NOT EXISTS practice_board_decisions (
+                id INTEGER PRIMARY KEY,
+                practice_id INTEGER NOT NULL REFERENCES practices(id) ON DELETE CASCADE,
+                decision_round INTEGER NOT NULL,
+                meeting_date TEXT NOT NULL DEFAULT '',
+                attendees TEXT NOT NULL DEFAULT '',
+                agenda TEXT NOT NULL DEFAULT '',
+                summary TEXT NOT NULL DEFAULT '',
+                outcome TEXT NOT NULL DEFAULT '',
+                conditions TEXT NOT NULL DEFAULT '',
+                generated_document_id INTEGER REFERENCES documents(id) ON DELETE SET NULL,
+                created_by INTEGER REFERENCES users(id),
+                created_at TEXT NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS advisory_opinions (
+                id INTEGER PRIMARY KEY,
+                practice_id INTEGER NOT NULL REFERENCES practices(id) ON DELETE CASCADE,
+                meeting_date TEXT NOT NULL DEFAULT '',
+                attendees TEXT NOT NULL DEFAULT '',
+                agenda TEXT NOT NULL DEFAULT '',
+                summary TEXT NOT NULL DEFAULT '',
+                outcome TEXT NOT NULL DEFAULT '',
+                conditions TEXT NOT NULL DEFAULT '',
+                generated_document_id INTEGER REFERENCES documents(id) ON DELETE SET NULL,
+                created_by INTEGER REFERENCES users(id),
+                created_at TEXT NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS pre_golive_conditions (
+                id INTEGER PRIMARY KEY,
+                practice_id INTEGER NOT NULL REFERENCES practices(id) ON DELETE CASCADE,
+                description TEXT NOT NULL,
+                source TEXT NOT NULL DEFAULT '',
+                owner TEXT NOT NULL DEFAULT '',
+                priority TEXT NOT NULL DEFAULT 'bloccante',
+                due_date TEXT NOT NULL DEFAULT '',
+                cond_status TEXT NOT NULL DEFAULT 'aperta',
+                document_id INTEGER REFERENCES documents(id) ON DELETE SET NULL,
+                created_at TEXT NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS integration_requests (
+                id INTEGER PRIMARY KEY,
+                practice_id INTEGER NOT NULL REFERENCES practices(id) ON DELETE CASCADE,
+                practice_document_id INTEGER REFERENCES practice_documents(id) ON DELETE SET NULL,
+                phase TEXT NOT NULL DEFAULT '',
+                subject TEXT NOT NULL,
+                detail TEXT NOT NULL DEFAULT '',
+                priority TEXT NOT NULL DEFAULT 'non_bloccante',
+                req_status TEXT NOT NULL DEFAULT 'aperta',
+                requested_by INTEGER REFERENCES users(id),
+                created_at TEXT NOT NULL,
+                resolved_at TEXT NOT NULL DEFAULT ''
+            );
+
+            CREATE TABLE IF NOT EXISTS practice_alerts (
+                id INTEGER PRIMARY KEY,
+                practice_id INTEGER NOT NULL REFERENCES practices(id) ON DELETE CASCADE,
+                severity TEXT NOT NULL DEFAULT 'bloccante',
+                source TEXT NOT NULL DEFAULT '',
+                message TEXT NOT NULL,
+                alert_status TEXT NOT NULL DEFAULT 'aperto',
+                created_at TEXT NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS campaign_page_reviews (
+                id INTEGER PRIMARY KEY,
+                practice_id INTEGER NOT NULL REFERENCES practices(id) ON DELETE CASCADE,
+                review_status TEXT NOT NULL DEFAULT 'bozza',
+                coherence_notes TEXT NOT NULL DEFAULT '',
+                no_yield_promise INTEGER NOT NULL DEFAULT 0,
+                generated_document_id INTEGER REFERENCES documents(id) ON DELETE SET NULL,
+                updated_by INTEGER REFERENCES users(id),
+                updated_at TEXT NOT NULL DEFAULT ''
+            );
+
+            CREATE TABLE IF NOT EXISTS cvoi_criteria_scores (
+                id INTEGER PRIMARY KEY,
+                cvoi_report_id INTEGER NOT NULL REFERENCES cvoi_reports(id) ON DELETE CASCADE,
+                area_key TEXT NOT NULL,
+                idx INTEGER NOT NULL,
+                raw_score REAL NOT NULL DEFAULT 0
+            );
+
+            CREATE TABLE IF NOT EXISTS cvoi_member_reviews (
+                id INTEGER PRIMARY KEY,
+                cvoi_report_id INTEGER NOT NULL REFERENCES cvoi_reports(id) ON DELETE CASCADE,
+                user_id INTEGER REFERENCES users(id),
+                member_name TEXT NOT NULL DEFAULT '',
+                role TEXT NOT NULL DEFAULT '',
+                status TEXT NOT NULL DEFAULT 'in_attesa',
+                comment TEXT NOT NULL DEFAULT '',
+                signed_at TEXT NOT NULL DEFAULT '',
+                updated_at TEXT NOT NULL DEFAULT ''
+            );
+
+            CREATE TABLE IF NOT EXISTS cvoi_edit_log (
+                id INTEGER PRIMARY KEY,
+                cvoi_report_id INTEGER NOT NULL REFERENCES cvoi_reports(id) ON DELETE CASCADE,
+                actor_user_id INTEGER REFERENCES users(id),
+                actor_name TEXT NOT NULL DEFAULT '',
+                action TEXT NOT NULL DEFAULT '',
+                summary TEXT NOT NULL DEFAULT '',
+                created_at TEXT NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS practice_phases (
+                id INTEGER PRIMARY KEY,
+                practice_id INTEGER NOT NULL REFERENCES practices(id) ON DELETE CASCADE,
+                phase TEXT NOT NULL,
+                status TEXT NOT NULL DEFAULT 'da_completare',
+                updated_at TEXT NOT NULL DEFAULT '',
+                updated_by INTEGER REFERENCES users(id)
+            );
+
+            CREATE TABLE IF NOT EXISTS board_member_votes (
+                id INTEGER PRIMARY KEY,
+                board_decision_id INTEGER NOT NULL REFERENCES practice_board_decisions(id) ON DELETE CASCADE,
+                user_id INTEGER REFERENCES users(id),
+                member_name TEXT NOT NULL DEFAULT '',
+                vote TEXT NOT NULL DEFAULT 'in_attesa',
+                comment TEXT NOT NULL DEFAULT '',
+                voted_at TEXT NOT NULL DEFAULT ''
+            );
+
+            CREATE TABLE IF NOT EXISTS advisory_member_reviews (
+                id INTEGER PRIMARY KEY,
+                advisory_opinion_id INTEGER NOT NULL REFERENCES advisory_opinions(id) ON DELETE CASCADE,
+                user_id INTEGER REFERENCES users(id),
+                member_name TEXT NOT NULL DEFAULT '',
+                status TEXT NOT NULL DEFAULT 'in_attesa',
+                comment TEXT NOT NULL DEFAULT '',
+                signed_at TEXT NOT NULL DEFAULT '',
+                updated_at TEXT NOT NULL DEFAULT ''
+            );
             """
         )
         ensure_column(conn, "finance_costs", "linked_contract_id", "INTEGER REFERENCES supplier_contracts(id) ON DELETE SET NULL")
         ensure_column(conn, "deals", "platform_fee_percent", "REAL NOT NULL DEFAULT 5")
+        ensure_column(conn, "documents", "practice_id", "INTEGER REFERENCES practices(id) ON DELETE SET NULL")
+        # Iterazione 2: CVOI collaborativo + chiusura pratica
+        ensure_column(conn, "cvoi_reports", "workflow_status", "TEXT NOT NULL DEFAULT 'bozza'")
+        ensure_column(conn, "cvoi_reports", "notes_qualitative", "TEXT NOT NULL DEFAULT ''")
+        ensure_column(conn, "cvoi_reports", "closing_note", "TEXT NOT NULL DEFAULT ''")
+        ensure_column(conn, "cvoi_reports", "data_caricamento", "TEXT NOT NULL DEFAULT ''")
+        ensure_column(conn, "cvoi_reports", "data_valutazione", "TEXT NOT NULL DEFAULT ''")
+        ensure_column(conn, "cvoi_reports", "mail", "TEXT NOT NULL DEFAULT ''")
+        ensure_column(conn, "cvoi_reports", "drafter_user_id", "INTEGER")
+        ensure_column(conn, "practices", "closed_at", "TEXT NOT NULL DEFAULT ''")
+        ensure_column(conn, "practices", "closure_outcome", "TEXT NOT NULL DEFAULT ''")
+        ensure_column(conn, "practices", "closure_note", "TEXT NOT NULL DEFAULT ''")
+        # Iterazione 3: voto collegiale CdA + advisory collaborativo
+        ensure_column(conn, "practice_board_decisions", "decision_status", "TEXT NOT NULL DEFAULT 'finalizzata'")
+        ensure_column(conn, "practice_board_decisions", "finalized_by", "INTEGER")
+        ensure_column(conn, "practice_board_decisions", "finalized_at", "TEXT NOT NULL DEFAULT ''")
+        ensure_column(conn, "advisory_opinions", "workflow_status", "TEXT NOT NULL DEFAULT 'bozza'")
+        ensure_column(conn, "advisory_opinions", "drafter_user_id", "INTEGER")
         if conn.execute("SELECT COUNT(*) FROM platforms").fetchone()[0] == 0:
             seed(conn)
         ensure_demo_extensions(conn)
@@ -1073,6 +1503,14 @@ def seed(conn):
             (4, "Paolo Conti", "paolo.conti@example.test", "covi"),
             (5, "Elena Martini", "elena.martini@example.test", "board"),
             (6, "Sara De Luca", "sara.deluca@example.test", "operator"),
+            (7, "Tommaso Pravettoni", "tommaso.pravettoni@example.test", "technical_committee"),
+            (8, "Marta Provera", "marta.provera@example.test", "technical_committee"),
+            (9, "Valentina Franchini", "valentina.franchini@example.test", "technical_committee"),
+            (10, "Amministratore", "admin@example.test", "admin"),
+            (11, "Gaetano De Vito", "gaetano.devito@example.test", "board"),
+            (12, "Stefania Monotoni", "stefania.monotoni@example.test", "board"),
+            (13, "Mauro Sacchetto", "mauro.sacchetto@example.test", "covi"),
+            (14, "Luciano Rodighiero", "luciano.rodighiero@example.test", "covi"),
         ],
     )
     committee_rows = []
@@ -1684,7 +2122,75 @@ def ensure_demo_extensions(conn):
                 (2, (today - timedelta(days=9)).isoformat(), "Maria Fontana", "Email", "Test di ingresso non salvato", "Aperto", "Ticket tecnico aperto", 1),
             ],
         )
+    ensure_demo_practice(conn)
     conn.commit()
+
+
+def ensure_demo_practice(conn):
+    """Pratica demo Pariter (Quinte Parallele) ingerita tramite la pipeline reale."""
+    if conn.execute("SELECT COUNT(*) FROM practices WHERE platform_id = 1").fetchone()[0] > 0:
+        return
+    dossier = {
+        "jsons": {
+            "dati_struttura": {
+                "meta": {"piattaforma": "Pariter Equity", "esitoFase1Label": "Idoneo", "statoFase2": "completata"},
+                "societa": {
+                    "denominazione": "Quinte Parallele S.r.l.",
+                    "forma": "S.r.l.",
+                    "sedeLegale": "Via dei Musicisti 12, Milano",
+                    "pIva": "12345670961",
+                    "pec": "quinteparallele@pec.it",
+                },
+                "legaleRappresentante": {"nome": "Fabio Malerba", "carica": "Amministratore unico"},
+                "offertaFase1": {
+                    "importoTarget": "150000",
+                    "importoMax": "300000",
+                    "preMoney": "1200000",
+                    "equity": "11%",
+                    "strumento": "Quote di S.r.l.",
+                    "diritti": "Diritti economici e amministrativi secondo statuto",
+                    "useOfProceeds": "Sviluppo piattaforma, marketing, capitale circolante",
+                },
+            },
+            "kiis_dati": {
+                "gestorePortale": "Pariter Equity",
+                "statoFase3": "in lavorazione",
+                "completamentoPct": 72,
+                "alertBloccanti": [
+                    "Parte F (diritti): manca riferimento alla fonte giuridica (statuto/delibera).",
+                ],
+                "campiPariter": [
+                    "Costi a carico dell'investitore (Parte H)",
+                    "Periodo di riflessione",
+                ],
+                "panoramica": {"ov_progetto": "Quinte Parallele - produzione e distribuzione musicale"},
+            },
+        },
+        "files": [],
+    }
+    mapped = map_dossier_to_practice(dossier, 1, "Quinte Parallele - produzione musicale")
+    practice_id = ingest_practice(conn, dossier, mapped, 1, 1)
+    # avanza la demo a uno stato attivo e marca alcuni documenti come verificati
+    now = now_iso()
+    conn.execute(
+        "UPDATE practices SET status = 'verifiche_interne', internal_owner = 'Alessia Ricci', updated_at = ? WHERE id = ?",
+        (now, practice_id),
+    )
+    for to_status, note in [
+        ("verifica_documentale", "Avvio verifica documentale"),
+        ("fase1_validata", "Fase 1 validata"),
+        ("verifiche_interne", "Avvio verifiche interne Pariter"),
+    ]:
+        conn.execute(
+            """INSERT INTO practice_status_history(practice_id, from_status, to_status, actor_id, notes, created_at)
+               VALUES (?, '', ?, 1, ?, ?)""",
+            (practice_id, to_status, note, now),
+        )
+    conn.execute(
+        """UPDATE practice_documents SET doc_status = 'verificato', updated_at = ?
+           WHERE practice_id = ? AND phase = 'fase1' AND required = 1""",
+        (now, practice_id),
+    )
 
 
 def log_audit(conn, platform_id, actor_id, entity_type, entity_id, action, details=""):
@@ -1730,6 +2236,8 @@ def option_values(options, selected):
 
 def user_can(user, action):
     role = user["role"]
+    if role == "admin":  # override: l'amministratore puo' agire da ogni lato
+        return True
     permissions = {
         "create_deal": {"compliance", "legal", "operator"},
         "edit_requirement": {"compliance", "legal", "operator"},
@@ -1745,6 +2253,12 @@ def user_can(user, action):
         "manage_registers": {"compliance", "legal"},
         "manage_proponents": {"compliance", "legal", "operator"},
         "manage_finance": {"compliance", "legal", "operator"},
+        "manage_practice": {"compliance", "legal", "operator"},
+        "cvoi_draft": {"technical_committee"},
+        "cvoi_sign": {"technical_committee"},
+        "view_comitato_tecnico": {"technical_committee"},
+        "advisory_opinion": {"covi"},
+        "close_practice": {"compliance", "legal"},
     }
     return role in permissions.get(action, set())
 
@@ -1815,6 +2329,816 @@ def save_uploaded_document(conn, file_item, platform_id, deal_id, proponent_id, 
         ),
     )
     return cur.lastrowid
+
+
+def link_document_practice(conn, document_id, practice_id):
+    """Aggancia un documento (creato dagli helper condivisi) a una pratica."""
+    if document_id and practice_id:
+        conn.execute("UPDATE documents SET practice_id = ? WHERE id = ?", (practice_id, document_id))
+
+
+def store_practice_file(conn, platform_id, practice_id, proponent_id, origin, category, title, filename, data, actor_id):
+    """Salva su disco bytes grezzi (da import dossier) e li registra in documents."""
+    safe = sanitize_filename(filename or "documento.bin")
+    folder = UPLOAD_DIR / datetime.now().strftime("%Y%m")
+    folder.mkdir(parents=True, exist_ok=True)
+    stored = f"{datetime.now().strftime('%Y%m%d-%H%M%S')}-{uuid.uuid4().hex[:8]}-{safe}"
+    path = folder / stored
+    path.write_bytes(data)
+    cur = conn.execute(
+        """
+        INSERT INTO documents(platform_id, deal_id, proponent_id, practice_id, origin, category, title, filename, storage_path, generated, created_by, created_at)
+        VALUES (?, NULL, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?)
+        """,
+        (platform_id, proponent_id, practice_id, origin, category, title or safe, safe,
+         str(path.relative_to(BASE_DIR)), actor_id, now_iso()),
+    )
+    return cur.lastrowid
+
+
+# ----- Ingestione dossier proponente (confine astratto trasporto/mappatura) -----
+
+DOSSIER_JSON_KEYS = {
+    "dati_struttura.json": "dati_struttura",
+    "kiis_dati.json": "kiis_dati",
+    "dati_completi.json": "dati_completi",
+}
+
+
+def _dossier_phase_from_path(name):
+    low = name.lower()
+    for ph in ("fase1", "fase2", "fase3", "fase4"):
+        if ph in low:
+            return ph
+    return ""
+
+
+def read_dossier_from_zip(file_item):
+    """STRATO TRASPORTO. Legge un .zip dossier e restituisce il dict canonico.
+    Sostituibile in futuro con un feed live senza toccare mappatura/persistenza."""
+    file_item.file.seek(0)
+    raw = file_item.file.read()
+    jsons = {}
+    files = []
+    with zipfile.ZipFile(io.BytesIO(raw)) as zf:
+        for info in zf.infolist():
+            if info.is_dir():
+                continue
+            base = info.filename.rsplit("/", 1)[-1]
+            data = zf.read(info.filename)
+            key = DOSSIER_JSON_KEYS.get(base.lower())
+            if key:
+                try:
+                    jsons[key] = json.loads(data.decode("utf-8"))
+                except (ValueError, UnicodeDecodeError):
+                    pass
+                continue
+            # i .json di dati non vanno tra i file allegati; tutto il resto sì
+            if base.lower().endswith(".json"):
+                continue
+            files.append((info.filename, data))
+    return {"jsons": jsons, "files": files}
+
+
+def read_dossier_from_json(struttura_item=None, kiis_item=None):
+    """STRATO TRASPORTO (variante): singoli JSON di fase."""
+    jsons = {}
+    for item, key in ((struttura_item, "dati_struttura"), (kiis_item, "kiis_dati")):
+        if item is not None:
+            item.file.seek(0)
+            try:
+                jsons[key] = json.loads(item.file.read().decode("utf-8"))
+            except (ValueError, UnicodeDecodeError):
+                pass
+    return {"jsons": jsons, "files": []}
+
+
+def _parse_amount(value):
+    """Converte importi in formato libero/italiano in float (tollerante)."""
+    if value in (None, ""):
+        return 0.0
+    s = re.sub(r"[^0-9.,]", "", str(value))
+    if not s:
+        return 0.0
+    if "." in s and "," in s:  # 1.234.567,89 -> 1234567.89
+        s = s.replace(".", "").replace(",", ".")
+    elif "," in s:  # 1234,89 -> 1234.89
+        s = s.replace(",", ".")
+    elif "." in s:
+        # solo punto: separatore migliaia se piu' punti o 3 cifre dopo l'ultimo
+        # (200.000 -> 200000); decimale se 1-2 cifre dopo l'unico punto (12.50)
+        if s.count(".") > 1 or len(s.rsplit(".", 1)[1]) == 3:
+            s = s.replace(".", "")
+    try:
+        return float(s)
+    except ValueError:
+        return 0.0
+
+
+def map_dossier_to_practice(dossier, platform_id, project_title_override=""):
+    """STRATO MAPPATURA PURA: dossier canonico -> record pratica + alert.
+    Nessun I/O, nessun DB. Tollerante a chiavi mancanti / fasi parziali."""
+    js = dossier.get("jsons", {})
+    ds = js.get("dati_struttura") or {}
+    dc = js.get("dati_completi") or {}
+    kd = js.get("kiis_dati") or {}
+    dc_data = dc.get("DATA") or {}
+
+    societa = ds.get("societa") or {}
+    offerta = ds.get("offertaFase1") or {}
+    denom = societa.get("denominazione") or dc_data.get("denom") or ""
+
+    target = offerta.get("importoTarget") or dc_data.get("impTarget")
+    massimo = offerta.get("importoMax") or dc_data.get("impMax")
+    premoney = offerta.get("preMoney") or dc_data.get("preMoney")
+    equity = offerta.get("equity") or dc_data.get("pctEquity") or ""
+    strumento = offerta.get("strumento") or dc_data.get("strumento") or ""
+
+    title = (project_title_override or "").strip()
+    if not title:
+        panoramica = kd.get("panoramica") or {}
+        title = panoramica.get("ov_progetto") or dc_data.get("ov_progetto") or ""
+    if not title:
+        title = f"Offerta {denom}".strip() if denom else "Pratica importata"
+
+    practice = {
+        "project_title": title,
+        "proponent_name": denom,
+        "instrument": strumento,
+        "target_amount": _parse_amount(target),
+        "max_amount": _parse_amount(massimo),
+        "pre_money": _parse_amount(premoney),
+        "equity_percent": str(equity),
+        "kiis_state": kd.get("statoFase3") or "",
+        "external_ref": (ds.get("meta") or {}).get("piattaforma") or kd.get("gestorePortale") or "",
+        "dossier_json": json.dumps(js, ensure_ascii=False),
+    }
+
+    alerts = []
+    for msg in (kd.get("alertBloccanti") or []):
+        alerts.append({"severity": "bloccante", "source": "import_dossier", "message": str(msg)})
+    for campo in (kd.get("campiPariter") or []):
+        alerts.append({"severity": "non_bloccante", "source": "import_dossier",
+                       "message": f"Campo KIIS da compilare da Pariter: {campo}"})
+    if not js:
+        alerts.append({"severity": "non_bloccante", "source": "import_dossier",
+                       "message": "Nessun JSON dati riconosciuto nel pacchetto: verificare l'export del proponente."})
+    return {"practice": practice, "alerts": alerts}
+
+
+def ingest_practice(conn, dossier, mapped, platform_id, actor_id, proponent_id=None):
+    """STRATO PERSISTENZA: scrive pratica, checklist documentale, alert e file."""
+    now = now_iso()
+    p = mapped["practice"]
+    cur = conn.execute(
+        """
+        INSERT INTO practices(platform_id, proponent_id, project_title, proponent_name, status,
+            instrument, target_amount, max_amount, pre_money, equity_percent,
+            source_system, external_ref, dossier_json, kiis_state, created_by, created_at, updated_at)
+        VALUES (?, ?, ?, ?, 'dossier_ricevuto', ?, ?, ?, ?, ?, 'Import file', ?, ?, ?, ?, ?, ?)
+        """,
+        (platform_id, proponent_id, p["project_title"], p["proponent_name"],
+         p["instrument"], p["target_amount"], p["max_amount"], p["pre_money"], p["equity_percent"],
+         p["external_ref"], p["dossier_json"], p["kiis_state"], actor_id, now, now),
+    )
+    practice_id = cur.lastrowid
+
+    conn.execute(
+        """INSERT INTO practice_status_history(practice_id, from_status, to_status, actor_id, notes, created_at)
+           VALUES (?, '', 'dossier_ricevuto', ?, 'Dossier importato dal software proponente', ?)""",
+        (practice_id, actor_id, now),
+    )
+
+    for phase in ("fase1", "fase2", "fase3", "fase4"):
+        conn.execute(
+            "INSERT INTO practice_phases(practice_id, phase, status, updated_at) VALUES (?, ?, 'da_completare', ?)",
+            (practice_id, phase, now),
+        )
+
+    # Checklist documentale attesa.
+    seed_doc_ids = {}
+    for phase, category, label, required in PRACTICE_DOC_SEED:
+        c = conn.execute(
+            """INSERT INTO practice_documents(practice_id, phase, category, label, required, doc_status, updated_at)
+               VALUES (?, ?, ?, ?, ?, 'mancante', ?)""",
+            (practice_id, phase, category, label, required, now),
+        )
+        seed_doc_ids.setdefault(phase, []).append((c.lastrowid, label.lower()))
+
+    # File del dossier -> documents (con practice_id) + match alla checklist.
+    for name, data in dossier.get("files", []):
+        base = name.rsplit("/", 1)[-1]
+        phase = _dossier_phase_from_path(name)
+        doc_id = store_practice_file(
+            conn, platform_id, practice_id, proponent_id,
+            "Proponente", phase or "dossier", base, base, data, actor_id,
+        )
+        # match euristico per fase + parola chiave nel nome file
+        low = base.lower()
+        for row_id, label in seed_doc_ids.get(phase, []):
+            token = label.split()[0]
+            if token and token in low:
+                conn.execute(
+                    """UPDATE practice_documents SET doc_status='da_verificare', document_id=?, updated_at=?
+                       WHERE id=? AND doc_status='mancante'""",
+                    (doc_id, now, row_id),
+                )
+                break
+
+    for a in mapped.get("alerts", []):
+        conn.execute(
+            """INSERT INTO practice_alerts(practice_id, severity, source, message, alert_status, created_at)
+               VALUES (?, ?, ?, ?, 'aperto', ?)""",
+            (practice_id, a["severity"], a["source"], a["message"], now),
+        )
+
+    log_audit(conn, platform_id, actor_id, "practice", practice_id, "Import dossier",
+              f"{p['project_title']} ({p['proponent_name']})")
+    return practice_id
+
+
+def practice_doc_shell(title, practice, sections_html, ai_generated=True):
+    """Documento HTML stampabile per output istruttoria (stile sobrio, marcato IA)."""
+    banner = (
+        '<div class="ai-flag">Bozza generata da IA &mdash; da verificare. La validazione finale e\' sempre umana.</div>'
+        if ai_generated else ""
+    )
+    return f"""<!doctype html>
+<html lang="it"><head><meta charset="utf-8"><title>{esc(title)} - {esc(practice['project_title'])}</title>
+<style>
+  body{{font-family:Georgia,'Times New Roman',serif;color:#1f1b17;max-width:820px;margin:24px auto;padding:0 28px;line-height:1.5;}}
+  h1{{font-size:21px;margin:0 0 4px;}} h2{{font-size:15px;margin:22px 0 6px;border-bottom:1px solid #d8d0c4;padding-bottom:3px;}}
+  .meta{{font-family:Consolas,monospace;font-size:12px;color:#5f5a55;margin:2px 0;}}
+  .ai-flag{{font-family:Consolas,monospace;font-size:11px;color:#9a6a22;border:1px solid #d8c39a;background:#faf4e6;padding:7px 10px;margin:0 0 18px;}}
+  table{{width:100%;border-collapse:collapse;font-size:13px;margin:6px 0;}} td,th{{border:1px solid #d8d0c4;padding:6px 8px;text-align:left;}}
+  p{{margin:6px 0;}} .muted{{color:#76706a;}}
+</style></head><body>
+{banner}
+<h1>{esc(title)}</h1>
+<p class="meta">Proponente: {esc(practice['proponent_name'] or '-')}</p>
+<p class="meta">Progetto: {esc(practice['project_title'])}</p>
+<p class="meta">Pratica #{practice['id']} &middot; generato il {esc(now_iso())}</p>
+{sections_html}
+<h2>Validazione</h2>
+<p class="muted">Documento da sottoporre a validazione del responsabile competente prima dell'allegazione al fascicolo.</p>
+</body></html>"""
+
+
+def build_internal_review_html(practice, review_type):
+    """Genera la bozza di relazione interna (AML art.5 / conflitti / coerenza KIIS)."""
+    js = {}
+    try:
+        js = json.loads(practice["dossier_json"] or "{}")
+    except (ValueError, TypeError):
+        js = {}
+    ds = js.get("dati_struttura") or {}
+    societa = ds.get("societa") or {}
+    rep = ds.get("legaleRappresentante") or {}
+    kd = js.get("kiis_dati") or {}
+
+    if review_type == "aml_art5":
+        sections = f"""
+<h2>1. Oggetto</h2>
+<p>Controlli ex art. 5 Reg. (UE) 2020/1503 sul titolare del progetto e sul titolare effettivo, ai fini dell'ammissione dell'offerta sulla piattaforma Pariter Equity.</p>
+<h2>2. Soggetti</h2>
+<table>
+  <tr><th>Denominazione proponente</th><td>{esc(practice['proponent_name'] or societa.get('denominazione') or '-')}</td></tr>
+  <tr><th>Sede</th><td>{esc(societa.get('sedeLegale') or '-')}</td></tr>
+  <tr><th>P. IVA</th><td>{esc(societa.get('pIva') or '-')}</td></tr>
+  <tr><th>Legale rappresentante</th><td>{esc(rep.get('nome') or '-')} ({esc(rep.get('carica') or '-')})</td></tr>
+</table>
+<h2>3. Verifiche svolte</h2>
+<p>- Assenza di stabilimento/residenza in giurisdizioni non cooperative a fini fiscali;<br>
+- assenza di stabilimento/residenza in Paesi terzi ad alto rischio;<br>
+- assenza di precedenti penali rilevanti in capo agli esponenti;<br>
+- coerenza anagrafica tra visura, statuto e autodichiarazioni.</p>
+<h2>4. Documentazione esaminata</h2>
+<p>Visura camerale, statuto, autodichiarazione onorabilita', dichiarazione su giurisdizioni. Eventuale casellario giudiziale da acquisire.</p>
+<h2>5. Conclusioni allo stato degli atti</h2>
+<p>Allo stato degli atti non emergono elementi ostativi ai sensi dell'art. 5. Da completare con la documentazione ancora in acquisizione.</p>
+"""
+        title = "Relazione art. 5 / AML"
+    elif review_type == "conflitti":
+        sections = f"""
+<h2>1. Oggetto</h2>
+<p>Verifica sull'insussistenza/sussistenza di conflitti di interesse tra Pariter Equity e il proponente {esc(practice['proponent_name'] or '-')} in relazione al progetto.</p>
+<h2>2. Soggetti coinvolti</h2>
+<p>Proponente, esponenti, soci, advisor e collaboratori coinvolti nell'istruttoria.</p>
+<h2>3. Conflitti rilevati</h2>
+<table>
+  <tr><th>Conflitti attuali</th><td>Nessuno rilevato allo stato degli atti</td></tr>
+  <tr><th>Conflitti potenziali</th><td>Da monitorare secondo il registro conflitti</td></tr>
+  <tr><th>Rapporti Pariter-proponente</th><td>Da dichiarare/aggiornare</td></tr>
+</table>
+<h2>4. Misure di mitigazione</h2>
+<p>Annotazione nel registro conflitti, astensione dei soggetti interessati ove ricorrano i presupposti.</p>
+<h2>5. Attestazione finale</h2>
+<p>Allo stato degli atti si attesta l'insussistenza di conflitti di interesse ostativi, salvo aggiornamenti.</p>
+"""
+        title = "Relazione insussistenza conflitti di interesse"
+    else:  # coerenza_kiis
+        offerta = ds.get("offertaFase1") or {}
+        sections = f"""
+<h2>1. Oggetto</h2>
+<p>Verifica di coerenza tra bozza KIIS, dati di offerta, business plan e documentazione di progetto.</p>
+<h2>2. Dati di offerta confrontati</h2>
+<table>
+  <tr><th>Importo target</th><td>{esc(offerta.get('importoTarget') or '-')}</td></tr>
+  <tr><th>Importo massimo</th><td>{esc(offerta.get('importoMax') or '-')}</td></tr>
+  <tr><th>Pre-money</th><td>{esc(offerta.get('preMoney') or '-')}</td></tr>
+  <tr><th>Equity offerta</th><td>{esc(offerta.get('equity') or '-')}</td></tr>
+  <tr><th>Strumento</th><td>{esc(offerta.get('strumento') or '-')}</td></tr>
+</table>
+<h2>3. Controlli di coerenza</h2>
+<p>- Importi target/massimo coerenti tra KIIS e dati offerta;<br>
+- diritti degli investitori coerenti con statuto/delibera;<br>
+- rischi coerenti con il business plan;<br>
+- uso dei fondi coerente;<br>
+- claim non fuorvianti e privi di promesse di rendimento.</p>
+<h2>4. Alert rilevati</h2>
+<p>{esc('; '.join(kd.get('alertBloccanti') or []) or 'Nessun alert bloccante segnalato dal proponente.')}</p>
+<h2>5. Esito</h2>
+<p>Coerenza complessiva da confermare previa chiusura degli alert e dei campi di competenza Pariter.</p>
+"""
+        title = "Report coerenza KIIS / offerta / documenti"
+    return title, practice_doc_shell(title, practice, sections)
+
+
+CVOI_OUTCOME_LABELS = {
+    "superato": "Superato",
+    "superato_condizioni": "Superato con condizioni",
+    "non_superato": "Non superato",
+    "da_integrare": "Da integrare",
+}
+
+
+def compute_cvoi(score_inputs):
+    """score_inputs: lista dict {weight, threshold, raw}. Ritorna (weighted, outcome)."""
+    weighted = round(sum(s["raw"] * s["weight"] for s in score_inputs), 2)
+    below = [s for s in score_inputs if s["raw"] < s["threshold"]]
+    if weighted >= CVOI_OVERALL_THRESHOLD and not below:
+        outcome = "superato"
+    elif weighted >= CVOI_OVERALL_THRESHOLD:
+        outcome = "superato_condizioni"
+    else:
+        outcome = "non_superato"
+    return weighted, outcome
+
+
+def compute_cvoi_from_criteria(criteria_scores):
+    """criteria_scores: {area_key: [punteggi]}. Ritorna (area_totals, weighted, outcome, total_raw, total_max)."""
+    score_inputs = []
+    area_totals = {}
+    total_raw = 0.0
+    total_max = 0
+    for key, _label, w, mx, thr in CVOI_AREAS:
+        vals = criteria_scores.get(key, [])
+        raw = round(sum(vals), 2)
+        area_totals[key] = raw
+        total_raw += raw
+        total_max += mx
+        score_inputs.append({"weight": w, "threshold": thr, "raw": raw})
+    weighted, outcome = compute_cvoi(score_inputs)
+    return area_totals, weighted, outcome, round(total_raw, 2), total_max
+
+
+def build_cvoi_html(practice, report_fields, criteria_scores):
+    """Verbale di valutazione del progetto (CVOI), fedele al template reale."""
+    area_totals, weighted, outcome, total_raw, total_max = compute_cvoi_from_criteria(criteria_scores)
+    # tabella riepilogo aree
+    summary_rows = ""
+    for key, label, w, mx, thr in CVOI_AREAS:
+        raw = area_totals.get(key, 0)
+        summary_rows += (f"<tr><td>{esc(label)}</td><td>{raw:g}/{int(mx)}</td>"
+                         f"<td>{int(w*100)}%</td><td>{round(raw*w, 2):g}</td></tr>")
+    formula = " + ".join(f"({area_totals.get(k,0):g}x{w:g})" for k, _l, w, _m, _t in CVOI_AREAS)
+    # sezioni per criterio
+    crit_sections = ""
+    for n, (key, label, w, mx, thr) in enumerate(CVOI_AREAS, start=1):
+        vals = criteria_scores.get(key, [])
+        rows_html = "".join(
+            f"<tr><td>{esc(c)}</td><td>{(vals[i] if i < len(vals) else 0):g}</td></tr>"
+            for i, c in enumerate(CVOI_CRITERIA[key])
+        )
+        crit_sections += f"""
+<h2>{n}) {esc(label)}</h2>
+<table><tr><th>Criterio di valutazione</th><th>Punteggio</th></tr>{rows_html}</table>
+<p class="muted">Punteggio minimo richiesto: {int(thr)} su {int(mx)}. Peso {int(w*100)}% sul giudizio finale.</p>"""
+    notes = report_fields.get("notes_qualitative") or ""
+    closing = report_fields.get("closing_note") or (
+        "La presente valutazione puo' essere inoltrata al CdA per l'approvazione del progetto, salvo che non "
+        "emergano ulteriori criticita' non riscontrate in questa sede. Si ricorda al CdA che la pubblicazione "
+        "del progetto potra' avvenire unicamente a seguito dell'invio del casellario giudiziale di tutti i membri "
+        "dell'Organo Amministrativo del Proponente.")
+    signatures = report_fields.get("signatures_html") or '<p class="muted">_____________________ &nbsp; _____________________ &nbsp; _____________________</p>'
+    sections = f"""
+<table>
+  <tr><th>Proponente</th><td>{esc(practice['proponent_name'] or '-')}</td></tr>
+  <tr><th>Mail</th><td>{esc(report_fields.get('mail') or '-')}</td></tr>
+  <tr><th>Data caricamento</th><td>{esc(report_fields.get('data_caricamento') or '-')}</td></tr>
+  <tr><th>Data valutazione</th><td>{esc(report_fields.get('data_valutazione') or '-')}</td></tr>
+  <tr><th>Punteggio di valutazione</th><td>{formula} = {weighted:g}</td></tr>
+</table>
+<p>Valutazione elaborata dal Comitato Valutazione Opportunita' di Investimento (CVOI), che ha analizzato la
+documentazione prodotta dal Proponente (visura, statuto, business plan, financial plan, presentazione, bilanci),
+tenuto colloqui con il Proponente e visionato le autodichiarazioni (mancato superamento 5.000.000, titolare
+effettivo, assenza precedenti penali).</p>
+<p>Il punteggio complessivo minimo per superare il first screening - media ponderata - e' stabilito in
+{CVOI_OVERALL_THRESHOLD:g} punti ((18x0,35)+(21x0,35)+(18x0,30)).</p>
+<h2>Aree di valutazione</h2>
+<table>
+  <tr><th>Area</th><th>Punteggio</th><th>Peso</th><th>Media ponderata</th></tr>
+  {summary_rows}
+  <tr><th>Complessivo</th><th>{total_raw:g}/{total_max}</th><th>100%</th><th>{weighted:g}</th></tr>
+</table>
+<p><strong>Esito first screening: {esc(CVOI_OUTCOME_LABELS.get(outcome, outcome))}</strong> (soglia {CVOI_OVERALL_THRESHOLD:g}).</p>
+{crit_sections}
+<h2>Note di valutazione</h2>
+<p>{esc(notes or 'Nessuna nota.').replace(chr(10), '<br>')}</p>
+<p>***</p>
+<p>{esc(closing).replace(chr(10), '<br>')}</p>
+<h2>Firme componenti CVOI</h2>
+{signatures}
+"""
+    return practice_doc_shell("Verbale di valutazione del progetto - CVOI", practice, sections, ai_generated=False)
+
+
+DECISION_OUTCOMES = [
+    ("approvata", "Approvata - prosecuzione iter"),
+    ("approvata_condizioni", "Approvata con condizioni"),
+    ("sospesa", "Sospesa - richiesta revisioni/integrazioni"),
+    ("respinta", "Rigetto"),
+]
+DECISION_OUTCOME_LABELS = dict(DECISION_OUTCOMES)
+BOARD_VOTE_LABELS = {
+    "approva": "Favorevole",
+    "contrario": "Contrario",
+    "astenuto": "Astenuto",
+    "in_attesa": "In attesa",
+}
+ADVISORY_OUTCOMES = [
+    ("favorevole", "Favorevole"),
+    ("favorevole_condizioni", "Favorevole con raccomandazioni"),
+    ("sospensivo", "Sospensivo / richiesta integrazioni"),
+    ("contrario", "Contrario"),
+]
+ADVISORY_OUTCOME_LABELS = dict(ADVISORY_OUTCOMES)
+
+
+def set_practice_status(conn, practice, to_status, actor_id, notes="", conditions=""):
+    conn.execute(
+        "UPDATE practices SET status = ?, updated_at = ? WHERE id = ?",
+        (to_status, now_iso(), practice["id"]),
+    )
+    conn.execute(
+        """INSERT INTO practice_status_history(practice_id, from_status, to_status, actor_id, notes, conditions, created_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?)""",
+        (practice["id"], practice["status"], to_status, actor_id, notes, conditions, now_iso()),
+    )
+    log_audit(conn, practice["platform_id"], actor_id, "practice", practice["id"],
+              f"Stato: {practice_status_label(to_status)}", notes)
+
+
+def cvoi_is_validated(conn, practice_id):
+    """CVOI utilizzabile per la prima delibera: versione unanime del Comitato Tecnico
+    oppure validazione/forzatura (admin)."""
+    return conn.execute(
+        "SELECT 1 FROM cvoi_reports WHERE practice_id = ? AND (workflow_status = 'unanime' OR review_status = 'validato') LIMIT 1",
+        (practice_id,),
+    ).fetchone() is not None
+
+
+def cvoi_committee_members(conn):
+    return conn.execute("SELECT id, name FROM users WHERE role = 'technical_committee' AND active = 1 ORDER BY id").fetchall()
+
+
+def board_members(conn):
+    return conn.execute("SELECT id, name FROM users WHERE role = 'board' AND active = 1 ORDER BY id").fetchall()
+
+
+def advisory_members(conn):
+    return conn.execute("SELECT id, name FROM users WHERE role = 'covi' AND active = 1 ORDER BY id").fetchall()
+
+
+def recompute_cvoi_unanime(conn, report_id):
+    """Imposta workflow_status='unanime' se tutti i membri del Comitato Tecnico hanno approvato e firmato."""
+    members = cvoi_committee_members(conn)
+    if not members:
+        return False
+    reviews = {r["user_id"]: r for r in conn.execute(
+        "SELECT user_id, status, signed_at FROM cvoi_member_reviews WHERE cvoi_report_id = ?", (report_id,)
+    ).fetchall()}
+    for m in members:
+        rv = reviews.get(m["id"])
+        if not rv or rv["status"] != "approvato" or not rv["signed_at"]:
+            conn.execute("UPDATE cvoi_reports SET workflow_status = 'in_revisione' WHERE id = ? AND workflow_status = 'unanime'", (report_id,))
+            return False
+    conn.execute("UPDATE cvoi_reports SET workflow_status = 'unanime' WHERE id = ?", (report_id,))
+    return True
+
+
+def board_decision_outcome(conn, practice_id, round_no):
+    r = conn.execute(
+        "SELECT outcome FROM practice_board_decisions WHERE practice_id = ? AND decision_round = ? ORDER BY id DESC LIMIT 1",
+        (practice_id, round_no),
+    ).fetchone()
+    return r["outcome"] if r else None
+
+
+def advisory_is_expressed(conn, practice_id):
+    return conn.execute(
+        "SELECT 1 FROM advisory_opinions WHERE practice_id = ? LIMIT 1", (practice_id,)
+    ).fetchone() is not None
+
+
+def advisory_is_unanime(conn, practice_id):
+    return conn.execute(
+        "SELECT 1 FROM advisory_opinions WHERE practice_id = ? AND workflow_status = 'unanime' LIMIT 1", (practice_id,)
+    ).fetchone() is not None
+
+
+def recompute_advisory_unanime(conn, advisory_id):
+    members = advisory_members(conn)
+    if not members:
+        return False
+    reviews = {r["user_id"]: r for r in conn.execute(
+        "SELECT user_id, status, signed_at FROM advisory_member_reviews WHERE advisory_opinion_id = ?", (advisory_id,)
+    ).fetchall()}
+    for m in members:
+        rv = reviews.get(m["id"])
+        if not rv or rv["status"] != "approvato" or not rv["signed_at"]:
+            conn.execute("UPDATE advisory_opinions SET workflow_status = 'in_revisione' WHERE id = ? AND workflow_status = 'unanime'", (advisory_id,))
+            return False
+    conn.execute("UPDATE advisory_opinions SET workflow_status = 'unanime' WHERE id = ?", (advisory_id,))
+    return True
+
+
+def golive_blockers(conn, practice_id):
+    """Elenco dei requisiti bloccanti ancora aperti per il go-live (spec sez. 22)."""
+    blockers = []
+    if conn.execute(
+        "SELECT 1 FROM practice_alerts WHERE practice_id = ? AND severity = 'bloccante' AND alert_status = 'aperto' LIMIT 1", (practice_id,)
+    ).fetchone():
+        blockers.append("Alert bloccanti aperti.")
+    open_conditions = conn.execute(
+        "SELECT COUNT(*) FROM pre_golive_conditions WHERE practice_id = ? AND priority = 'bloccante' AND cond_status NOT IN ('soddisfatta','non_applicabile')", (practice_id,)
+    ).fetchone()[0]
+    if open_conditions:
+        blockers.append(f"Condizioni pre go-live bloccanti non soddisfatte: {open_conditions}.")
+    missing = conn.execute(
+        "SELECT COUNT(*) FROM practice_documents WHERE practice_id = ? AND phase = 'fase4' AND required = 1 AND doc_status <> 'verificato'", (practice_id,)
+    ).fetchone()[0]
+    if missing:
+        blockers.append(f"Checklist Fase 4 incompleta: {missing} documenti non verificati.")
+    if board_decision_outcome(conn, practice_id, 2) not in {"approvata", "approvata_condizioni"}:
+        blockers.append("Manca la seconda delibera CdA positiva.")
+    if not advisory_is_expressed(conn, practice_id):
+        blockers.append("Manca il parere Advisory Committee.")
+    return blockers
+
+
+def can_transition_practice(conn, practice, target):
+    """Ritorna '' se la transizione e' ammessa, altrimenti il motivo del blocco."""
+    if target not in PRACTICE_FLOW.get(practice["status"], set()):
+        return "Transizione non ammessa dallo stato corrente."
+    if target == "pronto_cvoi":
+        n = conn.execute(
+            "SELECT COUNT(*) FROM internal_reviews WHERE practice_id = ? AND review_status = 'validata'", (practice["id"],)
+        ).fetchone()[0]
+        if n < len(INTERNAL_REVIEW_TYPES):
+            return "Completare e validare le verifiche interne (AML, conflitti, coerenza) prima di inviare al Comitato Tecnico."
+    if target == "pronta_golive":
+        blockers = golive_blockers(conn, practice["id"])
+        if blockers:
+            return blockers[0]
+    return ""
+
+
+PARITER_LEGAL_HEADER = ("PARITER EQUITY S.R.L. - Viale Parioli 39/c, 00197 Roma - capitale sociale "
+                        "Euro 13.157,90 i.v. - C.F./P.IVA 02551670223 - REA RM-1768060")
+
+
+def cvoi_summary_for(conn, practice_id):
+    """Sintesi del CVOI piu' recente per i verbali a valle (None se assente)."""
+    report = conn.execute(
+        "SELECT * FROM cvoi_reports WHERE practice_id = ? ORDER BY id DESC LIMIT 1", (practice_id,)
+    ).fetchone()
+    if not report:
+        return None
+    scores = {(s["area_key"], s["idx"]): s["raw_score"]
+              for s in conn.execute("SELECT area_key, idx, raw_score FROM cvoi_criteria_scores WHERE cvoi_report_id = ?", (report["id"],)).fetchall()}
+    areas = []
+    for key, label, w, mx, thr in CVOI_AREAS:
+        raw = sum(v for (k, _i), v in scores.items() if k == key)
+        areas.append((label, raw, mx, w, round(raw * w, 2)))
+    return {
+        "weighted": report["weighted_score"],
+        "outcome": report["outcome"],
+        "data_valutazione": report["data_valutazione"] if "data_valutazione" in report.keys() else "",
+        "areas": areas,
+    }
+
+
+def _cvoi_summary_html(cvoi):
+    if not cvoi:
+        return "<p class='muted'>Verbale CVOI non ancora disponibile.</p>"
+    area_rows = "".join(
+        f"<tr><td>{esc(label)}</td><td>{raw:g}/{int(mx)}</td><td>{int(w*100)}%</td><td>{wm:g}</td></tr>"
+        for (label, raw, mx, w, wm) in cvoi["areas"]
+    )
+    return f"""<table>
+  <tr><th>Punteggio complessivo (media ponderata)</th><td>{cvoi['weighted']:g}</td></tr>
+  <tr><th>Soglia minima (First Screening)</th><td>{CVOI_OVERALL_THRESHOLD:g}</td></tr>
+  <tr><th>Data valutazione CVOI</th><td>{esc(cvoi['data_valutazione'] or '-')}</td></tr>
+</table>
+<table>
+  <tr><th>Area di valutazione</th><th>Punteggio</th><th>Peso</th><th>Media ponderata</th></tr>
+  {area_rows}
+</table>
+<p>Esito CVOI: <strong>{esc(CVOI_OUTCOME_LABELS.get(cvoi['outcome'], cvoi['outcome']))}</strong>.</p>"""
+
+
+def build_decision_html(practice, round_no, fields, cvoi, extra_lines=None, votes=None):
+    """Verbale di Consiglio di Amministrazione (fedele al template Pariter)."""
+    round_label = "Prima delibera CdA (preliminare)" if round_no == 1 else "Seconda delibera CdA (definitiva)"
+    extra_html = "".join(f"<tr><th>{esc(k)}</th><td>{esc(v)}</td></tr>" for k, v in (extra_lines or []))
+    outcome_label = DECISION_OUTCOME_LABELS.get(fields.get("outcome"), fields.get("outcome"))
+    votes_html = ""
+    if votes:
+        vrows = "".join(f"<tr><td>{esc(n)}</td><td>{esc(BOARD_VOTE_LABELS.get(v, v))}</td></tr>" for n, v in votes)
+        favor = sum(1 for _n, v in votes if v == "approva")
+        contr = sum(1 for _n, v in votes if v == "contrario")
+        asten = sum(1 for _n, v in votes if v == "astenuto")
+        votes_html = f"""
+<h2>Esiti del voto</h2>
+<table><tr><th>Consigliere</th><th>Voto</th></tr>{vrows}</table>
+<p>Favorevoli: {favor} &middot; Contrari: {contr} &middot; Astenuti: {asten}.</p>"""
+    sections = f"""
+<p class="meta">{esc(PARITER_LEGAL_HEADER)}</p>
+<h2>Verbale di Consiglio di Amministrazione del {esc(fields.get('meeting_date') or '-')}</h2>
+<p>Il Consiglio di Amministrazione della Societa' si e' riunito in modalita' mista per discutere e deliberare
+in merito alla pratica di equity crowdfunding <strong>{esc(practice['project_title'])}</strong>
+del proponente {esc(practice['proponent_name'] or '-')}.</p>
+<h2>Presenti</h2>
+<p>{esc(fields.get('attendees') or '-').replace(chr(10), '<br>')}</p>
+<h2>Ordine del giorno</h2>
+<p>{esc(fields.get('agenda') or '-').replace(chr(10), '<br>')}</p>
+<h2>Esito istruttoria CVOI</h2>
+{_cvoi_summary_html(cvoi)}
+{('<h2>Riferimenti</h2><table>' + extra_html + '</table>') if extra_html else ''}
+<h2>Presa d'atto delle verifiche</h2>
+<p>Il Responsabile della funzione di controllo rappresenta che il Proponente ha depositato le autodichiarazioni
+richieste (rispetto limiti art. 1 par. 2 lett. c Reg. UE 1503/2020; correttezza e completezza dei dati) e che le
+verifiche sul conflitto di interessi e sull'art. 5 del Reg. UE 1503/2020 hanno dato esito negativo (assenza di
+motivi ostativi). Si ricorda che, in assenza dei casellari giudiziali di tutti i membri dell'organo amministrativo
+del Proponente e della delibera di aumento di capitale, il progetto non potra' essere pubblicato.</p>
+{votes_html}
+<h2>Delibera</h2>
+<p>Il Consiglio, dopo ampio confronto, <strong>DELIBERA: {esc(outcome_label)}</strong>.</p>
+<p>{esc(fields.get('summary') or '').replace(chr(10), '<br>')}</p>
+<h2>Condizioni</h2>
+<p>{esc(fields.get('conditions') or 'Nessuna condizione.').replace(chr(10), '<br>')}</p>
+<p>Letto, approvato e sottoscritto. La seduta e' sciolta.</p>
+<h2>Firme</h2>
+<p class="muted">Il Presidente _____________________ &nbsp;&nbsp; Il Segretario _____________________</p>
+"""
+    return practice_doc_shell(round_label, practice, sections, ai_generated=False)
+
+
+def build_advisory_html(practice, fields, cvoi):
+    """Parere Advisory Committee non vincolante (fedele al template)."""
+    outcome_label = ADVISORY_OUTCOME_LABELS.get(fields.get("outcome"), fields.get("outcome"))
+    sections = f"""
+<h2>1. Premessa e perimetro del presente parere</h2>
+<p>Il presente documento costituisce il parere dell'Advisory Committee, reso ai sensi della procedura di selezione
+(Allegato 5.1), ed e' <strong>obbligatorio ma non vincolante</strong> ai fini delle determinazioni del Consiglio di
+Amministrazione.</p>
+<h2>2. Riferimenti procedurali e documentazione esaminata</h2>
+<p>L'Advisory Committee ha esaminato il fascicolo e la documentazione istruttoria predisposti dal team interno e il
+verbale di valutazione del Comitato Valutazione Opportunita' di Investimento (CVOI), con autonomia e indipendenza di
+giudizio, con particolare riguardo ai profili di conflitto di interessi e alla coerenza/correttezza/completezza delle
+informazioni chiave sull'investimento.</p>
+<h2>3. Sintesi dell'esito del First Screening (CVOI)</h2>
+{_cvoi_summary_html(cvoi)}
+<h2>4. Valutazioni qualitative e profili di rischio</h2>
+<p>{esc(fields.get('summary') or 'Si rinvia alle note di valutazione del CVOI.').replace(chr(10), '<br>')}</p>
+<h2>5. Verifiche di processo: conflitti di interesse e coerenza informativa</h2>
+<p>All'esito dell'esame dei materiali ricevuti, l'Advisory Committee non ha rilevato, allo stato, profili ostativi o
+incompatibilita' tali da suggerire il rigetto dell'iniziativa per ragioni di conflitto di interessi; resta ferma la
+necessita' che il CdA, con il supporto del Responsabile delle funzioni di controllo, espleti le valutazioni finali.</p>
+<h2>6. Osservazioni e raccomandazioni al CdA (parere non vincolante)</h2>
+<p>L'Advisory Committee esprime <strong>{esc(outcome_label)}</strong>. Si raccomanda al CdA di prendere atto del
+superamento della soglia minima di First Screening e di condizionare l'eventuale pubblicazione all'acquisizione
+integrale della documentazione richiesta e, in particolare, all'invio del casellario giudiziale di tutti i membri
+dell'organo amministrativo del Proponente.</p>
+<p>{esc(fields.get('conditions') or '').replace(chr(10), '<br>')}</p>
+<h2>7. Conclusione</h2>
+<p>Il presente parere e' reso in forma non vincolante e viene trasmesso al CdA unitamente al fascicolo di valutazione
+e alle tabelle di punteggio, per le determinazioni di competenza.</p>
+<h2>Per l'Advisory Committee</h2>
+<p class="muted">{esc(fields.get('attendees') or '').replace(chr(10), '<br>') or '_____________________ &nbsp; _____________________'}</p>
+"""
+    return practice_doc_shell("Advisory Committee - parere non vincolante al CdA", practice, sections, ai_generated=False)
+
+
+CONDITION_STATUS_LABELS = {
+    "aperta": "Aperta",
+    "in_corso": "In lavorazione",
+    "soddisfatta": "Soddisfatta",
+    "non_applicabile": "Non piu' applicabile",
+}
+
+
+def build_campaign_review_html(practice, review):
+    js = {}
+    try:
+        js = json.loads(practice["dossier_json"] or "{}")
+    except (ValueError, TypeError):
+        js = {}
+    offerta = (js.get("dati_struttura") or {}).get("offertaFase1") or {}
+    sections = f"""
+<h2>1. Oggetto</h2>
+<p>Revisione della pagina campagna del progetto {esc(practice['project_title'])} ai fini della pubblicazione.</p>
+<h2>2. Controlli di coerenza</h2>
+<table>
+  <tr><th>Coerenza con KIIS</th><td>Da confermare</td></tr>
+  <tr><th>Coerenza con delibera aumento capitale</th><td>Da confermare</td></tr>
+  <tr><th>Coerenza con business plan</th><td>Da confermare</td></tr>
+  <tr><th>Equity / strumento dichiarati</th><td>{esc(offerta.get('equity') or '-')} / {esc(offerta.get('strumento') or '-')}</td></tr>
+  <tr><th>Assenza di promesse di rendimento</th><td>{'Verificata' if review and review['no_yield_promise'] else 'Da verificare'}</td></tr>
+</table>
+<h2>3. Note di revisione</h2>
+<p>{esc((review['coherence_notes'] if review else '') or 'Nessuna nota.').replace(chr(10), '<br>')}</p>
+<h2>4. Esito</h2>
+<p><strong>{esc((review['review_status'] if review else 'bozza').replace('_', ' '))}</strong></p>
+"""
+    return practice_doc_shell("Report revisione pagina campagna", practice, sections)
+
+
+def build_practice_report_html(conn, practice):
+    pid = practice["id"]
+    docs = conn.execute("SELECT * FROM practice_documents WHERE practice_id = ? ORDER BY phase, id", (pid,)).fetchall()
+    reviews = conn.execute("SELECT * FROM internal_reviews WHERE practice_id = ?", (pid,)).fetchall()
+    cvoi = conn.execute("SELECT * FROM cvoi_reports WHERE practice_id = ? ORDER BY id DESC LIMIT 1", (pid,)).fetchone()
+    decisions = conn.execute("SELECT * FROM practice_board_decisions WHERE practice_id = ? ORDER BY decision_round", (pid,)).fetchall()
+    advisory = conn.execute("SELECT * FROM advisory_opinions WHERE practice_id = ? ORDER BY id DESC LIMIT 1", (pid,)).fetchone()
+    conds = conn.execute("SELECT * FROM pre_golive_conditions WHERE practice_id = ? ORDER BY priority, id", (pid,)).fetchall()
+    history = conn.execute("SELECT * FROM practice_status_history WHERE practice_id = ? ORDER BY id", (pid,)).fetchall()
+
+    doc_rows = "".join(
+        f"<tr><td>{esc((d['phase'] or '').upper())}</td><td>{esc(d['label'])}</td><td>{esc(DOC_STATUS_LABELS.get(d['doc_status'], d['doc_status']))}</td></tr>"
+        for d in docs
+    )
+    review_rows = "".join(
+        f"<tr><td>{esc(INTERNAL_REVIEW_LABELS.get(r['review_type'], r['review_type']))}</td><td>{esc(r['review_status'].replace('_',' '))}</td></tr>"
+        for r in reviews
+    ) or "<tr><td colspan='2' class='muted'>Nessuna relazione generata.</td></tr>"
+    cvoi_html = (
+        f"<p>Esito: <strong>{esc(CVOI_OUTCOME_LABELS.get(cvoi['outcome'], cvoi['outcome']))}</strong> &middot; punteggio {cvoi['weighted_score']:g} / soglia {CVOI_OVERALL_THRESHOLD:g} &middot; stato {esc(cvoi['review_status'])}</p>"
+        if cvoi else "<p class='muted'>Report CVOI non generato.</p>"
+    )
+    dec_rows = "".join(
+        f"<tr><td>{'Prima' if d['decision_round']==1 else 'Seconda'} delibera</td><td>{esc(DECISION_OUTCOME_LABELS.get(d['outcome'], d['outcome']))}</td><td>{esc(d['meeting_date'] or '-')}</td></tr>"
+        for d in decisions
+    ) or "<tr><td colspan='3' class='muted'>Nessuna delibera.</td></tr>"
+    adv_html = (
+        f"<p>Parere (non vincolante): <strong>{esc(ADVISORY_OUTCOME_LABELS.get(advisory['outcome'], advisory['outcome']))}</strong></p>"
+        if advisory else "<p class='muted'>Parere Advisory non espresso.</p>"
+    )
+    cond_rows = "".join(
+        f"<tr><td>{esc(c['description'])}</td><td>{esc(c['priority'])}</td><td>{esc(CONDITION_STATUS_LABELS.get(c['cond_status'], c['cond_status']))}</td></tr>"
+        for c in conds
+    ) or "<tr><td colspan='3' class='muted'>Nessuna condizione.</td></tr>"
+    hist_rows = "".join(
+        f"<tr><td>{esc((h['created_at'] or '')[:16])}</td><td>{esc(practice_status_label(h['to_status']))}</td><td>{esc(h['notes'] or '')}</td></tr>"
+        for h in history
+    ) or "<tr><td colspan='3' class='muted'>-</td></tr>"
+
+    sections = f"""
+<h2>Dati offerta</h2>
+<table>
+  <tr><th>Proponente</th><td>{esc(practice['proponent_name'] or '-')}</td></tr>
+  <tr><th>Strumento</th><td>{esc(practice['instrument'] or '-')}</td></tr>
+  <tr><th>Target / Massimo</th><td>{money(practice['target_amount'])} / {money(practice['max_amount'])}</td></tr>
+  <tr><th>Pre-money / Equity</th><td>{money(practice['pre_money'])} / {esc(practice['equity_percent'] or '-')}</td></tr>
+  <tr><th>Stato pratica</th><td>{esc(practice_status_label(practice['status']))}</td></tr>
+</table>
+<h2>Verifica documentale</h2>
+<table><tr><th>Fase</th><th>Documento</th><th>Stato</th></tr>{doc_rows}</table>
+<h2>Verifiche interne</h2>
+<table><tr><th>Relazione</th><th>Stato</th></tr>{review_rows}</table>
+<h2>CVOI</h2>
+{cvoi_html}
+<h2>Delibere CdA</h2>
+<table><tr><th>Organo</th><th>Esito</th><th>Data</th></tr>{dec_rows}</table>
+<h2>Advisory Committee</h2>
+{adv_html}
+<h2>Condizioni pre go-live</h2>
+<table><tr><th>Condizione</th><th>Priorita'</th><th>Stato</th></tr>{cond_rows}</table>
+<h2>Storico stati</h2>
+<table><tr><th>Data</th><th>Stato</th><th>Note</th></tr>{hist_rows}</table>
+"""
+    return practice_doc_shell(f"Fascicolo istruttorio - {practice['project_title']}", practice, sections, ai_generated=False)
 
 
 def build_opinion_html(deal, committee, reviewer, outcome, summary):
@@ -1954,6 +3278,16 @@ class App(BaseHTTPRequestHandler):
             self.page_deal_detail(int(path.rsplit("/", 1)[1]))
         elif re.fullmatch(r"/deals/\d+/report", path):
             self.page_deal_report(int(path.split("/")[2]))
+        elif path == "/pariter/comitato-tecnico":
+            self.page_comitato_tecnico()
+        elif path == "/pariter/practices/import":
+            self.page_practice_import()
+        elif re.fullmatch(r"/pariter/practices/\d+", path):
+            self.page_practice_detail(int(path.rsplit("/", 1)[1]))
+        elif re.fullmatch(r"/pariter/practices/\d+/report", path):
+            self.page_practice_report(int(path.split("/")[3]))
+        elif re.fullmatch(r"/pariter/practices/\d+/export", path):
+            self.export_practice_zip(int(path.split("/")[3]))
         elif path == "/compagine":
             self.page_compagine()
         elif path == "/governance":
@@ -2010,6 +3344,38 @@ class App(BaseHTTPRequestHandler):
                 self.post_deal_upload(int(path.split("/")[2]), form, files)
             elif re.fullmatch(r"/deals/\d+/generate-report", path):
                 self.post_generate_report(int(path.split("/")[2]), form)
+            elif path == "/pariter/practices/import":
+                self.post_practice_import(form, files)
+            elif re.fullmatch(r"/pariter/practices/\d+/document-status", path):
+                self.post_practice_document_status(int(path.split("/")[3]), form)
+            elif re.fullmatch(r"/pariter/practices/\d+/phase", path):
+                self.post_practice_phase(int(path.split("/")[3]), form)
+            elif re.fullmatch(r"/pariter/practices/\d+/document-upload", path):
+                self.post_practice_document_upload(int(path.split("/")[3]), form, files)
+            elif re.fullmatch(r"/pariter/practices/\d+/internal-review", path):
+                self.post_practice_internal_review(int(path.split("/")[3]), form)
+            elif re.fullmatch(r"/pariter/practices/\d+/integration-request", path):
+                self.post_practice_integration_request(int(path.split("/")[3]), form)
+            elif re.fullmatch(r"/pariter/practices/\d+/alert", path):
+                self.post_practice_alert(int(path.split("/")[3]), form)
+            elif re.fullmatch(r"/pariter/practices/\d+/cvoi", path):
+                self.post_practice_cvoi(int(path.split("/")[3]), form)
+            elif re.fullmatch(r"/pariter/practices/\d+/cvoi-member", path):
+                self.post_practice_cvoi_member(int(path.split("/")[3]), form)
+            elif re.fullmatch(r"/pariter/practices/\d+/close", path):
+                self.post_practice_close(int(path.split("/")[3]), form)
+            elif re.fullmatch(r"/pariter/practices/\d+/board-decision", path):
+                self.post_practice_board_decision(int(path.split("/")[3]), form)
+            elif re.fullmatch(r"/pariter/practices/\d+/advisory", path):
+                self.post_practice_advisory(int(path.split("/")[3]), form)
+            elif re.fullmatch(r"/pariter/practices/\d+/advisory-member", path):
+                self.post_practice_advisory_member(int(path.split("/")[3]), form)
+            elif re.fullmatch(r"/pariter/practices/\d+/condition", path):
+                self.post_practice_condition(int(path.split("/")[3]), form)
+            elif re.fullmatch(r"/pariter/practices/\d+/transition", path):
+                self.post_practice_transition(int(path.split("/")[3]), form)
+            elif re.fullmatch(r"/pariter/practices/\d+/campaign-review", path):
+                self.post_practice_campaign_review(int(path.split("/")[3]), form)
             elif path == "/proponents/create":
                 self.post_proponent_create(form)
             elif re.fullmatch(r"/proponents/\d+/update", path):
@@ -2164,6 +3530,9 @@ class App(BaseHTTPRequestHandler):
             ("Documenti", "/documents", "documents"),
             ("Assistente IA", "/assistant", "assistant"),
         ]
+        # Voce dedicata ai membri del Comitato Tecnico (solo Pariter).
+        if ctx["platform_id"] == 1 and ctx["user"]["role"] in {"technical_committee", "admin"}:
+            nav_items.insert(5, ("Comitato Tecnico", "/pariter/comitato-tecnico", "comitato_tecnico"))
         nav = "".join(
             f'<a class="nav-link {"active" if key == active else ""}" href="{rel_url(href, ctx)}">{label}</a>'
             for label, href, key in nav_items
@@ -2750,6 +4119,9 @@ document.querySelectorAll('[data-campaign-form]').forEach((form) => {
     def page_deals(self):
         ctx = self.get_ctx()
         pid = ctx["platform_id"]
+        if pid == 1:  # Pariter: hub istruttoria/in corso/conclusi
+            self.page_pariter_hub(ctx)
+            return
         deals = rows(
             """
             SELECT d.*, p.name AS proponent_name,
@@ -2796,6 +4168,1685 @@ document.querySelectorAll('[data-campaign-form]').forEach((form) => {
 </section>
 """
         self.render("Deal", body, "deals")
+
+    # ===================== Istruttoria Pariter =====================
+
+    def page_pariter_hub(self, ctx):
+        pid = ctx["platform_id"]
+        practices = rows(
+            """
+            SELECT pr.*,
+                (SELECT COUNT(*) FROM practice_alerts a
+                   WHERE a.practice_id = pr.id AND a.severity = 'bloccante' AND a.alert_status = 'aperto') AS blocking_alerts,
+                (SELECT COUNT(*) FROM practice_alerts a
+                   WHERE a.practice_id = pr.id AND a.severity = 'non_bloccante' AND a.alert_status = 'aperto') AS soft_alerts,
+                (SELECT COUNT(*) FROM practice_documents d
+                   WHERE d.practice_id = pr.id AND d.required = 1 AND d.doc_status IN ('mancante','da_integrare')) AS missing_docs
+            FROM practices pr
+            WHERE pr.platform_id = ?
+            ORDER BY pr.updated_at DESC
+            """,
+            (pid,),
+        )
+        buckets = {"istruttoria": [], "in_corso": [], "conclusi": []}
+        for pr in practices:
+            buckets[practice_bucket(pr["status"])].append(pr)
+        vista = (self.get_query_param("vista") or "istruttoria")
+        if vista not in buckets:
+            vista = "istruttoria"
+        tab_defs = [
+            ("istruttoria", "In istruttoria"),
+            ("in_corso", "In corso"),
+            ("conclusi", "Conclusi"),
+        ]
+        tabs = "".join(
+            f'<a class="subtab {"active" if key == vista else ""}" '
+            f'href="{rel_url("/deals", ctx, {"vista": key})}">{label} ({len(buckets[key])})</a>'
+            for key, label in tab_defs
+        )
+        selected = buckets[vista]
+        if selected:
+            body_rows = "".join(
+                f"""<tr>
+                  <td><a href="{rel_url('/pariter/practices/' + str(pr['id']), ctx)}"><strong>{esc(pr['project_title'])}</strong></a></td>
+                  <td>{esc(pr['proponent_name'] or '-')}</td>
+                  <td><span class="badge {badge_class(practice_status_label(pr['status']))}">{esc(practice_status_label(pr['status']))}</span></td>
+                  <td>{('<span class="badge danger">' + str(pr['blocking_alerts']) + ' bloc.</span>') if pr['blocking_alerts'] else '-'}{(' <span class="badge warning">' + str(pr['soft_alerts']) + '</span>') if pr['soft_alerts'] else ''}</td>
+                  <td>{esc(pr['missing_docs'] or 0)}</td>
+                  <td class="muted">{esc(next_step_summary(pr['status']))}</td>
+                  <td class="muted">{esc((pr['updated_at'] or '')[:10])}</td>
+                  <td><a class="button tiny" href="{rel_url('/pariter/practices/' + str(pr['id']), ctx)}">Apri fascicolo</a></td>
+                </tr>"""
+                for pr in selected
+            )
+            table = f"""
+  <table class="data-table compact">
+    <thead><tr><th>Progetto</th><th>Proponente</th><th>Stato</th><th>Alert</th><th>Doc mancanti</th><th>Prossimo step</th><th>Aggiornato</th><th></th></tr></thead>
+    <tbody>{body_rows}</tbody>
+  </table>"""
+        else:
+            table = '<p class="muted" style="padding:14px 2px;">Nessuna pratica in questa vista.</p>'
+        body = f"""
+<section class="panel">
+  <div class="section-head">
+    <h2>Deal e istruttoria</h2>
+    <a class="button primary" href="{rel_url('/pariter/practices/import', ctx)}">Importa dossier</a>
+  </div>
+  <div class="subtabs">{tabs}</div>
+  {table}
+</section>
+"""
+        self.render("Deal", body, "deals")
+
+    def page_comitato_tecnico(self):
+        ctx = self.get_ctx()
+        if ctx["platform_id"] != 1:
+            self.redirect("/deals", ctx, "Il Comitato Tecnico e' attivo solo su Pariter Equity.")
+            return
+        if not user_can(ctx["user"], "view_comitato_tecnico"):
+            self.redirect("/", ctx, "Area riservata ai membri del Comitato Tecnico.")
+            return
+        practices = rows(
+            """
+            SELECT pr.*, cr.workflow_status AS cvoi_status, cr.weighted_score AS cvoi_score
+            FROM practices pr
+            LEFT JOIN cvoi_reports cr ON cr.practice_id = pr.id
+            WHERE pr.platform_id = 1 AND (pr.status = 'pronto_cvoi' OR cr.id IS NOT NULL)
+            ORDER BY pr.updated_at DESC
+            """,
+        )
+        if practices:
+            body_rows = "".join(
+                f"""<tr>
+                  <td><a href="{rel_url('/pariter/practices/' + str(pr['id']), ctx, {'tab': 'cvoi'})}"><strong>{esc(pr['project_title'])}</strong></a></td>
+                  <td>{esc(pr['proponent_name'] or '-')}</td>
+                  <td><span class="badge {badge_class(practice_status_label(pr['status']))}">{esc(practice_status_label(pr['status']))}</span></td>
+                  <td>{esc((pr['cvoi_status'] or 'da redigere'))}{(' &middot; ' + format(pr['cvoi_score'], 'g')) if pr['cvoi_score'] else ''}</td>
+                  <td><a class="button tiny" href="{rel_url('/pariter/practices/' + str(pr['id']), ctx, {'tab': 'cvoi'})}">Apri CVOI</a>
+                      <a class="button tiny" href="{rel_url('/pariter/practices/' + str(pr['id']), ctx, {'tab': 'documentale'})}">Dossier</a></td>
+                </tr>"""
+                for pr in practices
+            )
+            table = f"""<table class="data-table compact">
+    <thead><tr><th>Progetto</th><th>Proponente</th><th>Stato pratica</th><th>CVOI</th><th></th></tr></thead>
+    <tbody>{body_rows}</tbody></table>"""
+        else:
+            table = '<p class="muted" style="padding:14px 2px;">Nessuna pratica in valutazione dal Comitato Tecnico.</p>'
+        body = f"""
+<section class="panel">
+  <div class="section-head"><h2>Comitato Tecnico - pratiche in valutazione</h2></div>
+  <p class="muted">Pratiche per cui le verifiche interne Pariter sono validate e il dossier e' pronto per la valutazione CVOI.</p>
+  {table}
+</section>"""
+        self.render("Comitato Tecnico", body, "comitato_tecnico")
+
+    def get_query_param(self, name):
+        params = parse_qs(urlparse(self.path).query)
+        return (params.get(name) or [""])[0]
+
+    def get_practice(self, practice_id):
+        return row("SELECT * FROM practices WHERE id = ?", (practice_id,))
+
+    def recall_documents_html(self, ctx, practice, origins, title="Documenti richiamati per la valutazione"):
+        placeholders = ",".join("?" for _ in origins)
+        docs = rows(
+            f"SELECT * FROM documents WHERE practice_id = ? AND origin IN ({placeholders}) ORDER BY id",
+            (practice["id"], *origins),
+        )
+        if not docs:
+            body = '<p class="muted">Nessun documento delle fasi precedenti disponibile.</p>'
+        else:
+            items = "".join(
+                f'<li><span class="muted">[{esc(d["origin"])}]</span> {esc(d["title"])} '
+                f'<a class="button tiny" href="{rel_url("/documents/" + str(d["id"]) + "/download", ctx)}">Apri</a></li>'
+                for d in docs
+            )
+            body = f'<ul class="clean-list">{items}</ul>'
+        return f'<section class="panel"><div class="section-head"><h2>{esc(title)}</h2></div>{body}</section>'
+
+    def render_practice_shell(self, ctx, practice, active_tab, inner):
+        nav = "".join(
+            f'<a class="subtab {"active" if key == active_tab else ""}" '
+            f'href="{rel_url("/pariter/practices/" + str(practice["id"]), ctx, {"tab": key})}">{label}</a>'
+            for key, label in PRACTICE_TABS
+        )
+        st = practice["status"]
+        closed = practice["closed_at"] if "closed_at" in practice.keys() else ""
+        closed_banner = (f'<div class="ai-flag" style="color:var(--red);border-color:#d8b3b0;background:#f7ecea">'
+                         f'Pratica chiusa il {esc((closed or "")[:16])} - sola lettura. Le azioni sono disabilitate.</div>'
+                         if closed else "")
+        header = f"""
+{closed_banner}
+<section class="panel">
+  <div class="section-head">
+    <div>
+      <h2 style="margin:0">{esc(practice['project_title'])}</h2>
+      <p class="muted" style="margin:4px 0 0">{esc(practice['proponent_name'] or '-')} &middot; pratica #{practice['id']}</p>
+    </div>
+    <div class="header-badges">
+      <span class="badge {badge_class(practice_status_label(st))}">{esc(practice_status_label(st))}</span>
+      <a class="button tiny" href="{rel_url('/pariter/practices/' + str(practice['id']) + '/report', ctx)}">Report fascicolo</a>
+      <a class="button tiny" href="{rel_url('/pariter/practices/' + str(practice['id']) + '/export', ctx)}">Export ZIP</a>
+    </div>
+  </div>
+  <div class="meta-grid">
+    <div><span class="muted">Strumento</span><br>{esc(practice['instrument'] or '-')}</div>
+    <div><span class="muted">Target</span><br>{money(practice['target_amount'])}</div>
+    <div><span class="muted">Massimo</span><br>{money(practice['max_amount'])}</div>
+    <div><span class="muted">Pre-money</span><br>{money(practice['pre_money'])}</div>
+    <div><span class="muted">Equity offerta</span><br>{esc(practice['equity_percent'] or '-')}</div>
+    <div><span class="muted">Stato KIIS</span><br>{esc(practice['kiis_state'] or '-')}</div>
+  </div>
+</section>
+<div class="subtabs wrap">{nav}</div>
+{inner}
+"""
+        self.render(practice["project_title"], header, "deals")
+
+    def page_practice_detail(self, practice_id):
+        ctx = self.get_ctx()
+        practice = self.get_practice(practice_id)
+        if not practice or practice["platform_id"] != ctx["platform_id"]:
+            self.not_found()
+            return
+        tab = self.get_query_param("tab") or "riepilogo"
+        if tab not in PRACTICE_TAB_LABELS:
+            tab = "riepilogo"
+        inner = self.practice_tab_body(ctx, practice, tab)
+        self.render_practice_shell(ctx, practice, tab, inner)
+
+    def practice_tab_body(self, ctx, practice, tab):
+        if tab == "riepilogo":
+            return self.practice_tab_riepilogo(ctx, practice)
+        if tab == "documentale":
+            return self.practice_tab_documentale(ctx, practice)
+        if tab == "interne":
+            return self.practice_tab_interne(ctx, practice)
+        if tab == "cvoi":
+            return self.practice_tab_cvoi(ctx, practice)
+        if tab == "cda1":
+            return self.practice_tab_decision(ctx, practice, 1)
+        if tab == "advisory":
+            return self.practice_tab_advisory(ctx, practice)
+        if tab == "cda2":
+            return self.practice_tab_decision(ctx, practice, 2)
+        if tab == "condizioni":
+            return self.practice_tab_condizioni(ctx, practice)
+        if tab == "validazione":
+            return self.practice_tab_validazione(ctx, practice)
+        if tab == "campagna":
+            return self.practice_tab_campagna(ctx, practice)
+        if tab == "storico":
+            return self.practice_tab_storico(ctx, practice)
+        # tab ancora da implementare nelle fasi successive
+        return (
+            f'<section class="panel"><div class="section-head"><h2>{esc(PRACTICE_TAB_LABELS[tab])}</h2></div>'
+            '<p class="muted">Sezione in costruzione.</p></section>'
+        )
+
+    def practice_tab_riepilogo(self, ctx, practice):
+        alerts = rows(
+            "SELECT * FROM practice_alerts WHERE practice_id = ? AND alert_status = 'aperto' ORDER BY severity, id",
+            (practice["id"],),
+        )
+        if alerts:
+            alert_rows = "".join(
+                f'''<li><span class="badge {"danger" if a["severity"]=="bloccante" else "warning"}">{esc(a["severity"])}</span> {esc(a["message"])} <span class="muted">({esc(a["source"])})</span>
+                <form method="post" action="/pariter/practices/{practice['id']}/alert" style="display:inline;float:right">{hidden_ctx(ctx)}<input type="hidden" name="resolve_id" value="{a['id']}"><button class="button tiny" type="submit">Risolvi</button></form></li>'''
+                for a in alerts
+            )
+            alerts_html = f'<ul class="clean-list">{alert_rows}</ul>'
+        else:
+            alerts_html = '<p class="muted">Nessun alert aperto.</p>'
+        add_alert = f"""
+  <form class="inline-form" method="post" action="/pariter/practices/{practice['id']}/alert" style="margin-top:12px">
+    {hidden_ctx(ctx)}
+    <select name="severity"><option value="bloccante">bloccante</option><option value="non_bloccante" selected>non bloccante</option></select>
+    <input name="message" placeholder="Nuovo alert" required>
+    <button class="button tiny" type="submit">Aggiungi</button>
+  </form>"""
+        nxt = next_step_summary(practice["status"])
+        closed = practice["closed_at"] if "closed_at" in practice.keys() else ""
+        if closed:
+            is_admin = ctx["user"]["role"] == "admin"
+            reopen = (f'''<form method="post" action="/pariter/practices/{practice['id']}/close" style="display:inline">
+                {hidden_ctx(ctx)}<input type="hidden" name="action" value="reopen">
+                <button class="button secondary" type="submit">Riapri pratica</button></form>''' if is_admin else "")
+            closure_panel = f"""
+<section class="panel">
+  <div class="section-head"><h2>Pratica chiusa</h2><span class="badge neutral">Sola lettura</span></div>
+  <div class="meta-grid">
+    <div><span class="muted">Esito finale</span><br>{esc(practice['closure_outcome'] or '-')}</div>
+    <div><span class="muted">Chiusa il</span><br>{esc((closed or '')[:16])}</div>
+  </div>
+  <p>{esc(practice['closure_note'] or '').replace(chr(10), '<br>')}</p>
+  <div class="form-actions">{reopen}</div>
+</section>"""
+        elif user_can(ctx["user"], "close_practice"):
+            closure_panel = f"""
+<section class="panel">
+  <div class="section-head"><h2>Chiusura / finalizzazione pratica</h2></div>
+  <p class="muted">La chiusura archivia la pratica e ne blocca le modifiche (resta consultabile ed esportabile).</p>
+  <form class="form-grid" method="post" action="/pariter/practices/{practice['id']}/close">
+    {hidden_ctx(ctx)}<input type="hidden" name="action" value="close">
+    <label>Esito finale<select name="closure_outcome"><option>Pubblicata / conclusa</option><option>Respinta</option><option>Archiviata senza seguito</option><option>Ritirata dal proponente</option></select></label>
+    <label class="span2">Nota di chiusura<textarea name="closure_note" rows="2"></textarea></label>
+    <div class="form-actions"><button class="button primary" type="submit">Chiudi pratica</button></div>
+  </form>
+</section>"""
+        else:
+            closure_panel = ""
+        return f"""
+<section class="panel">
+  <div class="section-head"><h2>Riepilogo pratica</h2></div>
+  <div class="meta-grid">
+    <div><span class="muted">Stato</span><br><span class="badge {badge_class(practice_status_label(practice['status']))}">{esc(practice_status_label(practice['status']))}</span></div>
+    <div><span class="muted">Prossimo step</span><br>{esc(nxt)}</div>
+    <div><span class="muted">Origine dati</span><br>{esc(practice['source_system'] or '-')}</div>
+    <div><span class="muted">Responsabile interno</span><br>{esc(practice['internal_owner'] or '-')}</div>
+    <div><span class="muted">Creata</span><br>{esc((practice['created_at'] or '')[:16])}</div>
+    <div><span class="muted">Aggiornata</span><br>{esc((practice['updated_at'] or '')[:16])}</div>
+  </div>
+</section>
+<section class="panel">
+  <div class="section-head"><h2>Alert aperti</h2></div>
+  {alerts_html}
+  {add_alert}
+</section>
+{closure_panel}
+"""
+
+    def practice_tab_storico(self, ctx, practice):
+        history = rows(
+            """
+            SELECT h.*, u.name AS actor_name
+            FROM practice_status_history h
+            LEFT JOIN users u ON u.id = h.actor_id
+            WHERE h.practice_id = ?
+            ORDER BY h.id DESC
+            """,
+            (practice["id"],),
+        )
+        if not history:
+            inner = '<p class="muted">Nessun passaggio di stato registrato.</p>'
+        else:
+            items = "".join(
+                f"""<tr>
+                  <td class="muted">{esc((h['created_at'] or '')[:16])}</td>
+                  <td>{esc(practice_status_label(h['from_status']) if h['from_status'] else '-')} &rarr; <strong>{esc(practice_status_label(h['to_status']))}</strong></td>
+                  <td>{esc(h['actor_name'] or '-')}</td>
+                  <td>{esc(h['notes'] or '')}</td>
+                </tr>"""
+                for h in history
+            )
+            inner = f"""<table class="data-table compact">
+    <thead><tr><th>Data</th><th>Transizione</th><th>Utente</th><th>Note</th></tr></thead>
+    <tbody>{items}</tbody></table>"""
+        return f'<section class="panel"><div class="section-head"><h2>Storico stati</h2></div>{inner}</section>'
+
+    def practice_tab_documentale(self, ctx, practice):
+        pid = practice["id"]
+        phase_order = ["fase1", "fase2", "fase3", "fase4"]
+        phase_labels = {"fase1": "Fase 1 - Onboarding", "fase2": "Fase 2 - Offerta",
+                        "fase3": "Fase 3 - KIIS", "fase4": "Fase 4 - Pre go-live"}
+        phase_state = {r["phase"]: r["status"] for r in rows(
+            "SELECT phase, status FROM practice_phases WHERE practice_id = ?", (pid,)
+        )}
+        for ph in phase_order:
+            phase_state.setdefault(ph, "da_completare")
+        dtab = self.get_query_param("dtab") or "fase1"
+        if dtab not in phase_order:
+            dtab = "fase1"
+        # sotto-schede orizzontali per fase, con spunta di completamento
+        sub = ""
+        for i, ph in enumerate(phase_order):
+            done = phase_state[ph] == "completata"
+            prev_done = i == 0 or phase_state[phase_order[i - 1]] == "completata"
+            mark = " &check;" if done else ("" if prev_done else " &middot;")
+            sub += (f'<a class="subtab {"active" if ph == dtab else ""}" '
+                    f'href="{rel_url("/pariter/practices/" + str(pid), ctx, {"tab": "documentale", "dtab": ph})}">'
+                    f'{esc(phase_labels[ph])}{mark}</a>')
+
+        docs = rows("SELECT * FROM practice_documents WHERE practice_id = ? AND phase = ? ORDER BY id", (pid, dtab))
+        doc_rows = ""
+        for d in docs:
+            status_opts = "".join(
+                f'<option value="{k}"{" selected" if k == d["doc_status"] else ""}>{esc(v)}</option>'
+                for k, v in DOC_STATUS_LABELS.items()
+            )
+            link = (
+                f'<a class="button tiny" href="{rel_url("/documents/" + str(d["document_id"]) + "/download", ctx)}">File</a>'
+                if d["document_id"] else '<span class="muted">-</span>'
+            )
+            integ = (
+                '<span class="badge warning">Integraz. richiesta</span>'
+                if d["integration_requested"] else
+                f'''<form method="post" action="/pariter/practices/{pid}/integration-request" style="display:inline">
+                    {hidden_ctx(ctx)}<input type="hidden" name="practice_document_id" value="{d['id']}">
+                    <input type="hidden" name="subject" value="Integrazione: {esc(d['label'])}">
+                    <button class="button tiny" type="submit">Richiedi integrazione</button></form>'''
+            )
+            doc_rows += f"""<tr>
+              <td>{esc(d['label'])}{' <span class="muted">*</span>' if d['required'] else ''}</td>
+              <td>
+                <form method="post" action="/pariter/practices/{pid}/document-status" class="inline-form">
+                  {hidden_ctx(ctx)}<input type="hidden" name="doc_id" value="{d['id']}">
+                  <select name="doc_status">{status_opts}</select>
+                  <input name="reviewer_notes" placeholder="Note revisore" value="{esc(d['reviewer_notes'] or '')}">
+                  <button class="button tiny" type="submit">Salva</button>
+                </form>
+              </td>
+              <td>{link}</td>
+              <td>{integ}</td>
+            </tr>"""
+        if not doc_rows:
+            doc_rows = '<tr><td colspan="4" class="muted">Nessun documento atteso in questa fase.</td></tr>'
+
+        done = phase_state[dtab] == "completata"
+        idx = phase_order.index(dtab)
+        prev_done = idx == 0 or phase_state[phase_order[idx - 1]] == "completata"
+        complete_action = (
+            f'''<form method="post" action="/pariter/practices/{pid}/phase" style="display:inline">
+                {hidden_ctx(ctx)}<input type="hidden" name="phase" value="{dtab}">
+                <input type="hidden" name="status" value="{'da_completare' if done else 'completata'}">
+                <button class="button {'secondary' if done else 'primary'}" type="submit">{'Riapri fase' if done else 'Segna fase completata'}</button></form>'''
+        )
+        phase_badge = (f'<span class="badge success">Completata</span>' if done
+                       else (f'<span class="badge neutral">Da completare</span>' if prev_done
+                             else f'<span class="badge warning">In attesa fase precedente</span>'))
+        unlock_note = ""
+        if not done and idx < 3:
+            nxt = phase_labels[phase_order[idx + 1]]
+            unlock_note = f'<p class="muted">Completando questa fase si sblocca: <strong>{esc(nxt)}</strong> (anche lato proponente nel sistema unico).</p>'
+
+        upload_opts = "".join(
+            f'<option value="{d["id"]}">{esc(d["label"])}</option>' for d in docs
+        )
+        upload = f"""
+<section class="panel">
+  <div class="section-head"><h2>Carica documento ({esc(phase_labels[dtab])})</h2></div>
+  <form class="form-grid" method="post" action="/pariter/practices/{pid}/document-upload" enctype="multipart/form-data">
+    {hidden_ctx(ctx)}
+    <label>Voce checklist<select name="doc_id">{upload_opts}</select></label>
+    <label>File<input type="file" name="file" required></label>
+    <div class="form-actions"><button class="button primary" type="submit">Carica e collega</button></div>
+  </form>
+</section>""" if upload_opts else ""
+        phase_panel = f"""
+<div class="subtabs wrap">{sub}</div>
+<section class="panel">
+  <div class="section-head"><h2>{esc(phase_labels[dtab])}</h2><div class="header-badges">{phase_badge}{complete_action}</div></div>
+  {unlock_note}
+  <table class="data-table compact">
+    <thead><tr><th>Documento</th><th>Stato / note revisore</th><th>File</th><th>Integrazione</th></tr></thead>
+    <tbody>{doc_rows}</tbody>
+  </table>
+</section>"""
+        reqs = rows(
+            "SELECT * FROM integration_requests WHERE practice_id = ? ORDER BY id DESC",
+            (practice["id"],),
+        )
+        if reqs:
+            req_rows = "".join(
+                f"""<tr><td>{esc(r['subject'])}</td><td><span class="badge {badge_class(r['req_status'])}">{esc(r['req_status'])}</span></td>
+                <td class="muted">{esc((r['created_at'] or '')[:10])}</td>
+                <td>{'' if r['req_status']=='chiusa' else f'''<form method="post" action="/pariter/practices/{practice['id']}/integration-request" style="display:inline">{hidden_ctx(ctx)}<input type="hidden" name="close_id" value="{r['id']}"><button class="button tiny" type="submit">Chiudi</button></form>'''}</td></tr>"""
+                for r in reqs
+            )
+            req_panel = f"""
+<section class="panel">
+  <div class="section-head"><h2>Richieste di integrazione</h2></div>
+  <table class="data-table compact"><thead><tr><th>Oggetto</th><th>Stato</th><th>Aperta</th><th></th></tr></thead><tbody>{req_rows}</tbody></table>
+</section>"""
+        else:
+            req_panel = ""
+        return phase_panel + upload + req_panel
+
+    def practice_tab_interne(self, ctx, practice):
+        existing = {r["review_type"]: r for r in rows(
+            "SELECT * FROM internal_reviews WHERE practice_id = ?", (practice["id"],)
+        )}
+        cards = []
+        for rtype, label in INTERNAL_REVIEW_TYPES:
+            rev = existing.get(rtype)
+            status = rev["review_status"] if rev else "non_generata"
+            doc_link = (
+                f'<a class="button tiny" href="{rel_url("/documents/" + str(rev["generated_document_id"]) + "/download", ctx)}">Apri bozza</a>'
+                if rev and rev["generated_document_id"] else ""
+            )
+            validate_btn = (
+                f'''<form method="post" action="/pariter/practices/{practice['id']}/internal-review" style="display:inline">
+                    {hidden_ctx(ctx)}<input type="hidden" name="review_type" value="{rtype}"><input type="hidden" name="action" value="validate">
+                    <button class="button tiny" type="submit">Valida</button></form>'''
+                if rev and rev["review_status"] in {"bozza", "da_integrare"} else ""
+            )
+            cards.append(f"""
+<section class="panel">
+  <div class="section-head">
+    <h2>{esc(label)}</h2>
+    <span class="badge {badge_class(status)}">{esc(status.replace('_',' '))}</span>
+  </div>
+  <p class="muted">{esc(rev['outcome']) if rev and rev['outcome'] else 'Relazione interna generata dai dati del dossier e validata manualmente.'}</p>
+  <div class="form-actions">
+    <form method="post" action="/pariter/practices/{practice['id']}/internal-review" style="display:inline">
+      {hidden_ctx(ctx)}<input type="hidden" name="review_type" value="{rtype}"><input type="hidden" name="action" value="generate">
+      <button class="button {'secondary' if rev else 'primary'}" type="submit">{'Rigenera bozza' if rev else 'Genera bozza (IA)'}</button>
+    </form>
+    {doc_link}
+    {validate_btn}
+  </div>
+</section>""")
+        validated = sum(1 for r in existing.values() if r["review_status"] == "validata")
+        total = len(INTERNAL_REVIEW_TYPES)
+        already_sent = PRACTICE_STATUS_INDEX.get(practice["status"], 0) >= PRACTICE_STATUS_INDEX["pronto_cvoi"]
+        if already_sent:
+            send_panel = '<section class="panel"><p class="badge success">Dossier gia\' inviato al Comitato Tecnico.</p></section>'
+        elif validated >= total:
+            send_panel = f"""
+<section class="panel">
+  <div class="section-head"><h2>Invia al Comitato Tecnico</h2><span class="badge success">{validated}/{total} verifiche validate</span></div>
+  <p class="muted">Le verifiche interne sono complete e validate: il dossier puo' essere trasmesso al Comitato Tecnico per la valutazione CVOI.</p>
+  <form method="post" action="/pariter/practices/{practice['id']}/transition" style="display:inline">
+    {hidden_ctx(ctx)}<input type="hidden" name="target" value="pronto_cvoi">
+    <button class="button primary" type="submit">Invia al Comitato Tecnico</button></form>
+</section>"""
+        else:
+            send_panel = f'<section class="panel"><div class="section-head"><h2>Invia al Comitato Tecnico</h2><span class="badge warning">{validated}/{total} verifiche validate</span></div><p class="muted">Genera e valida tutte le verifiche interne per sbloccare l\'invio.</p></section>'
+        return "".join(cards) + send_panel
+
+    def practice_tab_cvoi(self, ctx, practice):
+        pid = practice["id"]
+        report = row("SELECT * FROM cvoi_reports WHERE practice_id = ? ORDER BY id DESC LIMIT 1", (pid,))
+        saved = {}
+        if report:
+            for s in rows("SELECT area_key, idx, raw_score FROM cvoi_criteria_scores WHERE cvoi_report_id = ?", (report["id"],)):
+                saved[(s["area_key"], s["idx"])] = s["raw_score"]
+        area_fields = ""
+        for n, (key, label, w, mx, thr) in enumerate(CVOI_AREAS, start=1):
+            crit_rows = ""
+            for i, crit in enumerate(CVOI_CRITERIA[key]):
+                val = saved.get((key, i), "")
+                val_str = f"{val:g}" if val != "" else ""
+                crit_rows += f"""
+      <div class="crit-row">
+        <span>{esc(crit)}</span>
+        <input name="raw_{key}_{i}" type="number" min="0" max="{CVOI_CRITERION_MAX}" step="1" value="{val_str}" required>
+      </div>"""
+            area_fields += f"""
+    <fieldset class="cvoi-area-block">
+      <legend>{n}) {esc(label)} &middot; peso {int(w*100)}% &middot; max {int(mx)} &middot; soglia {int(thr)}</legend>
+      {crit_rows}
+    </fieldset>"""
+        summary = ""
+        if report:
+            doc_link = (
+                f'<a class="button tiny" href="{rel_url("/documents/" + str(report["generated_document_id"]) + "/download", ctx)}">Apri verbale CVOI</a>'
+                if report["generated_document_id"] else ""
+            )
+            wf = report["workflow_status"] if "workflow_status" in report.keys() else "bozza"
+            validated = (report["review_status"] == "validato") if "review_status" in report.keys() else False
+            validate_btn = (
+                '<span class="badge success">Validato</span>' if validated else
+                f'''<form method="post" action="/pariter/practices/{pid}/cvoi" style="display:inline">
+                    {hidden_ctx(ctx)}<input type="hidden" name="action" value="validate">
+                    <button class="button tiny" type="submit">Valida verbale</button></form>'''
+            )
+            summary = f"""
+<section class="panel">
+  <div class="section-head"><h2>Esito CVOI</h2><span class="badge {badge_class(CVOI_OUTCOME_LABELS.get(report['outcome'], report['outcome']))}">{esc(CVOI_OUTCOME_LABELS.get(report['outcome'], report['outcome']))}</span></div>
+  <div class="meta-grid">
+    <div><span class="muted">Punteggio ponderato</span><br><strong>{report['weighted_score']:g}</strong> / soglia {CVOI_OVERALL_THRESHOLD:g}</div>
+    <div><span class="muted">Stato redazione</span><br>{esc(wf)}</div>
+  </div>
+  <div class="form-actions">{doc_link} {validate_btn}</div>
+</section>"""
+        rv = lambda k: esc(report[k]) if report and k in report.keys() and report[k] else ""
+        form = f"""
+<section class="panel">
+  <div class="section-head"><h2>Verbale CVOI - scoring per criterio</h2></div>
+  <form method="post" action="/pariter/practices/{pid}/cvoi">
+    {hidden_ctx(ctx)}<input type="hidden" name="action" value="save">
+    <div class="form-grid">
+      <label>Mail proponente<input name="mail" value="{rv('mail')}"></label>
+      <label>Data caricamento<input name="data_caricamento" type="date" value="{rv('data_caricamento')}"></label>
+      <label>Data valutazione<input name="data_valutazione" type="date" value="{rv('data_valutazione')}"></label>
+    </div>
+    {area_fields}
+    <label>Note di valutazione (qualitative)<textarea name="notes_qualitative" rows="5">{rv('notes_qualitative')}</textarea></label>
+    <label>Clausola di chiusura per il CdA<textarea name="closing_note" rows="3">{rv('closing_note')}</textarea></label>
+    <label>Condizioni / note di sintesi<textarea name="conditions" rows="2">{rv('conditions')}</textarea></label>
+    <div class="form-actions"><button class="button primary" type="submit">Calcola e genera verbale</button></div>
+  </form>
+  <p class="muted">Soglia minima complessiva: {CVOI_OVERALL_THRESHOLD:g} = (18&times;0,35)+(21&times;0,35)+(18&times;0,30). Ogni criterio 0-{CVOI_CRITERION_MAX}.</p>
+</section>"""
+        members_panel = self.cvoi_members_panel(ctx, practice, report) if report else ""
+        log_panel = self.cvoi_log_panel(report) if report else ""
+        return summary + members_panel + log_panel + form
+
+    def cvoi_members_panel(self, ctx, practice, report):
+        pid = practice["id"]
+        is_admin = ctx["user"]["role"] == "admin"
+        members = rows("SELECT id, name FROM users WHERE role = 'technical_committee' AND active = 1 ORDER BY id")
+        reviews = {r["user_id"]: r for r in rows("SELECT * FROM cvoi_member_reviews WHERE cvoi_report_id = ?", (report["id"],))}
+        unanime = (report["workflow_status"] == "unanime") if "workflow_status" in report.keys() else False
+        rows_html = ""
+        for m in members:
+            rv = reviews.get(m["id"])
+            status = rv["status"] if rv else "in_attesa"
+            signed = rv["signed_at"] if rv else ""
+            can_act = (m["id"] == ctx["user_id"]) or is_admin
+            badge = {"approvato": "success", "modifica_richiesta": "warning"}.get(status, "neutral")
+            actions = ""
+            if not unanime and can_act:
+                label_sign = "Firma per conto" if (is_admin and m["id"] != ctx["user_id"]) else "Firma e approva"
+                actions = f'''
+                <form method="post" action="/pariter/practices/{pid}/cvoi-member" class="inline-form" style="display:inline">
+                  {hidden_ctx(ctx)}<input type="hidden" name="member_id" value="{m['id']}"><input type="hidden" name="action" value="sign">
+                  <button class="button tiny" type="submit">{label_sign}</button></form>
+                <form method="post" action="/pariter/practices/{pid}/cvoi-member" class="inline-form" style="display:inline">
+                  {hidden_ctx(ctx)}<input type="hidden" name="member_id" value="{m['id']}"><input type="hidden" name="action" value="request_change">
+                  <button class="button tiny" type="submit">Richiedi modifica</button></form>'''
+            rows_html += f"""<tr>
+              <td>{esc(m['name'])}</td>
+              <td><span class="badge {badge}">{esc(status.replace('_',' '))}</span></td>
+              <td class="muted">{esc((signed or '')[:16]) or '-'}</td>
+              <td>{actions}</td>
+            </tr>"""
+        force = ""
+        if is_admin and not unanime:
+            force = f'''<form method="post" action="/pariter/practices/{pid}/cvoi-member" style="display:inline">
+                {hidden_ctx(ctx)}<input type="hidden" name="action" value="force_unanime">
+                <button class="button secondary" type="submit">Forza versione unanime (admin)</button></form>'''
+        head_badge = '<span class="badge success">Versione unanime - firmata da tutti i membri</span>' if unanime else '<span class="badge warning">In revisione - manca l\'unanimita\'</span>'
+        return f"""
+<section class="panel">
+  <div class="section-head"><h2>Comitato Tecnico - approvazioni e firme</h2>{head_badge}</div>
+  <table class="data-table compact">
+    <thead><tr><th>Membro</th><th>Stato</th><th>Firmato il</th><th></th></tr></thead>
+    <tbody>{rows_html}</tbody>
+  </table>
+  <div class="form-actions">{force}</div>
+  <p class="muted">Un membro redige (salva il verbale), gli altri approvano/firmano o chiedono modifica. Quando tutti firmano la versione e' unanime e puo' essere trasmessa al CdA. Ogni nuova modifica azzera le firme.</p>
+</section>"""
+
+    def cvoi_log_panel(self, report):
+        log = rows("SELECT * FROM cvoi_edit_log WHERE cvoi_report_id = ? ORDER BY id DESC", (report["id"],))
+        if not log:
+            return ""
+        items = "".join(
+            f"<tr><td class='muted'>{esc((e['created_at'] or '')[:16])}</td><td>{esc(e['actor_name'] or '-')}</td><td>{esc(e['action'])}</td><td>{esc(e['summary'] or '')}</td></tr>"
+            for e in log
+        )
+        return f"""
+<section class="panel">
+  <div class="section-head"><h2>Storico modifiche e firme</h2></div>
+  <table class="data-table compact"><thead><tr><th>Data</th><th>Autore</th><th>Azione</th><th>Dettaglio</th></tr></thead><tbody>{items}</tbody></table>
+</section>"""
+
+    def practice_tab_decision(self, ctx, practice, round_no):
+        pid = practice["id"]
+        title = "Prima delibera CdA" if round_no == 1 else "Seconda delibera CdA"
+        can_act = user_can(ctx["user"], "board_decision")  # board + admin
+        with connect() as conn:
+            if round_no == 1:
+                locked = not cvoi_is_validated(conn, pid)
+                lock_msg = "Per deliberare serve un Report CVOI approvato dal Comitato Tecnico (versione unanime)."
+                origins = ["CVOI", "Verifiche interne"]
+            else:
+                locked = not advisory_is_unanime(conn, pid)
+                lock_msg = "Per la seconda delibera serve il parere Advisory Committee in versione unanime."
+                origins = ["CVOI", "Delibera CdA 1", "Advisory Committee"]
+            decision = conn.execute(
+                "SELECT * FROM practice_board_decisions WHERE practice_id = ? AND decision_round = ? ORDER BY id DESC LIMIT 1",
+                (pid, round_no),
+            ).fetchone()
+            members = board_members(conn)
+            votes = {}
+            if decision:
+                votes = {v["user_id"]: v for v in conn.execute(
+                    "SELECT * FROM board_member_votes WHERE board_decision_id = ?", (decision["id"],)
+                ).fetchall()}
+        recall = self.recall_documents_html(ctx, practice, origins,
+                                            "Documenti richiamati per la delibera")
+        if locked and not decision:
+            return recall + f'<section class="panel"><div class="section-head"><h2>{esc(title)}</h2></div><p class="muted">{esc(lock_msg)}</p></section>'
+
+        if not decision:
+            open_form = f"""
+<section class="panel">
+  <div class="section-head"><h2>{esc(title)}</h2></div>
+  <p class="muted">Apri la delibera per raccogliere i voti dei consiglieri e finalizzare l'esito.</p>
+  <form class="form-grid" method="post" action="/pariter/practices/{pid}/board-decision">
+    {hidden_ctx(ctx)}<input type="hidden" name="round" value="{round_no}"><input type="hidden" name="action" value="open">
+    <label>Data seduta<input name="meeting_date" type="date"></label>
+    <label class="span2">Ordine del giorno<input name="agenda" value="Valutazione pratica {esc(practice['project_title'])}"></label>
+    <div class="form-actions"><button class="button primary" type="submit" {'disabled' if not can_act else ''}>Apri delibera CdA</button></div>
+  </form>
+</section>"""
+            return recall + open_form
+
+        status = decision["decision_status"] if "decision_status" in decision.keys() else "finalizzata"
+        doc_link = (f'<a class="button tiny" href="{rel_url("/documents/" + str(decision["generated_document_id"]) + "/download", ctx)}">Apri verbale</a>'
+                    if decision["generated_document_id"] else "")
+
+        if status == "in_votazione":
+            # pannello voti membri
+            vrows = ""
+            for m in members:
+                v = votes.get(m["id"])
+                vote = v["vote"] if v else "in_attesa"
+                badge = {"approva": "success", "contrario": "danger", "astenuto": "neutral"}.get(vote, "warning")
+                actions = ""
+                if can_act and ((m["id"] == ctx["user_id"]) or ctx["user"]["role"] == "admin"):
+                    btns = "".join(
+                        f'''<form method="post" action="/pariter/practices/{pid}/board-decision" style="display:inline">
+                        {hidden_ctx(ctx)}<input type="hidden" name="action" value="vote"><input type="hidden" name="round" value="{round_no}">
+                        <input type="hidden" name="member_id" value="{m['id']}"><input type="hidden" name="vote" value="{vk}">
+                        <button class="button tiny" type="submit">{vl}</button></form>'''
+                        for vk, vl in (("approva", "Favorevole"), ("contrario", "Contrario"), ("astenuto", "Astenuto"))
+                    )
+                    actions = btns
+                vrows += f"""<tr><td>{esc(m['name'])}</td><td><span class="badge {badge}">{esc(BOARD_VOTE_LABELS.get(vote, vote))}</span></td><td>{actions}</td></tr>"""
+            outcome_opts = "".join(f'<option value="{k}">{esc(v)}</option>' for k, v in DECISION_OUTCOMES)
+            finalize = ""
+            if can_act:
+                finalize = f"""
+<section class="panel">
+  <div class="section-head"><h2>Finalizza delibera</h2></div>
+  <form class="form-grid" method="post" action="/pariter/practices/{pid}/board-decision">
+    {hidden_ctx(ctx)}<input type="hidden" name="action" value="finalize"><input type="hidden" name="round" value="{round_no}">
+    <label>Presenti<input name="attendees" value="{esc(decision['attendees'] or '')}" placeholder="Consiglieri presenti"></label>
+    <label>Esito deliberato<select name="outcome">{outcome_opts}</select></label>
+    <label class="span2">Motivazione / sintesi<textarea name="summary" rows="3"></textarea></label>
+    <label class="span2">Condizioni (se approvata con condizioni)<textarea name="conditions" rows="2"></textarea></label>
+    <div class="form-actions"><button class="button primary" type="submit">Finalizza e genera verbale</button></div>
+  </form>
+</section>"""
+            panel = f"""
+<section class="panel">
+  <div class="section-head"><h2>{esc(title)} - votazione in corso</h2><span class="badge warning">In votazione</span></div>
+  <table class="data-table compact"><thead><tr><th>Consigliere</th><th>Voto</th><th></th></tr></thead><tbody>{vrows}</tbody></table>
+  <p class="muted">Ogni consigliere esprime il proprio voto; il Presidente o l'amministratore finalizza la delibera. L'esito e i voti finiscono nel verbale.</p>
+</section>{finalize}"""
+            return recall + panel
+
+        # finalizzata o sospesa
+        vsum = ""
+        if votes:
+            vsum = " &middot; ".join(f"{esc(votes[m['id']]['vote'] if m['id'] in votes else 'in_attesa')}" for m in members)
+        outcome_label = DECISION_OUTCOME_LABELS.get(decision["outcome"], decision["outcome"])
+        reopen = ""
+        if status == "sospesa" and can_act:
+            reopen = f'''<form method="post" action="/pariter/practices/{pid}/board-decision" style="display:inline">
+                {hidden_ctx(ctx)}<input type="hidden" name="action" value="reopen"><input type="hidden" name="round" value="{round_no}">
+                <button class="button secondary" type="submit">Riapri votazione (ridelibera)</button></form>'''
+        susp_note = '<p class="muted">Pratica sospesa in attesa di revisioni/integrazioni: carica le integrazioni richieste e ridelibera.</p>' if status == "sospesa" else ""
+        panel = f"""
+<section class="panel">
+  <div class="section-head"><h2>{esc(title)}</h2><span class="badge {badge_class(outcome_label)}">{esc(outcome_label)}</span></div>
+  <p class="muted">Seduta {esc(decision['meeting_date'] or '-')} &middot; voti: {vsum or '-'}</p>
+  <p>{esc(decision['summary'] or '')}</p>
+  {susp_note}
+  <div class="form-actions">{doc_link} {reopen}</div>
+</section>"""
+        return recall + panel
+
+    def practice_tab_advisory(self, ctx, practice):
+        pid = practice["id"]
+        with connect() as conn:
+            locked = board_decision_outcome(conn, pid, 1) not in {"approvata", "approvata_condizioni"}
+            advisory = conn.execute("SELECT * FROM advisory_opinions WHERE practice_id = ? ORDER BY id DESC LIMIT 1", (pid,)).fetchone()
+        recall = self.recall_documents_html(ctx, practice, ["CVOI", "Delibera CdA 1"],
+                                            "Documenti richiamati per il parere")
+        if locked and not advisory:
+            return recall + '<section class="panel"><div class="section-head"><h2>Advisory Committee</h2></div><p class="muted">L\'Advisory Committee interviene dopo una prima delibera CdA positiva (anche con condizioni) e prima della seconda delibera.</p></section>'
+        summary_panel = ""
+        if advisory:
+            wf = advisory["workflow_status"] if "workflow_status" in advisory.keys() else "bozza"
+            doc_link = (f'<a class="button tiny" href="{rel_url("/documents/" + str(advisory["generated_document_id"]) + "/download", ctx)}">Apri parere</a>'
+                        if advisory["generated_document_id"] else "")
+            summary_panel = f"""
+<section class="panel">
+  <div class="section-head"><h2>Parere Advisory</h2><span class="badge {badge_class(ADVISORY_OUTCOME_LABELS.get(advisory['outcome'], advisory['outcome']))}">{esc(ADVISORY_OUTCOME_LABELS.get(advisory['outcome'], advisory['outcome']))}</span></div>
+  <div class="meta-grid"><div><span class="muted">Stato redazione</span><br>{esc(wf)}</div></div>
+  <p class="muted">{esc(advisory['summary'] or '')}</p>
+  <div class="form-actions">{doc_link}</div>
+</section>"""
+        can_draft = user_can(ctx["user"], "advisory_opinion")
+        outcome_opts = "".join(
+            f'<option value="{k}"{" selected" if advisory and advisory["outcome"]==k else ""}>{esc(v)}</option>'
+            for k, v in ADVISORY_OUTCOMES
+        )
+        draft_form = ""
+        if can_draft:
+            draft_form = f"""
+<section class="panel">
+  <div class="section-head"><h2>Redazione parere (non vincolante)</h2></div>
+  <form class="form-grid" method="post" action="/pariter/practices/{pid}/advisory">
+    {hidden_ctx(ctx)}<input type="hidden" name="action" value="save">
+    <label>Data seduta<input name="meeting_date" type="date" value="{esc(advisory['meeting_date']) if advisory else ''}"></label>
+    <label>Componenti<input name="attendees" value="{esc(advisory['attendees']) if advisory else ''}"></label>
+    <label class="span2">Valutazioni e raccomandazioni<textarea name="summary" rows="3">{esc(advisory['summary']) if advisory else ''}</textarea></label>
+    <label>Esito<select name="outcome">{outcome_opts}</select></label>
+    <label class="span2">Note / condizioni<textarea name="conditions" rows="2">{esc(advisory['conditions']) if advisory else ''}</textarea></label>
+    <div class="form-actions"><button class="button primary" type="submit">{'Rigenera parere' if advisory else 'Redigi e genera parere'}</button></div>
+  </form>
+</section>"""
+        members_panel = self.advisory_members_panel(ctx, practice, advisory) if advisory else ""
+        return recall + summary_panel + members_panel + draft_form
+
+    def advisory_members_panel(self, ctx, practice, advisory):
+        pid = practice["id"]
+        is_admin = ctx["user"]["role"] == "admin"
+        members = rows("SELECT id, name FROM users WHERE role = 'covi' AND active = 1 ORDER BY id")
+        reviews = {r["user_id"]: r for r in rows("SELECT * FROM advisory_member_reviews WHERE advisory_opinion_id = ?", (advisory["id"],))}
+        unanime = (advisory["workflow_status"] == "unanime") if "workflow_status" in advisory.keys() else False
+        rows_html = ""
+        for m in members:
+            rv = reviews.get(m["id"])
+            status = rv["status"] if rv else "in_attesa"
+            signed = rv["signed_at"] if rv else ""
+            can_act = (m["id"] == ctx["user_id"]) or is_admin
+            badge = {"approvato": "success", "modifica_richiesta": "warning"}.get(status, "neutral")
+            actions = ""
+            if not unanime and can_act:
+                label_sign = "Firma per conto" if (is_admin and m["id"] != ctx["user_id"]) else "Firma e approva"
+                actions = f'''
+                <form method="post" action="/pariter/practices/{pid}/advisory-member" class="inline-form" style="display:inline">
+                  {hidden_ctx(ctx)}<input type="hidden" name="member_id" value="{m['id']}"><input type="hidden" name="action" value="sign">
+                  <button class="button tiny" type="submit">{label_sign}</button></form>
+                <form method="post" action="/pariter/practices/{pid}/advisory-member" class="inline-form" style="display:inline">
+                  {hidden_ctx(ctx)}<input type="hidden" name="member_id" value="{m['id']}"><input type="hidden" name="action" value="request_change">
+                  <button class="button tiny" type="submit">Richiedi modifica</button></form>'''
+            rows_html += f"""<tr><td>{esc(m['name'])}</td><td><span class="badge {badge}">{esc(status.replace('_',' '))}</span></td><td class="muted">{esc((signed or '')[:16]) or '-'}</td><td>{actions}</td></tr>"""
+        force = ""
+        if is_admin and not unanime:
+            force = f'''<form method="post" action="/pariter/practices/{pid}/advisory-member" style="display:inline">
+                {hidden_ctx(ctx)}<input type="hidden" name="action" value="force_unanime">
+                <button class="button secondary" type="submit">Forza versione unanime (admin)</button></form>'''
+        head_badge = '<span class="badge success">Parere unanime - firmato da tutti i membri</span>' if unanime else '<span class="badge warning">In revisione - manca l\'unanimita\'</span>'
+        return f"""
+<section class="panel">
+  <div class="section-head"><h2>Advisory Committee - approvazioni e firme</h2>{head_badge}</div>
+  <table class="data-table compact"><thead><tr><th>Membro</th><th>Stato</th><th>Firmato il</th><th></th></tr></thead><tbody>{rows_html}</tbody></table>
+  <div class="form-actions">{force}</div>
+  <p class="muted">Come il CVOI: un membro redige, gli altri firmano o chiedono modifica; con tutte le firme il parere e' unanime e abilita la seconda delibera CdA. Ogni modifica azzera le firme.</p>
+</section>"""
+
+    def practice_tab_condizioni(self, ctx, practice):
+        conds = rows("SELECT * FROM pre_golive_conditions WHERE practice_id = ? ORDER BY priority, id", (practice["id"],))
+        if conds:
+            cond_rows = ""
+            for c in conds:
+                status_opts = "".join(
+                    f'<option value="{k}"{" selected" if k == c["cond_status"] else ""}>{esc(v)}</option>'
+                    for k, v in CONDITION_STATUS_LABELS.items()
+                )
+                cond_rows += f"""<tr>
+                  <td>{esc(c['description'])}</td>
+                  <td><span class="badge {'danger' if c['priority']=='bloccante' else 'neutral'}">{esc(c['priority'])}</span></td>
+                  <td class="muted">{esc(c['source'] or '-')} / {esc(c['owner'] or '-')}</td>
+                  <td class="muted">{esc(c['due_date'] or '-')}</td>
+                  <td><form class="inline-form" method="post" action="/pariter/practices/{practice['id']}/condition">{hidden_ctx(ctx)}<input type="hidden" name="cond_id" value="{c['id']}"><select name="cond_status">{status_opts}</select><button class="button tiny" type="submit">Salva</button></form></td>
+                </tr>"""
+            table = f"""<table class="data-table compact">
+    <thead><tr><th>Condizione</th><th>Priorita'</th><th>Fonte / responsabile</th><th>Scadenza</th><th>Stato</th></tr></thead>
+    <tbody>{cond_rows}</tbody></table>"""
+        else:
+            table = '<p class="muted">Nessuna condizione registrata.</p>'
+        add = f"""
+  <form class="form-grid" method="post" action="/pariter/practices/{practice['id']}/condition" style="margin-top:14px">
+    {hidden_ctx(ctx)}
+    <label class="span2">Descrizione<input name="description" required></label>
+    <label>Fonte<input name="source" placeholder="CVOI / Delibera / Advisory"></label>
+    <label>Responsabile<select name="owner"><option>proponente</option><option>Pariter</option><option>notaio</option><option>advisor</option><option>altro</option></select></label>
+    <label>Priorita'<select name="priority"><option value="bloccante">bloccante</option><option value="non_bloccante">non bloccante</option></select></label>
+    <label>Scadenza<input name="due_date" type="date"></label>
+    <div class="form-actions"><button class="button primary" type="submit">Aggiungi condizione</button></div>
+  </form>"""
+        return f'<section class="panel"><div class="section-head"><h2>Condizioni pre go-live</h2></div>{table}{add}</section>'
+
+    def practice_tab_validazione(self, ctx, practice):
+        pid = practice["id"]
+        with connect() as conn:
+            f4_docs = conn.execute(
+                "SELECT * FROM practice_documents WHERE practice_id = ? AND phase = 'fase4' ORDER BY id", (pid,)
+            ).fetchall()
+            blockers = golive_blockers(conn, pid)
+        check_rows = "".join(
+            f"""<tr><td>{esc(d['label'])}</td><td><span class="badge {'success' if d['doc_status']=='verificato' else 'warning'}">{esc(DOC_STATUS_LABELS.get(d['doc_status'], d['doc_status']))}</span></td></tr>"""
+            for d in f4_docs
+        )
+        checklist = f"""<table class="data-table compact"><thead><tr><th>Documento Fase 4</th><th>Stato</th></tr></thead><tbody>{check_rows}</tbody></table>""" if f4_docs else '<p class="muted">Nessun documento Fase 4 in checklist.</p>'
+        if blockers:
+            blk = "".join(f"<li>{esc(b)}</li>" for b in blockers)
+            blockers_html = f'<div class="ai-flag">Requisiti bloccanti aperti:<ul style="margin:6px 0 0">{blk}</ul></div>'
+        else:
+            blockers_html = '<p class="badge success">Nessun requisito bloccante aperto.</p>'
+        status = practice["status"]
+        # azione contestuale in base allo stato
+        action_btn = ""
+        if status in {"in_pre_golive", "da_integrare"}:
+            action_btn = f'''<form method="post" action="/pariter/practices/{pid}/transition" style="display:inline">{hidden_ctx(ctx)}<input type="hidden" name="target" value="pronta_verifica_finale"><button class="button primary" type="submit">Avvia verifica finale</button></form>'''
+        elif status == "pronta_verifica_finale":
+            disabled = " disabled" if blockers else ""
+            action_btn = f'''<form method="post" action="/pariter/practices/{pid}/transition" style="display:inline">{hidden_ctx(ctx)}<input type="hidden" name="target" value="pronta_golive"><button class="button primary" type="submit"{disabled}>Conferma pronta per go-live</button></form>'''
+        elif status == "pronta_golive":
+            action_btn = f'''<form method="post" action="/pariter/practices/{pid}/transition" style="display:inline">{hidden_ctx(ctx)}<input type="hidden" name="target" value="pubblicata"><button class="button primary" type="submit">Autorizza go-live</button></form>'''
+        elif status == "pubblicata":
+            action_btn = '<span class="badge success">Pratica pubblicata - go-live autorizzato</span>'
+        return f"""
+<section class="panel">
+  <div class="section-head"><h2>Validazione pre go-live</h2><span class="badge {badge_class(practice_status_label(status))}">{esc(practice_status_label(status))}</span></div>
+  {blockers_html}
+  <div class="form-actions" style="margin-top:10px">{action_btn}</div>
+</section>
+<section class="panel">
+  <div class="section-head"><h2>Checklist documenti Fase 4</h2></div>
+  {checklist}
+  <p class="muted">Aggiorna gli stati documento dal tab "Verifica documentale".</p>
+</section>"""
+
+    def practice_tab_campagna(self, ctx, practice):
+        review = row("SELECT * FROM campaign_page_reviews WHERE practice_id = ? ORDER BY id DESC LIMIT 1", (practice["id"],))
+        doc_link = ""
+        badge = ""
+        if review:
+            badge = f'<span class="badge {badge_class(review["review_status"])}">{esc(review["review_status"].replace("_"," "))}</span>'
+            if review["generated_document_id"]:
+                doc_link = f'<a class="button tiny" href="{rel_url("/documents/" + str(review["generated_document_id"]) + "/download", ctx)}">Apri report</a>'
+        checked = "checked" if (review and review["no_yield_promise"]) else ""
+        notes_val = esc(review["coherence_notes"]) if review else ""
+        return f"""
+<section class="panel">
+  <div class="section-head"><h2>Revisione pagina campagna</h2>{badge}</div>
+  <p class="muted">Confronto con KIIS, delibera aumento capitale e business plan; verifica assenza di promesse di rendimento e claim non supportati.</p>
+  <form class="form-grid" method="post" action="/pariter/practices/{practice['id']}/campaign-review">
+    {hidden_ctx(ctx)}
+    <label class="span2">Note di coerenza / revisione<textarea name="coherence_notes" rows="4">{notes_val}</textarea></label>
+    <label class="checkbox-row"><input type="checkbox" name="no_yield_promise" value="1" {checked}> Verificata assenza di promesse di rendimento</label>
+    <label>Esito<select name="review_status"><option value="in_revisione">In revisione</option><option value="da_correggere">Da correggere</option><option value="validata">Validata</option></select></label>
+    <div class="form-actions"><button class="button primary" type="submit">Salva e genera report</button>{doc_link}</div>
+  </form>
+</section>"""
+
+    def page_practice_import(self):
+        ctx = self.get_ctx()
+        if ctx["platform_id"] != 1:
+            self.redirect("/deals", ctx, "L'istruttoria Pariter e' disponibile solo per Pariter Equity.")
+            return
+        body = f"""
+<section class="panel narrow">
+  <div class="section-head"><h2>Importa dossier proponente</h2></div>
+  <p class="muted">Carica il pacchetto dossier (.zip) esportato dal software proponente, oppure i singoli file JSON di fase.</p>
+  <form class="form-grid" method="post" action="/pariter/practices/import" enctype="multipart/form-data">
+    {hidden_ctx(ctx)}
+    <label>Pacchetto dossier (.zip)<input type="file" name="dossier_zip" accept=".zip"></label>
+    <label>oppure dati_struttura.json<input type="file" name="struttura_json" accept=".json,application/json"></label>
+    <label>oppure KIIS_dati.json<input type="file" name="kiis_json" accept=".json,application/json"></label>
+    <label>Titolo progetto (se non desumibile)<input name="project_title" placeholder="Lascia vuoto per usare il dato del dossier"></label>
+    <div class="form-actions"><button class="button primary" type="submit">Importa e crea pratica</button></div>
+  </form>
+</section>
+"""
+        self.render("Importa dossier", body, "deals")
+
+    def page_practice_report(self, practice_id):
+        ctx = self.get_ctx()
+        practice = self.get_practice(practice_id)
+        if not practice or practice["platform_id"] != ctx["platform_id"]:
+            self.not_found()
+            return
+        with connect() as conn:
+            report_html = build_practice_report_html(conn, practice)
+        body = f"""
+<section class="panel">
+  <div class="section-head">
+    <h2>Report fascicolo istruttorio</h2>
+    <a class="button tiny" href="{rel_url('/pariter/practices/' + str(practice_id) + '/export', ctx)}">Export ZIP</a>
+  </div>
+  <iframe class="report-frame" srcdoc="{esc(report_html)}"></iframe>
+  <p class="muted">Usa la stampa del browser (Cmd+P) per salvare il report in PDF.</p>
+</section>"""
+        self.render("Report fascicolo", body, "deals")
+
+    def export_practice_zip(self, practice_id):
+        ctx = self.get_ctx()
+        practice = self.get_practice(practice_id)
+        if not practice or practice["platform_id"] != ctx["platform_id"]:
+            self.not_found()
+            return
+        with connect() as conn:
+            report_html = build_practice_report_html(conn, practice)
+            docs = conn.execute(
+                "SELECT * FROM documents WHERE practice_id = ? ORDER BY id", (practice_id,)
+            ).fetchall()
+        buf = io.BytesIO()
+        index = [
+            f"FASCICOLO ISTRUTTORIO PARITER - {practice['project_title']}",
+            f"Proponente: {practice['proponent_name'] or '-'}",
+            f"Stato pratica: {practice_status_label(practice['status'])}",
+            "", "=== DOCUMENTI ===",
+        ]
+        with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
+            zf.writestr("Fascicolo/00_Report_istruttoria.html", report_html)
+            zf.writestr("Fascicolo/dossier_dati.json", practice["dossier_json"] or "{}")
+            for d in docs:
+                src = BASE_DIR / d["storage_path"]
+                arc = f"Fascicolo/{sanitize_filename(d['origin'] or 'doc')}/{d['id']}_{sanitize_filename(d['filename'] or 'documento')}"
+                try:
+                    zf.writestr(arc, src.read_bytes())
+                    index.append(f"  [{d['origin']}] {d['title']} -> {arc}")
+                except OSError:
+                    index.append(f"  [{d['origin']}] {d['title']} (file non disponibile)")
+            zf.writestr("Fascicolo/INDICE.txt", "\n".join(index))
+        data = buf.getvalue()
+        filename = f"Fascicolo_Pariter_{sanitize_filename(practice['proponent_name'] or 'proponente')}_{sanitize_filename(practice['project_title'])}.zip"
+        self.send_response(200)
+        self.send_header("Content-Type", "application/zip")
+        self.send_header("Content-Disposition", f'attachment; filename="{filename}"')
+        self.send_header("Content-Length", str(len(data)))
+        self.end_headers()
+        self.wfile.write(data)
+
+    def post_practice_import(self, form, files):
+        ctx = self.ctx_from_form(form)
+        if ctx["platform_id"] != 1:
+            self.redirect("/deals", ctx, "L'istruttoria Pariter e' disponibile solo per Pariter Equity.")
+            return
+        if not user_can(ctx["user"], "manage_practice"):
+            self.redirect("/deals", ctx, "Ruolo non abilitato all'import dossier.")
+            return
+        zip_item = files.get("dossier_zip")
+        struttura = files.get("struttura_json")
+        kiis = files.get("kiis_json")
+        if zip_item is not None and getattr(zip_item, "filename", ""):
+            dossier = read_dossier_from_zip(zip_item)
+        elif (struttura and getattr(struttura, "filename", "")) or (kiis and getattr(kiis, "filename", "")):
+            dossier = read_dossier_from_json(
+                struttura if (struttura and getattr(struttura, "filename", "")) else None,
+                kiis if (kiis and getattr(kiis, "filename", "")) else None,
+            )
+        else:
+            self.redirect("/pariter/practices/import", ctx, "Carica un pacchetto .zip o almeno un file JSON di fase.")
+            return
+        mapped = map_dossier_to_practice(dossier, ctx["platform_id"], form.get("project_title", ""))
+        with connect() as conn:
+            practice_id = ingest_practice(conn, dossier, mapped, ctx["platform_id"], ctx["user_id"])
+            conn.commit()
+        self.redirect(f"/pariter/practices/{practice_id}", ctx, "Dossier importato: pratica creata.")
+
+    def _practice_guard(self, ctx, practice_id, back_tab="riepilogo", perm="manage_practice", allow_closed=False):
+        practice = self.get_practice(practice_id)
+        if not practice or practice["platform_id"] != ctx["platform_id"]:
+            self.not_found()
+            return None
+        if not user_can(ctx["user"], perm):
+            self.redirect(f"/pariter/practices/{practice_id}", ctx, "Ruolo non abilitato.", {"tab": back_tab})
+            return None
+        closed = practice["closed_at"] if "closed_at" in practice.keys() else ""
+        if closed and not allow_closed:
+            self.redirect(f"/pariter/practices/{practice_id}", ctx, "Pratica chiusa: sola lettura.", {"tab": back_tab})
+            return None
+        return practice
+
+    def post_practice_document_status(self, practice_id, form):
+        ctx = self.ctx_from_form(form)
+        practice = self._practice_guard(ctx, practice_id, "documentale")
+        if not practice:
+            return
+        with connect() as conn:
+            conn.execute(
+                """UPDATE practice_documents SET doc_status = ?, reviewer_notes = ?, updated_by = ?, updated_at = ?
+                   WHERE id = ? AND practice_id = ?""",
+                (form.get("doc_status", "da_verificare"), form.get("reviewer_notes", ""),
+                 ctx["user_id"], now_iso(), int(form["doc_id"]), practice_id),
+            )
+            conn.execute("UPDATE practices SET updated_at = ? WHERE id = ?", (now_iso(), practice_id))
+            log_audit(conn, ctx["platform_id"], ctx["user_id"], "practice", practice_id, "Verifica documentale", form.get("doc_status", ""))
+            conn.commit()
+        self.redirect(f"/pariter/practices/{practice_id}", ctx, "Stato documento aggiornato.", {"tab": "documentale"})
+
+    def post_practice_phase(self, practice_id, form):
+        ctx = self.ctx_from_form(form)
+        practice = self._practice_guard(ctx, practice_id, "documentale")
+        if not practice:
+            return
+        phase = form.get("phase", "")
+        status = "completata" if form.get("status") == "completata" else "da_completare"
+        with connect() as conn:
+            updated = conn.execute(
+                "UPDATE practice_phases SET status = ?, updated_at = ?, updated_by = ? WHERE practice_id = ? AND phase = ?",
+                (status, now_iso(), ctx["user_id"], practice_id, phase),
+            ).rowcount
+            if not updated:
+                conn.execute(
+                    "INSERT INTO practice_phases(practice_id, phase, status, updated_at, updated_by) VALUES (?, ?, ?, ?, ?)",
+                    (practice_id, phase, status, now_iso(), ctx["user_id"]),
+                )
+            conn.execute("UPDATE practices SET updated_at = ? WHERE id = ?", (now_iso(), practice_id))
+            log_audit(conn, ctx["platform_id"], ctx["user_id"], "practice", practice_id, "Completamento fase", f"{phase}: {status}")
+            conn.commit()
+        msg = "Fase segnata come completata." if status == "completata" else "Fase riaperta."
+        self.redirect(f"/pariter/practices/{practice_id}", ctx, msg, {"tab": "documentale", "dtab": phase})
+
+    def post_practice_document_upload(self, practice_id, form, files):
+        ctx = self.ctx_from_form(form)
+        practice = self._practice_guard(ctx, practice_id, "documentale")
+        if not practice:
+            return
+        file_item = files.get("file")
+        if not (file_item and getattr(file_item, "filename", "")):
+            self.redirect(f"/pariter/practices/{practice_id}", ctx, "Nessun file caricato.", {"tab": "documentale"})
+            return
+        doc_row = row("SELECT * FROM practice_documents WHERE id = ? AND practice_id = ?", (int(form["doc_id"]), practice_id))
+        with connect() as conn:
+            document_id = save_uploaded_document(
+                conn, file_item, ctx["platform_id"], None, practice["proponent_id"],
+                "Proponente", (doc_row["phase"] if doc_row else "dossier"),
+                doc_row["label"] if doc_row else file_item.filename, ctx["user_id"],
+            )
+            link_document_practice(conn, document_id, practice_id)
+            conn.execute(
+                """UPDATE practice_documents SET document_id = ?, doc_status = 'da_verificare', updated_by = ?, updated_at = ?
+                   WHERE id = ? AND practice_id = ?""",
+                (document_id, ctx["user_id"], now_iso(), int(form["doc_id"]), practice_id),
+            )
+            log_audit(conn, ctx["platform_id"], ctx["user_id"], "practice", practice_id, "Upload documento pratica", doc_row["label"] if doc_row else "")
+            conn.commit()
+        self.redirect(f"/pariter/practices/{practice_id}", ctx, "Documento caricato e collegato.", {"tab": "documentale"})
+
+    def post_practice_internal_review(self, practice_id, form):
+        ctx = self.ctx_from_form(form)
+        practice = self._practice_guard(ctx, practice_id, "interne")
+        if not practice:
+            return
+        rtype = form.get("review_type", "")
+        action = form.get("action", "generate")
+        if rtype not in INTERNAL_REVIEW_LABELS:
+            self.redirect(f"/pariter/practices/{practice_id}", ctx, "Tipo relazione non valido.", {"tab": "interne"})
+            return
+        with connect() as conn:
+            existing = conn.execute(
+                "SELECT * FROM internal_reviews WHERE practice_id = ? AND review_type = ?", (practice_id, rtype)
+            ).fetchone()
+            if action == "validate":
+                if existing:
+                    conn.execute(
+                        "UPDATE internal_reviews SET review_status = 'validata', updated_by = ?, updated_at = ? WHERE id = ?",
+                        (ctx["user_id"], now_iso(), existing["id"]),
+                    )
+                msg = "Relazione validata."
+            else:  # generate
+                title, html_doc = build_internal_review_html(practice, rtype)
+                document_id = generated_document(
+                    conn, ctx["platform_id"], None, practice["proponent_id"],
+                    "Verifiche interne", "relazione", f"{title} - {practice['project_title']}",
+                    f"{rtype}.html", html_doc, ctx["user_id"],
+                )
+                link_document_practice(conn, document_id, practice_id)
+                if existing:
+                    conn.execute(
+                        "UPDATE internal_reviews SET review_status = 'bozza', generated_document_id = ?, updated_by = ?, updated_at = ? WHERE id = ?",
+                        (document_id, ctx["user_id"], now_iso(), existing["id"]),
+                    )
+                else:
+                    conn.execute(
+                        """INSERT INTO internal_reviews(practice_id, review_type, review_status, generated_document_id, updated_by, updated_at)
+                           VALUES (?, ?, 'bozza', ?, ?, ?)""",
+                        (practice_id, rtype, document_id, ctx["user_id"], now_iso()),
+                    )
+                msg = "Bozza relazione generata (da verificare)."
+            conn.execute("UPDATE practices SET updated_at = ? WHERE id = ?", (now_iso(), practice_id))
+            log_audit(conn, ctx["platform_id"], ctx["user_id"], "practice", practice_id, f"Relazione {rtype}", action)
+            conn.commit()
+        self.redirect(f"/pariter/practices/{practice_id}", ctx, msg, {"tab": "interne"})
+
+    def post_practice_integration_request(self, practice_id, form):
+        ctx = self.ctx_from_form(form)
+        practice = self._practice_guard(ctx, practice_id, "documentale")
+        if not practice:
+            return
+        with connect() as conn:
+            if form.get("close_id"):
+                conn.execute(
+                    "UPDATE integration_requests SET req_status = 'chiusa', resolved_at = ? WHERE id = ? AND practice_id = ?",
+                    (now_iso(), int(form["close_id"]), practice_id),
+                )
+                msg = "Richiesta di integrazione chiusa."
+            else:
+                pdoc_id = int(form["practice_document_id"]) if form.get("practice_document_id") else None
+                conn.execute(
+                    """INSERT INTO integration_requests(practice_id, practice_document_id, phase, subject, detail, priority, req_status, requested_by, created_at)
+                       VALUES (?, ?, '', ?, ?, ?, 'inviata', ?, ?)""",
+                    (practice_id, pdoc_id, form.get("subject", "Integrazione"), form.get("detail", ""),
+                     form.get("priority", "non_bloccante"), ctx["user_id"], now_iso()),
+                )
+                if pdoc_id:
+                    conn.execute(
+                        "UPDATE practice_documents SET integration_requested = 1, doc_status = 'da_integrare', updated_at = ? WHERE id = ? AND practice_id = ?",
+                        (now_iso(), pdoc_id, practice_id),
+                    )
+                msg = "Richiesta di integrazione inviata al proponente."
+            log_audit(conn, ctx["platform_id"], ctx["user_id"], "practice", practice_id, "Richiesta integrazione", form.get("subject", ""))
+            conn.commit()
+        self.redirect(f"/pariter/practices/{practice_id}", ctx, msg, {"tab": "documentale"})
+
+    def post_practice_cvoi(self, practice_id, form):
+        ctx = self.ctx_from_form(form)
+        practice = self._practice_guard(ctx, practice_id, "cvoi", perm="cvoi_draft")
+        if not practice:
+            return
+        action = form.get("action", "save")
+        with connect() as conn:
+            report = conn.execute(
+                "SELECT * FROM cvoi_reports WHERE practice_id = ? ORDER BY id DESC LIMIT 1", (practice_id,)
+            ).fetchone()
+            if action == "validate":
+                if report:
+                    conn.execute(
+                        "UPDATE cvoi_reports SET review_status = 'validato', updated_at = ? WHERE id = ?",
+                        (now_iso(), report["id"]),
+                    )
+                msg = "Report CVOI validato."
+            else:
+                # punteggi per criterio
+                criteria_scores = {}
+                for key, label, w, mx, thr in CVOI_AREAS:
+                    vals = []
+                    for i in range(len(CVOI_CRITERIA[key])):
+                        try:
+                            v = float(form.get(f"raw_{key}_{i}", 0) or 0)
+                        except ValueError:
+                            v = 0.0
+                        vals.append(max(0.0, min(v, CVOI_CRITERION_MAX)))
+                    criteria_scores[key] = vals
+                area_totals, weighted, outcome, _tr, _tm = compute_cvoi_from_criteria(criteria_scores)
+                conditions = form.get("conditions", "")
+                report_fields = {
+                    "mail": form.get("mail", ""),
+                    "data_caricamento": form.get("data_caricamento", ""),
+                    "data_valutazione": form.get("data_valutazione", ""),
+                    "notes_qualitative": form.get("notes_qualitative", ""),
+                    "closing_note": form.get("closing_note", ""),
+                }
+                html_doc = build_cvoi_html(practice, report_fields, criteria_scores)
+                document_id = generated_document(
+                    conn, ctx["platform_id"], None, practice["proponent_id"],
+                    "CVOI", "verbale", f"Verbale CVOI - {practice['project_title']}",
+                    "verbale_cvoi.html", html_doc, ctx["user_id"],
+                )
+                link_document_practice(conn, document_id, practice_id)
+                now = now_iso()
+                if report:
+                    conn.execute(
+                        """UPDATE cvoi_reports SET weighted_score = ?, outcome = ?, conditions = ?,
+                           notes_qualitative = ?, closing_note = ?, mail = ?, data_caricamento = ?, data_valutazione = ?,
+                           generated_document_id = ?, drafter_user_id = ?, updated_at = ? WHERE id = ?""",
+                        (weighted, outcome, conditions, report_fields["notes_qualitative"], report_fields["closing_note"],
+                         report_fields["mail"], report_fields["data_caricamento"], report_fields["data_valutazione"],
+                         document_id, ctx["user_id"], now, report["id"]),
+                    )
+                    conn.execute("DELETE FROM cvoi_criteria_scores WHERE cvoi_report_id = ?", (report["id"],))
+                    report_id = report["id"]
+                else:
+                    cur = conn.execute(
+                        """INSERT INTO cvoi_reports(practice_id, weighted_score, outcome, conditions, review_status, workflow_status,
+                           notes_qualitative, closing_note, mail, data_caricamento, data_valutazione,
+                           generated_document_id, drafter_user_id, created_by, created_at, updated_at)
+                           VALUES (?, ?, ?, ?, 'bozza', 'bozza', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                        (practice_id, weighted, outcome, conditions, report_fields["notes_qualitative"], report_fields["closing_note"],
+                         report_fields["mail"], report_fields["data_caricamento"], report_fields["data_valutazione"],
+                         document_id, ctx["user_id"], ctx["user_id"], now, now),
+                    )
+                    report_id = cur.lastrowid
+                for key, _label, _w, _mx, _thr in CVOI_AREAS:
+                    for i, v in enumerate(criteria_scores[key]):
+                        conn.execute(
+                            "INSERT INTO cvoi_criteria_scores(cvoi_report_id, area_key, idx, raw_score) VALUES (?, ?, ?, ?)",
+                            (report_id, key, i, v),
+                        )
+                conn.execute(
+                    "INSERT INTO cvoi_edit_log(cvoi_report_id, actor_user_id, actor_name, action, summary, created_at) VALUES (?, ?, ?, 'redazione', ?, ?)",
+                    (report_id, ctx["user_id"], ctx["user"]["name"], f"Bozza aggiornata: {CVOI_OUTCOME_LABELS.get(outcome, outcome)} ({weighted:g})", now),
+                )
+                # una nuova versione invalida le approvazioni precedenti: torna in revisione
+                conn.execute("UPDATE cvoi_reports SET workflow_status = 'in_revisione' WHERE id = ?", (report_id,))
+                conn.execute("DELETE FROM cvoi_member_reviews WHERE cvoi_report_id = ?", (report_id,))
+                msg = f"Verbale CVOI generato: {CVOI_OUTCOME_LABELS.get(outcome, outcome)} ({weighted:g}). Approvazioni dei membri azzerate."
+            conn.execute("UPDATE practices SET updated_at = ? WHERE id = ?", (now_iso(), practice_id))
+            log_audit(conn, ctx["platform_id"], ctx["user_id"], "practice", practice_id, "CVOI", action)
+            conn.commit()
+        self.redirect(f"/pariter/practices/{practice_id}", ctx, msg, {"tab": "cvoi"})
+
+    def post_practice_close(self, practice_id, form):
+        ctx = self.ctx_from_form(form)
+        practice = self._practice_guard(ctx, practice_id, "riepilogo", perm="close_practice", allow_closed=True)
+        if not practice:
+            return
+        action = form.get("action", "close")
+        with connect() as conn:
+            if action == "reopen":
+                if ctx["user"]["role"] != "admin":
+                    self.redirect(f"/pariter/practices/{practice_id}", ctx, "Solo l'amministratore puo' riaprire una pratica.", {"tab": "riepilogo"})
+                    return
+                conn.execute("UPDATE practices SET closed_at = '', updated_at = ? WHERE id = ?", (now_iso(), practice_id))
+                log_audit(conn, ctx["platform_id"], ctx["user_id"], "practice", practice_id, "Riapertura pratica", "")
+                conn.commit()
+                self.redirect(f"/pariter/practices/{practice_id}", ctx, "Pratica riaperta.", {"tab": "riepilogo"})
+                return
+            outcome = form.get("closure_outcome", "Archiviata")
+            note = form.get("closure_note", "")
+            now = now_iso()
+            conn.execute(
+                "UPDATE practices SET closed_at = ?, closure_outcome = ?, closure_note = ? WHERE id = ?",
+                (now, outcome, note, practice_id),
+            )
+            set_practice_status(conn, practice, "archiviata", ctx["user_id"], f"Chiusura pratica: {outcome}", note)
+            conn.commit()
+        self.redirect(f"/pariter/practices/{practice_id}", ctx, "Pratica chiusa e archiviata.", {"tab": "riepilogo"})
+
+    def post_practice_cvoi_member(self, practice_id, form):
+        ctx = self.ctx_from_form(form)
+        practice = self.get_practice(practice_id)
+        if not practice or practice["platform_id"] != ctx["platform_id"]:
+            self.not_found()
+            return
+        if practice["closed_at"]:
+            self.redirect(f"/pariter/practices/{practice_id}", ctx, "Pratica chiusa: sola lettura.", {"tab": "cvoi"})
+            return
+        if not user_can(ctx["user"], "cvoi_sign"):
+            self.redirect(f"/pariter/practices/{practice_id}", ctx, "Azione riservata ai membri del Comitato Tecnico.", {"tab": "cvoi"})
+            return
+        is_admin = ctx["user"]["role"] == "admin"
+        action = form.get("action", "")
+        now = now_iso()
+        with connect() as conn:
+            report = conn.execute("SELECT * FROM cvoi_reports WHERE practice_id = ? ORDER BY id DESC LIMIT 1", (practice_id,)).fetchone()
+            if not report:
+                self.redirect(f"/pariter/practices/{practice_id}", ctx, "Genera prima il verbale CVOI.", {"tab": "cvoi"})
+                return
+            rid = report["id"]
+
+            def upsert(member_id, member_name, status, signed):
+                updated = conn.execute(
+                    "UPDATE cvoi_member_reviews SET status = ?, signed_at = ?, member_name = ?, updated_at = ? WHERE cvoi_report_id = ? AND user_id = ?",
+                    (status, signed, member_name, now, rid, member_id),
+                ).rowcount
+                if not updated:
+                    conn.execute(
+                        "INSERT INTO cvoi_member_reviews(cvoi_report_id, user_id, member_name, role, status, signed_at, updated_at) VALUES (?, ?, ?, 'technical_committee', ?, ?, ?)",
+                        (rid, member_id, member_name, status, signed, now),
+                    )
+
+            if action == "force_unanime":
+                if not is_admin:
+                    self.redirect(f"/pariter/practices/{practice_id}", ctx, "Solo l'amministratore puo' forzare l'unanimita'.", {"tab": "cvoi"})
+                    return
+                for m in cvoi_committee_members(conn):
+                    upsert(m["id"], m["name"], "approvato", now)
+                conn.execute("UPDATE cvoi_reports SET workflow_status = 'unanime' WHERE id = ?", (rid,))
+                conn.execute(
+                    "INSERT INTO cvoi_edit_log(cvoi_report_id, actor_user_id, actor_name, action, summary, created_at) VALUES (?, ?, ?, 'forzatura', 'Versione resa unanime (admin)', ?)",
+                    (rid, ctx["user_id"], ctx["user"]["name"], now),
+                )
+                msg = "Versione resa unanime dall'amministratore."
+            else:
+                member_id = int(form.get("member_id") or ctx["user_id"])
+                if not is_admin and member_id != ctx["user_id"]:
+                    self.redirect(f"/pariter/practices/{practice_id}", ctx, "Puoi firmare solo per te stesso.", {"tab": "cvoi"})
+                    return
+                m = conn.execute("SELECT name FROM users WHERE id = ?", (member_id,)).fetchone()
+                member_name = m["name"] if m else ""
+                if action == "sign":
+                    upsert(member_id, member_name, "approvato", now)
+                    log_action, log_summary = "firma", f"{member_name}: approvato e firmato"
+                    msg = "Firma registrata."
+                else:  # request_change
+                    upsert(member_id, member_name, "modifica_richiesta", "")
+                    log_action, log_summary = "modifica", f"{member_name}: richiesta modifica"
+                    msg = "Richiesta di modifica registrata."
+                conn.execute(
+                    "INSERT INTO cvoi_edit_log(cvoi_report_id, actor_user_id, actor_name, action, summary, created_at) VALUES (?, ?, ?, ?, ?, ?)",
+                    (rid, ctx["user_id"], ctx["user"]["name"], log_action, log_summary, now),
+                )
+                if recompute_cvoi_unanime(conn, rid):
+                    msg += " La versione e' ora unanime."
+            conn.execute("UPDATE practices SET updated_at = ? WHERE id = ?", (now, practice_id))
+            log_audit(conn, ctx["platform_id"], ctx["user_id"], "practice", practice_id, "CVOI - approvazione membro", action)
+            conn.commit()
+        self.redirect(f"/pariter/practices/{practice_id}", ctx, msg, {"tab": "cvoi"})
+
+    def post_practice_board_decision(self, practice_id, form):
+        ctx = self.ctx_from_form(form)
+        round_no = 2 if str(form.get("round", "1")) == "2" else 1
+        back_tab = "cda1" if round_no == 1 else "cda2"
+        practice = self._practice_guard(ctx, practice_id, back_tab, perm="board_decision")
+        if not practice:
+            return
+        action = form.get("action", "finalize")
+        is_admin = ctx["user"]["role"] == "admin"
+        now = now_iso()
+        with connect() as conn:
+            decision = conn.execute(
+                "SELECT * FROM practice_board_decisions WHERE practice_id = ? AND decision_round = ? ORDER BY id DESC LIMIT 1",
+                (practice_id, round_no),
+            ).fetchone()
+
+            if action == "open":
+                if round_no == 1 and not cvoi_is_validated(conn, practice_id):
+                    self.redirect(f"/pariter/practices/{practice_id}", ctx, "Serve un CVOI in versione unanime.", {"tab": back_tab})
+                    return
+                if round_no == 2 and not advisory_is_unanime(conn, practice_id):
+                    self.redirect(f"/pariter/practices/{practice_id}", ctx, "Serve un parere Advisory in versione unanime.", {"tab": back_tab})
+                    return
+                if decision and decision["decision_status"] == "in_votazione":
+                    self.redirect(f"/pariter/practices/{practice_id}", ctx, "Delibera gia' aperta.", {"tab": back_tab})
+                    return
+                conn.execute(
+                    """INSERT INTO practice_board_decisions(practice_id, decision_round, meeting_date, agenda, outcome, decision_status, created_by, created_at)
+                       VALUES (?, ?, ?, ?, '', 'in_votazione', ?, ?)""",
+                    (practice_id, round_no, form.get("meeting_date", ""), form.get("agenda", ""), ctx["user_id"], now),
+                )
+                log_audit(conn, ctx["platform_id"], ctx["user_id"], "practice", practice_id, f"Delibera CdA {round_no}", "apertura votazione")
+                conn.commit()
+                self.redirect(f"/pariter/practices/{practice_id}", ctx, "Delibera aperta: i consiglieri possono votare.", {"tab": back_tab})
+                return
+
+            if not decision:
+                self.redirect(f"/pariter/practices/{practice_id}", ctx, "Apri prima la delibera.", {"tab": back_tab})
+                return
+            rid = decision["id"]
+
+            if action == "vote":
+                if decision["decision_status"] != "in_votazione":
+                    self.redirect(f"/pariter/practices/{practice_id}", ctx, "La votazione non e' aperta.", {"tab": back_tab})
+                    return
+                member_id = int(form.get("member_id") or ctx["user_id"])
+                if not is_admin and member_id != ctx["user_id"]:
+                    self.redirect(f"/pariter/practices/{practice_id}", ctx, "Puoi votare solo per te stesso.", {"tab": back_tab})
+                    return
+                vote = form.get("vote", "astenuto")
+                if vote not in {"approva", "contrario", "astenuto"}:
+                    vote = "astenuto"
+                m = conn.execute("SELECT name FROM users WHERE id = ?", (member_id,)).fetchone()
+                mname = m["name"] if m else ""
+                updated = conn.execute(
+                    "UPDATE board_member_votes SET vote = ?, member_name = ?, voted_at = ? WHERE board_decision_id = ? AND user_id = ?",
+                    (vote, mname, now, rid, member_id),
+                ).rowcount
+                if not updated:
+                    conn.execute(
+                        "INSERT INTO board_member_votes(board_decision_id, user_id, member_name, vote, voted_at) VALUES (?, ?, ?, ?, ?)",
+                        (rid, member_id, mname, vote, now),
+                    )
+                conn.commit()
+                self.redirect(f"/pariter/practices/{practice_id}", ctx, f"Voto registrato: {BOARD_VOTE_LABELS.get(vote, vote)}.", {"tab": back_tab})
+                return
+
+            if action == "reopen":
+                conn.execute("UPDATE practice_board_decisions SET decision_status = 'in_votazione', outcome = '' WHERE id = ?", (rid,))
+                conn.execute("DELETE FROM board_member_votes WHERE board_decision_id = ?", (rid,))
+                set_practice_status(conn, practice, "attesa_cda1" if round_no == 1 else "attesa_cda2", ctx["user_id"], "Ridelibera CdA dopo sospensione")
+                conn.commit()
+                self.redirect(f"/pariter/practices/{practice_id}", ctx, "Votazione riaperta per ridelibera.", {"tab": back_tab})
+                return
+
+            # finalize
+            if decision["decision_status"] != "in_votazione":
+                self.redirect(f"/pariter/practices/{practice_id}", ctx, "Delibera non in votazione.", {"tab": back_tab})
+                return
+            outcome = form.get("outcome", "sospesa")
+            votes_rows = conn.execute(
+                "SELECT user_id, member_name, vote FROM board_member_votes WHERE board_decision_id = ?", (rid,)
+            ).fetchall()
+            vote_map = {v["user_id"]: v["vote"] for v in votes_rows}
+            votes = [(m["name"], vote_map.get(m["id"], "in_attesa")) for m in board_members(conn)]
+            fields = {
+                "meeting_date": decision["meeting_date"] or form.get("meeting_date", ""),
+                "attendees": form.get("attendees", "") or decision["attendees"] or "",
+                "agenda": decision["agenda"] or "",
+                "summary": form.get("summary", ""),
+                "conditions": form.get("conditions", ""),
+                "outcome": outcome,
+            }
+            cvoi = cvoi_summary_for(conn, practice_id)
+            extra_lines = []
+            if round_no == 2:
+                o1 = board_decision_outcome(conn, practice_id, 1)
+                extra_lines.append(("Prima delibera CdA", DECISION_OUTCOME_LABELS.get(o1, o1 or "-")))
+                adv = conn.execute("SELECT outcome FROM advisory_opinions WHERE practice_id = ? ORDER BY id DESC LIMIT 1", (practice_id,)).fetchone()
+                if adv:
+                    extra_lines.append(("Parere Advisory", ADVISORY_OUTCOME_LABELS.get(adv["outcome"], adv["outcome"])))
+            html_doc = build_decision_html(practice, round_no, fields, cvoi, extra_lines, votes)
+            document_id = generated_document(
+                conn, ctx["platform_id"], None, practice["proponent_id"],
+                f"Delibera CdA {round_no}", "delibera",
+                f"{'Prima' if round_no == 1 else 'Seconda'} delibera CdA - {practice['project_title']}",
+                f"delibera_cda{round_no}.html", html_doc, ctx["user_id"],
+            )
+            link_document_practice(conn, document_id, practice_id)
+            new_status = "sospesa" if outcome == "sospesa" else "finalizzata"
+            conn.execute(
+                """UPDATE practice_board_decisions SET attendees = ?, summary = ?, outcome = ?, conditions = ?,
+                   generated_document_id = ?, decision_status = ?, finalized_by = ?, finalized_at = ? WHERE id = ?""",
+                (fields["attendees"], fields["summary"], outcome, fields["conditions"], document_id, new_status, ctx["user_id"], now, rid),
+            )
+            if round_no == 1:
+                target = {"approvata": "cda1_positiva", "approvata_condizioni": "cda1_positiva_condizioni",
+                          "respinta": "respinta", "sospesa": "da_integrare"}.get(outcome)
+            else:
+                target = {"approvata": "in_pre_golive", "approvata_condizioni": "in_pre_golive",
+                          "respinta": "respinta", "sospesa": "da_integrare"}.get(outcome)
+            if target:
+                set_practice_status(conn, practice, target, ctx["user_id"],
+                                    f"Delibera CdA {round_no}: {DECISION_OUTCOME_LABELS.get(outcome, outcome)}", fields["conditions"])
+            conn.commit()
+        if outcome.startswith("approvata"):
+            nxt = "Advisory Committee sbloccato." if round_no == 1 else "Fase 4 proponente sbloccata (pre go-live)."
+        elif outcome == "sospesa":
+            nxt = "Pratica sospesa: in attesa di revisioni/integrazioni (resta schedulata in CdA)."
+        else:
+            nxt = "Pratica respinta."
+        self.redirect(f"/pariter/practices/{practice_id}", ctx, nxt, {"tab": back_tab})
+
+    def post_practice_advisory(self, practice_id, form):
+        ctx = self.ctx_from_form(form)
+        practice = self._practice_guard(ctx, practice_id, "advisory", perm="advisory_opinion")
+        if not practice:
+            return
+        outcome = form.get("outcome", "favorevole")
+        fields = {k: form.get(k, "") for k in ("meeting_date", "attendees", "summary", "conditions")}
+        fields["outcome"] = outcome
+        now = now_iso()
+        with connect() as conn:
+            if board_decision_outcome(conn, practice_id, 1) not in {"approvata", "approvata_condizioni"}:
+                self.redirect(f"/pariter/practices/{practice_id}", ctx, "Serve una prima delibera CdA positiva.", {"tab": "advisory"})
+                return
+            cvoi = cvoi_summary_for(conn, practice_id)
+            html_doc = build_advisory_html(practice, fields, cvoi)
+            document_id = generated_document(
+                conn, ctx["platform_id"], None, practice["proponent_id"],
+                "Advisory Committee", "parere", f"Parere Advisory Committee - {practice['project_title']}",
+                "parere_advisory.html", html_doc, ctx["user_id"],
+            )
+            link_document_practice(conn, document_id, practice_id)
+            existing = conn.execute("SELECT id FROM advisory_opinions WHERE practice_id = ? ORDER BY id DESC LIMIT 1", (practice_id,)).fetchone()
+            if existing:
+                conn.execute(
+                    """UPDATE advisory_opinions SET meeting_date = ?, attendees = ?, summary = ?, outcome = ?, conditions = ?,
+                       generated_document_id = ?, workflow_status = 'in_revisione', drafter_user_id = ? WHERE id = ?""",
+                    (fields["meeting_date"], fields["attendees"], fields["summary"], outcome, fields["conditions"],
+                     document_id, ctx["user_id"], existing["id"]),
+                )
+                conn.execute("DELETE FROM advisory_member_reviews WHERE advisory_opinion_id = ?", (existing["id"],))
+            else:
+                conn.execute(
+                    """INSERT INTO advisory_opinions(practice_id, meeting_date, attendees, agenda, summary, outcome, conditions, generated_document_id, workflow_status, drafter_user_id, created_by, created_at)
+                       VALUES (?, ?, ?, '', ?, ?, ?, ?, 'in_revisione', ?, ?, ?)""",
+                    (practice_id, fields["meeting_date"], fields["attendees"], fields["summary"], outcome,
+                     fields["conditions"], document_id, ctx["user_id"], ctx["user_id"], now),
+                )
+            if PRACTICE_STATUS_INDEX.get(practice["status"], 0) < PRACTICE_STATUS_INDEX["in_advisory"]:
+                set_practice_status(conn, practice, "in_advisory", ctx["user_id"], "Parere Advisory in redazione")
+            else:
+                conn.execute("UPDATE practices SET updated_at = ? WHERE id = ?", (now, practice_id))
+            conn.commit()
+        self.redirect(f"/pariter/practices/{practice_id}", ctx, "Parere Advisory redatto. Ora i membri firmano per l'unanimita'.", {"tab": "advisory"})
+
+    def post_practice_advisory_member(self, practice_id, form):
+        ctx = self.ctx_from_form(form)
+        practice = self.get_practice(practice_id)
+        if not practice or practice["platform_id"] != ctx["platform_id"]:
+            self.not_found()
+            return
+        if practice["closed_at"]:
+            self.redirect(f"/pariter/practices/{practice_id}", ctx, "Pratica chiusa: sola lettura.", {"tab": "advisory"})
+            return
+        if not user_can(ctx["user"], "advisory_opinion"):
+            self.redirect(f"/pariter/practices/{practice_id}", ctx, "Azione riservata all'Advisory Committee.", {"tab": "advisory"})
+            return
+        is_admin = ctx["user"]["role"] == "admin"
+        action = form.get("action", "")
+        now = now_iso()
+        with connect() as conn:
+            advisory = conn.execute("SELECT * FROM advisory_opinions WHERE practice_id = ? ORDER BY id DESC LIMIT 1", (practice_id,)).fetchone()
+            if not advisory:
+                self.redirect(f"/pariter/practices/{practice_id}", ctx, "Redigi prima il parere.", {"tab": "advisory"})
+                return
+            aid = advisory["id"]
+
+            def upsert(member_id, member_name, status, signed):
+                updated = conn.execute(
+                    "UPDATE advisory_member_reviews SET status = ?, signed_at = ?, member_name = ?, updated_at = ? WHERE advisory_opinion_id = ? AND user_id = ?",
+                    (status, signed, member_name, now, aid, member_id),
+                ).rowcount
+                if not updated:
+                    conn.execute(
+                        "INSERT INTO advisory_member_reviews(advisory_opinion_id, user_id, member_name, status, signed_at, updated_at) VALUES (?, ?, ?, ?, ?, ?)",
+                        (aid, member_id, member_name, status, signed, now),
+                    )
+
+            if action == "force_unanime":
+                if not is_admin:
+                    self.redirect(f"/pariter/practices/{practice_id}", ctx, "Solo l'amministratore puo' forzare.", {"tab": "advisory"})
+                    return
+                for m in advisory_members(conn):
+                    upsert(m["id"], m["name"], "approvato", now)
+                conn.execute("UPDATE advisory_opinions SET workflow_status = 'unanime' WHERE id = ?", (aid,))
+                became_unanime = True
+            else:
+                member_id = int(form.get("member_id") or ctx["user_id"])
+                if not is_admin and member_id != ctx["user_id"]:
+                    self.redirect(f"/pariter/practices/{practice_id}", ctx, "Puoi firmare solo per te stesso.", {"tab": "advisory"})
+                    return
+                m = conn.execute("SELECT name FROM users WHERE id = ?", (member_id,)).fetchone()
+                upsert(member_id, m["name"] if m else "", "approvato" if action == "sign" else "modifica_richiesta", now if action == "sign" else "")
+                became_unanime = recompute_advisory_unanime(conn, aid)
+            if became_unanime and PRACTICE_STATUS_INDEX.get(practice["status"], 0) < PRACTICE_STATUS_INDEX["advisory_ricevuto"]:
+                set_practice_status(conn, practice, "advisory_ricevuto", ctx["user_id"], "Parere Advisory unanime: seconda delibera sbloccata")
+            log_audit(conn, ctx["platform_id"], ctx["user_id"], "practice", practice_id, "Advisory - firma membro", action)
+            conn.commit()
+        msg = "Parere Advisory ora unanime: seconda delibera CdA sbloccata." if became_unanime else "Registrato."
+        self.redirect(f"/pariter/practices/{practice_id}", ctx, msg, {"tab": "advisory"})
+
+    def post_practice_condition(self, practice_id, form):
+        ctx = self.ctx_from_form(form)
+        practice = self._practice_guard(ctx, practice_id, "condizioni")
+        if not practice:
+            return
+        with connect() as conn:
+            if form.get("cond_id"):
+                conn.execute(
+                    "UPDATE pre_golive_conditions SET cond_status = ? WHERE id = ? AND practice_id = ?",
+                    (form.get("cond_status", "aperta"), int(form["cond_id"]), practice_id),
+                )
+                msg = "Condizione aggiornata."
+            else:
+                conn.execute(
+                    """INSERT INTO pre_golive_conditions(practice_id, description, source, owner, priority, due_date, cond_status, created_at)
+                       VALUES (?, ?, ?, ?, ?, ?, 'aperta', ?)""",
+                    (practice_id, form.get("description", ""), form.get("source", ""), form.get("owner", ""),
+                     form.get("priority", "bloccante"), form.get("due_date", ""), now_iso()),
+                )
+                msg = "Condizione aggiunta."
+            conn.execute("UPDATE practices SET updated_at = ? WHERE id = ?", (now_iso(), practice_id))
+            log_audit(conn, ctx["platform_id"], ctx["user_id"], "practice", practice_id, "Condizione pre go-live", msg)
+            conn.commit()
+        self.redirect(f"/pariter/practices/{practice_id}", ctx, msg, {"tab": "condizioni"})
+
+    def post_practice_transition(self, practice_id, form):
+        ctx = self.ctx_from_form(form)
+        practice = self._practice_guard(ctx, practice_id, "validazione")
+        if not practice:
+            return
+        target = form.get("target", "")
+        with connect() as conn:
+            reason = can_transition_practice(conn, practice, target)
+            if reason:
+                self.redirect(f"/pariter/practices/{practice_id}", ctx, f"Transizione bloccata: {reason}", {"tab": "validazione"})
+                return
+            set_practice_status(conn, practice, target, ctx["user_id"], "Transizione manuale")
+            conn.commit()
+        label = practice_status_label(target)
+        self.redirect(f"/pariter/practices/{practice_id}", ctx, f"Stato aggiornato: {label}.", {"tab": "validazione"})
+
+    def post_practice_campaign_review(self, practice_id, form):
+        ctx = self.ctx_from_form(form)
+        practice = self._practice_guard(ctx, practice_id, "campagna")
+        if not practice:
+            return
+        review_status = form.get("review_status", "in_revisione")
+        no_yield = 1 if form.get("no_yield_promise") else 0
+        notes = form.get("coherence_notes", "")
+        with connect() as conn:
+            existing = conn.execute(
+                "SELECT * FROM campaign_page_reviews WHERE practice_id = ? ORDER BY id DESC LIMIT 1", (practice_id,)
+            ).fetchone()
+            review_data = {"coherence_notes": notes, "no_yield_promise": no_yield, "review_status": review_status}
+            html_doc = build_campaign_review_html(practice, review_data)
+            document_id = generated_document(
+                conn, ctx["platform_id"], None, practice["proponent_id"],
+                "Pagina campagna", "report", f"Revisione pagina campagna - {practice['project_title']}",
+                "revisione_campagna.html", html_doc, ctx["user_id"],
+            )
+            link_document_practice(conn, document_id, practice_id)
+            if existing:
+                conn.execute(
+                    "UPDATE campaign_page_reviews SET review_status = ?, coherence_notes = ?, no_yield_promise = ?, generated_document_id = ?, updated_by = ?, updated_at = ? WHERE id = ?",
+                    (review_status, notes, no_yield, document_id, ctx["user_id"], now_iso(), existing["id"]),
+                )
+            else:
+                conn.execute(
+                    """INSERT INTO campaign_page_reviews(practice_id, review_status, coherence_notes, no_yield_promise, generated_document_id, updated_by, updated_at)
+                       VALUES (?, ?, ?, ?, ?, ?, ?)""",
+                    (practice_id, review_status, notes, no_yield, document_id, ctx["user_id"], now_iso()),
+                )
+            log_audit(conn, ctx["platform_id"], ctx["user_id"], "practice", practice_id, "Revisione pagina campagna", review_status)
+            conn.commit()
+        self.redirect(f"/pariter/practices/{practice_id}", ctx, "Revisione pagina campagna salvata.", {"tab": "campagna"})
+
+    def post_practice_alert(self, practice_id, form):
+        ctx = self.ctx_from_form(form)
+        practice = self._practice_guard(ctx, practice_id, "riepilogo")
+        if not practice:
+            return
+        with connect() as conn:
+            if form.get("resolve_id"):
+                conn.execute(
+                    "UPDATE practice_alerts SET alert_status = 'risolto' WHERE id = ? AND practice_id = ?",
+                    (int(form["resolve_id"]), practice_id),
+                )
+                msg = "Alert risolto."
+            else:
+                conn.execute(
+                    """INSERT INTO practice_alerts(practice_id, severity, source, message, alert_status, created_at)
+                       VALUES (?, ?, 'manuale', ?, 'aperto', ?)""",
+                    (practice_id, form.get("severity", "non_bloccante"), form.get("message", ""), now_iso()),
+                )
+                msg = "Alert aggiunto."
+            conn.commit()
+        self.redirect(f"/pariter/practices/{practice_id}", ctx, msg, {"tab": "riepilogo"})
 
     def page_deal_new(self):
         ctx = self.get_ctx()
