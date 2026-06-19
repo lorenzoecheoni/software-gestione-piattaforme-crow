@@ -2123,7 +2123,69 @@ def ensure_demo_extensions(conn):
             ],
         )
     ensure_demo_practice(conn)
+    ensure_demo_practice_cda(conn)
     conn.commit()
+
+
+def ensure_demo_practice_cda(conn):
+    """Seconda pratica demo ferma sulla Prima delibera CdA con votazione APERTA,
+    cosi' da mostrare dal vivo come il CdA vota e delibera."""
+    if conn.execute("SELECT COUNT(*) FROM practices WHERE platform_id = 1").fetchone()[0] >= 2:
+        return
+    now = now_iso()
+    cur = conn.execute(
+        """INSERT INTO practices(platform_id, project_title, proponent_name, status, instrument,
+            target_amount, max_amount, pre_money, equity_percent, source_system, kiis_state,
+            internal_owner, created_by, created_at, updated_at)
+           VALUES (1, 'MedTech Aurora - dispositivo diagnostico', 'MedTech Aurora S.p.A.', 'attesa_cda1',
+            'Quote di S.r.l.', 250000, 500000, 2500000, '9%', 'Import file', 'completata',
+            'Alessia Ricci', 1, ?, ?)""",
+        (now, now),
+    )
+    pid = cur.lastrowid
+    for phase in ("fase1", "fase2", "fase3", "fase4"):
+        conn.execute("INSERT INTO practice_phases(practice_id, phase, status, updated_at) VALUES (?, ?, ?, ?)",
+                     (pid, phase, "completata" if phase in ("fase1", "fase2", "fase3") else "da_completare", now))
+    for phase, category, label, required in PRACTICE_DOC_SEED:
+        st = "verificato" if (phase in ("fase1", "fase2", "fase3") and required) else "mancante"
+        conn.execute(
+            "INSERT INTO practice_documents(practice_id, phase, category, label, required, doc_status, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (pid, phase, category, label, required, st, now),
+        )
+    for rtype, _label in INTERNAL_REVIEW_TYPES:
+        conn.execute(
+            "INSERT INTO internal_reviews(practice_id, review_type, review_status, updated_at) VALUES (?, ?, 'validata', ?)",
+            (pid, rtype, now),
+        )
+    # CVOI gia' unanime (cosi' la CdA1 e' sbloccata)
+    cur2 = conn.execute(
+        """INSERT INTO cvoi_reports(practice_id, weighted_score, outcome, review_status, workflow_status,
+            data_valutazione, created_by, created_at, updated_at)
+           VALUES (?, 25.4, 'superato', 'bozza', 'unanime', '2026-01-20', 1, ?, ?)""",
+        (pid, now, now),
+    )
+    rid = cur2.lastrowid
+    for key, _l, _w, _m, _t in CVOI_AREAS:
+        for i in range(len(CVOI_CRITERIA[key])):
+            conn.execute("INSERT INTO cvoi_criteria_scores(cvoi_report_id, area_key, idx, raw_score) VALUES (?, ?, ?, 4)",
+                         (rid, key, i))
+    for uid in (3, 7, 8, 9):
+        nm = conn.execute("SELECT name FROM users WHERE id = ?", (uid,)).fetchone()
+        conn.execute(
+            "INSERT INTO cvoi_member_reviews(cvoi_report_id, user_id, member_name, role, status, signed_at, updated_at) VALUES (?, ?, ?, 'technical_committee', 'approvato', ?, ?)",
+            (rid, uid, nm["name"] if nm else "", now, now),
+        )
+    # Prima delibera CdA gia' APERTA in votazione (nessun voto ancora espresso)
+    conn.execute(
+        """INSERT INTO practice_board_decisions(practice_id, decision_round, meeting_date, agenda, outcome, decision_status, created_by, created_at)
+           VALUES (?, 1, '2026-01-22', 'Valutazione pratica MedTech Aurora', '', 'in_votazione', 11, ?)""",
+        (pid, now),
+    )
+    conn.execute(
+        """INSERT INTO practice_status_history(practice_id, from_status, to_status, actor_id, notes, created_at)
+           VALUES (?, '', 'attesa_cda1', 1, 'Demo: CdA1 con votazione aperta', ?)""",
+        (pid, now),
+    )
 
 
 def ensure_demo_practice(conn):
@@ -2958,6 +3020,122 @@ def _cvoi_summary_html(cvoi):
 <p>Esito CVOI: <strong>{esc(CVOI_OUTCOME_LABELS.get(cvoi['outcome'], cvoi['outcome']))}</strong>.</p>"""
 
 
+def text_to_html(text):
+    """Converte testo libero (bozza editabile) in HTML per il documento ufficiale."""
+    blocks = re.split(r"\n\s*\n", (text or "").strip())
+    return "".join("<p>" + esc(b).replace("\n", "<br>") + "</p>" for b in blocks if b.strip())
+
+
+def wrap_practice_doc(title, practice, body_text):
+    return practice_doc_shell(title, practice, text_to_html(body_text), ai_generated=False)
+
+
+def _cvoi_summary_text(cvoi):
+    if not cvoi:
+        return "Verbale CVOI non ancora disponibile."
+    lines = [f"Esito CVOI: {CVOI_OUTCOME_LABELS.get(cvoi['outcome'], cvoi['outcome'])} "
+             f"- punteggio ponderato {cvoi['weighted']:g} su soglia {CVOI_OVERALL_THRESHOLD:g}."]
+    for label, raw, mx, w, wm in cvoi["areas"]:
+        lines.append(f"  - {label}: {raw:g}/{int(mx)} (peso {int(w*100)}%, ponderato {wm:g})")
+    return "\n".join(lines)
+
+
+def compose_decision_draft(practice, round_no, fields, cvoi, votes, extra_lines=None):
+    """Bozza editabile del verbale CdA, precompilata con i dati caricati."""
+    odg = ("Valutazione preliminare del progetto e autorizzazione all'invio all'Advisory Committee"
+           if round_no == 1 else
+           "Valutazione finale e relative motivazioni sul progetto; autorizzazione alla prosecuzione verso il pre go-live")
+    vote_lines = []
+    if votes:
+        for n, v in votes:
+            vote_lines.append(f"  - {n}: {BOARD_VOTE_LABELS.get(v, v)}")
+    fav = sum(1 for _n, v in (votes or []) if v == "approva")
+    con = sum(1 for _n, v in (votes or []) if v == "contrario")
+    ast = sum(1 for _n, v in (votes or []) if v == "astenuto")
+    extra = "\n".join(f"{k}: {v}" for k, v in (extra_lines or []))
+    parts = [
+        PARITER_LEGAL_HEADER,
+        "",
+        f"VERBALE DI CONSIGLIO DI AMMINISTRAZIONE DEL {fields.get('meeting_date') or '__________'}",
+        "",
+        ("Il giorno indicato, in modalita' mista, si e' riunito il Consiglio di Amministrazione di Pariter Equity "
+         f"S.r.l. per discutere e deliberare in merito al progetto \"{practice['project_title']}\" del proponente "
+         f"{practice['proponent_name'] or '-'}."),
+        "",
+        f"Ordine del giorno: {odg}.",
+        "",
+        f"Presenti: {fields.get('attendees') or '________________________'}.",
+        "",
+        "Esito dell'istruttoria CVOI:",
+        _cvoi_summary_text(cvoi),
+    ]
+    if extra:
+        parts += ["", extra]
+    parts += [
+        "",
+        ("Il Responsabile della funzione di controllo rappresenta che il Proponente ha depositato le autodichiarazioni "
+         "richieste e che le verifiche su conflitti di interesse e art. 5 Reg. UE 1503/2020 hanno dato esito negativo "
+         "(assenza di motivi ostativi). Si ricorda che, in assenza dei casellari giudiziali dell'organo amministrativo "
+         "del Proponente e della delibera di aumento di capitale, il progetto non potra' essere pubblicato."),
+        "",
+        "Esiti del voto:",
+        *(vote_lines or ["  - (nessun voto registrato)"]),
+        f"Favorevoli: {fav} - Contrari: {con} - Astenuti: {ast}.",
+        "",
+        f"Il Consiglio, dopo ampio confronto, DELIBERA: {DECISION_OUTCOME_LABELS.get(fields.get('outcome'), '____________')}.",
+        "",
+        (fields.get("summary") or ""),
+        "",
+        f"Condizioni: {fields.get('conditions') or 'nessuna'}.",
+        "",
+        "Letto, approvato e sottoscritto. La seduta e' sciolta.",
+        "",
+        "Il Presidente _____________________     Il Segretario _____________________",
+    ]
+    return "\n".join(parts)
+
+
+def compose_advisory_draft(practice, fields, cvoi):
+    """Bozza editabile del parere Advisory, precompilata e fedele al template."""
+    parts = [
+        "ADVISORY COMMITTEE - PARERE NON VINCOLANTE AL CONSIGLIO DI AMMINISTRAZIONE",
+        f"Progetto: {practice['project_title']}",
+        f"Proponente: {practice['proponent_name'] or '-'}",
+        f"Data: {fields.get('meeting_date') or '__________'}",
+        "",
+        "1. Premessa e perimetro del presente parere",
+        ("Il presente documento costituisce il parere dell'Advisory Committee, reso ai sensi della procedura di selezione "
+         "(Allegato 5.1), ed e' obbligatorio ma non vincolante ai fini delle determinazioni del Consiglio di Amministrazione."),
+        "",
+        "2. Riferimenti procedurali e documentazione esaminata",
+        ("L'Advisory Committee ha esaminato il fascicolo e la documentazione istruttoria e il verbale di valutazione del "
+         "Comitato Valutazione Opportunita' di Investimento (CVOI), con autonomia e indipendenza di giudizio."),
+        "",
+        "3. Sintesi dell'esito del First Screening (CVOI)",
+        _cvoi_summary_text(cvoi),
+        "",
+        "4. Valutazioni qualitative e profili di rischio",
+        (fields.get("summary") or "Si rinvia alle note di valutazione del CVOI."),
+        "",
+        "5. Verifiche di processo: conflitti di interesse e coerenza informativa",
+        ("All'esito dell'esame, l'Advisory Committee non ha rilevato profili ostativi per ragioni di conflitto di interessi; "
+         "resta ferma la necessita' che il CdA espleti le valutazioni finali."),
+        "",
+        "6. Osservazioni e raccomandazioni al CdA (parere non vincolante)",
+        (f"L'Advisory Committee esprime: {ADVISORY_OUTCOME_LABELS.get(fields.get('outcome'), fields.get('outcome'))}. "
+         "Si raccomanda di condizionare l'eventuale pubblicazione all'acquisizione integrale della documentazione richiesta "
+         "e, in particolare, all'invio del casellario giudiziale di tutti i membri dell'organo amministrativo del Proponente."),
+        (fields.get("conditions") or ""),
+        "",
+        "7. Conclusione",
+        ("Il presente parere e' reso in forma non vincolante e viene trasmesso al CdA unitamente al fascicolo di valutazione "
+         "e alle tabelle di punteggio, per le determinazioni di competenza."),
+        "",
+        f"Per l'Advisory Committee: {fields.get('attendees') or '_____________________  _____________________'}",
+    ]
+    return "\n".join(parts)
+
+
 def build_decision_html(practice, round_no, fields, cvoi, extra_lines=None, votes=None):
     """Verbale di Consiglio di Amministrazione (fedele al template Pariter)."""
     round_label = "Prima delibera CdA (preliminare)" if round_no == 1 else "Seconda delibera CdA (definitiva)"
@@ -3530,9 +3708,6 @@ class App(BaseHTTPRequestHandler):
             ("Documenti", "/documents", "documents"),
             ("Assistente IA", "/assistant", "assistant"),
         ]
-        # Voce dedicata ai membri del Comitato Tecnico (solo Pariter).
-        if ctx["platform_id"] == 1 and ctx["user"]["role"] in {"technical_committee", "admin"}:
-            nav_items.insert(5, ("Comitato Tecnico", "/pariter/comitato-tecnico", "comitato_tecnico"))
         nav = "".join(
             f'<a class="nav-link {"active" if key == active else ""}" href="{rel_url(href, ctx)}">{label}</a>'
             for label, href, key in nav_items
@@ -4735,17 +4910,15 @@ document.querySelectorAll('[data-campaign-form]').forEach((form) => {
             status = rv["status"] if rv else "in_attesa"
             signed = rv["signed_at"] if rv else ""
             can_act = (m["id"] == ctx["user_id"]) or is_admin
-            badge = {"approvato": "success", "modifica_richiesta": "warning"}.get(status, "neutral")
+            badge = {"approvato": "success", "contrario": "danger", "modifica_richiesta": "warning"}.get(status, "neutral")
             actions = ""
-            if not unanime and can_act:
-                label_sign = "Firma per conto" if (is_admin and m["id"] != ctx["user_id"]) else "Firma e approva"
-                actions = f'''
-                <form method="post" action="/pariter/practices/{pid}/cvoi-member" class="inline-form" style="display:inline">
-                  {hidden_ctx(ctx)}<input type="hidden" name="member_id" value="{m['id']}"><input type="hidden" name="action" value="sign">
-                  <button class="button tiny" type="submit">{label_sign}</button></form>
-                <form method="post" action="/pariter/practices/{pid}/cvoi-member" class="inline-form" style="display:inline">
-                  {hidden_ctx(ctx)}<input type="hidden" name="member_id" value="{m['id']}"><input type="hidden" name="action" value="request_change">
-                  <button class="button tiny" type="submit">Richiedi modifica</button></form>'''
+            if can_act and (not unanime or is_admin):
+                actions = "".join(
+                    f'''<form method="post" action="/pariter/practices/{pid}/cvoi-member" class="inline-form" style="display:inline">
+                      {hidden_ctx(ctx)}<input type="hidden" name="member_id" value="{m['id']}"><input type="hidden" name="action" value="{ak}">
+                      <button class="button tiny" type="submit">{al}</button></form>'''
+                    for ak, al in (("sign", "Favorevole"), ("contrario", "Contrario"), ("request_change", "Modifica"))
+                )
             rows_html += f"""<tr>
               <td>{esc(m['name'])}</td>
               <td><span class="badge {badge}">{esc(status.replace('_',' '))}</span></td>
@@ -4806,6 +4979,7 @@ document.querySelectorAll('[data-campaign-form]').forEach((form) => {
                 votes = {v["user_id"]: v for v in conn.execute(
                     "SELECT * FROM board_member_votes WHERE board_decision_id = ?", (decision["id"],)
                 ).fetchall()}
+            cvoi = cvoi_summary_for(conn, pid)
         recall = self.recall_documents_html(ctx, practice, origins,
                                             "Documenti richiamati per la delibera")
         if locked and not decision:
@@ -4850,6 +5024,10 @@ document.querySelectorAll('[data-campaign-form]').forEach((form) => {
             outcome_opts = "".join(f'<option value="{k}">{esc(v)}</option>' for k, v in DECISION_OUTCOMES)
             finalize = ""
             if can_act:
+                votes_list = [(m["name"], votes[m["id"]]["vote"] if m["id"] in votes else "in_attesa") for m in members]
+                draft_fields = {"meeting_date": decision["meeting_date"] or "", "attendees": decision["attendees"] or "",
+                                "summary": "", "conditions": "", "outcome": ""}
+                draft = compose_decision_draft(practice, round_no, draft_fields, cvoi, votes_list)
                 finalize = f"""
 <section class="panel">
   <div class="section-head"><h2>Finalizza delibera</h2></div>
@@ -4857,9 +5035,9 @@ document.querySelectorAll('[data-campaign-form]').forEach((form) => {
     {hidden_ctx(ctx)}<input type="hidden" name="action" value="finalize"><input type="hidden" name="round" value="{round_no}">
     <label>Presenti<input name="attendees" value="{esc(decision['attendees'] or '')}" placeholder="Consiglieri presenti"></label>
     <label>Esito deliberato<select name="outcome">{outcome_opts}</select></label>
-    <label class="span2">Motivazione / sintesi<textarea name="summary" rows="3"></textarea></label>
     <label class="span2">Condizioni (se approvata con condizioni)<textarea name="conditions" rows="2"></textarea></label>
-    <div class="form-actions"><button class="button primary" type="submit">Finalizza e genera verbale</button></div>
+    <label class="span2">Bozza verbale (precompilata, modificabile prima di generare)<textarea name="verbale_text" rows="16" class="doc-draft">{esc(draft)}</textarea></label>
+    <div class="form-actions"><button class="button primary" type="submit">Genera verbale ufficiale</button></div>
   </form>
 </section>"""
             panel = f"""
@@ -4896,6 +5074,7 @@ document.querySelectorAll('[data-campaign-form]').forEach((form) => {
         with connect() as conn:
             locked = board_decision_outcome(conn, pid, 1) not in {"approvata", "approvata_condizioni"}
             advisory = conn.execute("SELECT * FROM advisory_opinions WHERE practice_id = ? ORDER BY id DESC LIMIT 1", (pid,)).fetchone()
+            cvoi = cvoi_summary_for(conn, pid)
         recall = self.recall_documents_html(ctx, practice, ["CVOI", "Delibera CdA 1"],
                                             "Documenti richiamati per il parere")
         if locked and not advisory:
@@ -4919,6 +5098,14 @@ document.querySelectorAll('[data-campaign-form]').forEach((form) => {
         )
         draft_form = ""
         if can_draft:
+            df = {
+                "meeting_date": advisory["meeting_date"] if advisory else "",
+                "attendees": advisory["attendees"] if advisory else "",
+                "summary": advisory["summary"] if advisory else "",
+                "conditions": advisory["conditions"] if advisory else "",
+                "outcome": advisory["outcome"] if advisory else "favorevole",
+            }
+            parere_draft = compose_advisory_draft(practice, df, cvoi)
             draft_form = f"""
 <section class="panel">
   <div class="section-head"><h2>Redazione parere (non vincolante)</h2></div>
@@ -4926,10 +5113,9 @@ document.querySelectorAll('[data-campaign-form]').forEach((form) => {
     {hidden_ctx(ctx)}<input type="hidden" name="action" value="save">
     <label>Data seduta<input name="meeting_date" type="date" value="{esc(advisory['meeting_date']) if advisory else ''}"></label>
     <label>Componenti<input name="attendees" value="{esc(advisory['attendees']) if advisory else ''}"></label>
-    <label class="span2">Valutazioni e raccomandazioni<textarea name="summary" rows="3">{esc(advisory['summary']) if advisory else ''}</textarea></label>
     <label>Esito<select name="outcome">{outcome_opts}</select></label>
-    <label class="span2">Note / condizioni<textarea name="conditions" rows="2">{esc(advisory['conditions']) if advisory else ''}</textarea></label>
-    <div class="form-actions"><button class="button primary" type="submit">{'Rigenera parere' if advisory else 'Redigi e genera parere'}</button></div>
+    <label class="span2">Bozza parere (precompilata, modificabile prima di generare)<textarea name="parere_text" rows="18" class="doc-draft">{esc(parere_draft)}</textarea></label>
+    <div class="form-actions"><button class="button primary" type="submit">{'Rigenera parere' if advisory else 'Genera parere ufficiale'}</button></div>
   </form>
 </section>"""
         members_panel = self.advisory_members_panel(ctx, practice, advisory) if advisory else ""
@@ -4947,17 +5133,15 @@ document.querySelectorAll('[data-campaign-form]').forEach((form) => {
             status = rv["status"] if rv else "in_attesa"
             signed = rv["signed_at"] if rv else ""
             can_act = (m["id"] == ctx["user_id"]) or is_admin
-            badge = {"approvato": "success", "modifica_richiesta": "warning"}.get(status, "neutral")
+            badge = {"approvato": "success", "contrario": "danger", "modifica_richiesta": "warning"}.get(status, "neutral")
             actions = ""
-            if not unanime and can_act:
-                label_sign = "Firma per conto" if (is_admin and m["id"] != ctx["user_id"]) else "Firma e approva"
-                actions = f'''
-                <form method="post" action="/pariter/practices/{pid}/advisory-member" class="inline-form" style="display:inline">
-                  {hidden_ctx(ctx)}<input type="hidden" name="member_id" value="{m['id']}"><input type="hidden" name="action" value="sign">
-                  <button class="button tiny" type="submit">{label_sign}</button></form>
-                <form method="post" action="/pariter/practices/{pid}/advisory-member" class="inline-form" style="display:inline">
-                  {hidden_ctx(ctx)}<input type="hidden" name="member_id" value="{m['id']}"><input type="hidden" name="action" value="request_change">
-                  <button class="button tiny" type="submit">Richiedi modifica</button></form>'''
+            if can_act and (not unanime or is_admin):
+                actions = "".join(
+                    f'''<form method="post" action="/pariter/practices/{pid}/advisory-member" class="inline-form" style="display:inline">
+                      {hidden_ctx(ctx)}<input type="hidden" name="member_id" value="{m['id']}"><input type="hidden" name="action" value="{ak}">
+                      <button class="button tiny" type="submit">{al}</button></form>'''
+                    for ak, al in (("sign", "Favorevole"), ("contrario", "Contrario"), ("request_change", "Modifica"))
+                )
             rows_html += f"""<tr><td>{esc(m['name'])}</td><td><span class="badge {badge}">{esc(status.replace('_',' '))}</span></td><td class="muted">{esc((signed or '')[:16]) or '-'}</td><td>{actions}</td></tr>"""
         force = ""
         if is_admin and not unanime:
@@ -5500,8 +5684,12 @@ document.querySelectorAll('[data-campaign-form]').forEach((form) => {
                 member_name = m["name"] if m else ""
                 if action == "sign":
                     upsert(member_id, member_name, "approvato", now)
-                    log_action, log_summary = "firma", f"{member_name}: approvato e firmato"
-                    msg = "Firma registrata."
+                    log_action, log_summary = "firma", f"{member_name}: favorevole e firmato"
+                    msg = "Voto favorevole registrato."
+                elif action == "contrario":
+                    upsert(member_id, member_name, "contrario", "")
+                    log_action, log_summary = "contrario", f"{member_name}: contrario"
+                    msg = "Voto contrario registrato."
                 else:  # request_change
                     upsert(member_id, member_name, "modifica_richiesta", "")
                     log_action, log_summary = "modifica", f"{member_name}: richiesta modifica"
@@ -5618,7 +5806,12 @@ document.querySelectorAll('[data-campaign-form]').forEach((form) => {
                 adv = conn.execute("SELECT outcome FROM advisory_opinions WHERE practice_id = ? ORDER BY id DESC LIMIT 1", (practice_id,)).fetchone()
                 if adv:
                     extra_lines.append(("Parere Advisory", ADVISORY_OUTCOME_LABELS.get(adv["outcome"], adv["outcome"])))
-            html_doc = build_decision_html(practice, round_no, fields, cvoi, extra_lines, votes)
+            verbale_text = form.get("verbale_text", "").strip()
+            round_label = "Prima delibera CdA" if round_no == 1 else "Seconda delibera CdA"
+            if verbale_text:
+                html_doc = wrap_practice_doc(round_label, practice, verbale_text)
+            else:
+                html_doc = build_decision_html(practice, round_no, fields, cvoi, extra_lines, votes)
             document_id = generated_document(
                 conn, ctx["platform_id"], None, practice["proponent_id"],
                 f"Delibera CdA {round_no}", "delibera",
@@ -5664,7 +5857,12 @@ document.querySelectorAll('[data-campaign-form]').forEach((form) => {
                 self.redirect(f"/pariter/practices/{practice_id}", ctx, "Serve una prima delibera CdA positiva.", {"tab": "advisory"})
                 return
             cvoi = cvoi_summary_for(conn, practice_id)
-            html_doc = build_advisory_html(practice, fields, cvoi)
+            parere_text = form.get("parere_text", "").strip()
+            if parere_text:
+                html_doc = wrap_practice_doc("Advisory Committee - parere non vincolante", practice, parere_text)
+                fields["summary"] = "Parere redatto (vedi documento)."
+            else:
+                html_doc = build_advisory_html(practice, fields, cvoi)
             document_id = generated_document(
                 conn, ctx["platform_id"], None, practice["proponent_id"],
                 "Advisory Committee", "parere", f"Parere Advisory Committee - {practice['project_title']}",
@@ -5741,7 +5939,8 @@ document.querySelectorAll('[data-campaign-form]').forEach((form) => {
                     self.redirect(f"/pariter/practices/{practice_id}", ctx, "Puoi firmare solo per te stesso.", {"tab": "advisory"})
                     return
                 m = conn.execute("SELECT name FROM users WHERE id = ?", (member_id,)).fetchone()
-                upsert(member_id, m["name"] if m else "", "approvato" if action == "sign" else "modifica_richiesta", now if action == "sign" else "")
+                new_status = {"sign": "approvato", "contrario": "contrario"}.get(action, "modifica_richiesta")
+                upsert(member_id, m["name"] if m else "", new_status, now if action == "sign" else "")
                 became_unanime = recompute_advisory_unanime(conn, aid)
             if became_unanime and PRACTICE_STATUS_INDEX.get(practice["status"], 0) < PRACTICE_STATUS_INDEX["advisory_ricevuto"]:
                 set_practice_status(conn, practice, "advisory_ricevuto", ctx["user_id"], "Parere Advisory unanime: seconda delibera sbloccata")
