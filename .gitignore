@@ -1,6 +1,9 @@
 __pycache__/
 *.pyc
 .DS_Store
-data/*.db
-uploads/
 ecsp_suite.sqlite3
+
+# DB e allegati versionati di proposito per avere lo stesso scenario su piu' PC.
+# Lavorare su un PC alla volta: "aggiorna git" prima di cambiare postazione.
+# data/*.db
+# uploads/

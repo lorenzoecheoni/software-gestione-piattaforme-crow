@@ -4,6 +4,7 @@ import html
 import io
 import json
 import mimetypes
+import os
 import re
 import shutil
 import sqlite3
@@ -22,6 +23,168 @@ UPLOAD_DIR = BASE_DIR / "uploads"
 STATIC_DIR = BASE_DIR / "static"
 TEMPLATE_DIR = BASE_DIR / "templates" / "official"
 DB_PATH = DATA_DIR / "ecsp_suite.db"
+
+# Archivio documentale master (fuori dal repo: 148+ MB, sincronizzato via Google
+# Drive). I documenti dell'archivio hanno storage_path con prefisso "@archive/"
+# e vengono risolti qui invece che dentro BASE_DIR. Override con ECSP_ARCHIVE_DIR.
+ARCHIVE_PREFIX = "@archive/"
+ARCHIVE_DIR = Path(
+    os.environ.get("ECSP_ARCHIVE_DIR", str(BASE_DIR.parent / "Pariter Equity — Archivio documentale"))
+).resolve()
+
+
+def resolve_storage_path(storage_path):
+    """Risolve lo storage_path di un documento in un file su disco, gestendo sia i
+    file interni al repo sia quelli dell'archivio (prefisso @archive/).
+    Ritorna (Path, ok) dove ok=True solo se il file esiste ed e' dentro la radice
+    consentita (anti path-traversal)."""
+    if storage_path and storage_path.startswith(ARCHIVE_PREFIX):
+        rel = storage_path[len(ARCHIVE_PREFIX):]
+        file_path = (ARCHIVE_DIR / rel).resolve()
+        root = ARCHIVE_DIR
+    else:
+        file_path = (BASE_DIR / storage_path).resolve()
+        root = BASE_DIR.resolve()
+    ok = str(file_path).startswith(str(root)) and file_path.exists()
+    return file_path, ok
+
+
+# Descrizioni di contenuto dei documenti d'archivio, ricavate dai documenti-indice
+# (00_INDICE_GENERALE, 01_KNOWLEDGE_BASE sez. 10, 05_PROCESSO_ONBOARDING). Servono a
+# mostrare sotto ogni file una breve descrizione di cosa contiene.
+_ALLEGATO_DESC = {
+    "4": "Statuto e atto costitutivo",
+    "5": "Servizi, piattaforma e selezione delle offerte",
+    "8": "Rischi IT e presidi",
+    "9": "Presidi prudenziali (art. 11)",
+    "10": "Fondi propri",
+    "12": "Onorabilita dei soci",
+    "13": "Onorabilita e competenze dei gestori",
+    "5_1": "Tipologie di servizi e procedura di selezione delle offerte",
+    "5_2": "Descrizione della piattaforma",
+    "5_3": "Strategia di marketing",
+    "6_1": "Governance e assetto organizzativo",
+    "7": "Trattamento dei dati personali (GDPR)",
+    "8_1": "Rischi IT e presidi",
+    "9_1": "Presidi prudenziali (art. 11)",
+    "9_4": "Piano triennale",
+    "10_1": "Fondi propri",
+    "10_2": "Fondi propri",
+    "11": "Continuita operativa",
+    "12": "Onorabilita dei soci",
+    "13": "Onorabilita e competenze dei gestori",
+    "14": "Policy sui conflitti di interesse",
+    "16": "Gestione dei reclami",
+    "17": "Pagamenti e custodia (Banca Sella)",
+    "18": "KIIS - scheda con le informazioni chiave sull'investimento",
+    "19": "Limiti di investimento e classificazione investitori",
+}
+_M_DESC = {
+    1: "Checklist documentale del proponente", 2: "Checklist KYC ex art. 5",
+    3: "Checklist sul limite di 5 milioni", 4: "Modulo di valutazione CVOI (scoring)",
+    5: "Fascicolo di valutazione del progetto", 6: "Parere dell'Advisory Committee",
+    7: "Verbale CdA - delibera sull'offerta", 8: "Checklist di verifica della KIIS",
+    9: "Modulo di classificazione dell'investitore", 10: "Registri conflitti e reclami",
+    11: "Relazione sui controlli art. 5 / AML", 12: "Relazione di insussistenza dei conflitti",
+    13: "Notifica di data breach al Garante", 14: "Segnalazione di incidente ICT (DORA)",
+}
+_C_DESC = {
+    1: "PEC interna di ricezione della candidatura", 2: "Conferma di caricamento al proponente",
+    3: "Richiesta di integrazione documentale", 4: "Comunicazione di esito verifica documentale positivo",
+    5: "Comunicazione di progetto approvato", 6: "Comunicazione di progetto non ammesso",
+    7: "Avviso di pubblicazione dell'offerta", 8: "Conferma dell'ordine all'investitore",
+    9: "Comunicazione a CONSOB tramite SiCrowd",
+}
+_DORA_DESC = {
+    1: "Piano di adeguamento e gap analysis DORA", 2: "Delibera CdA di adozione del quadro ICT",
+    3: "Politica di gestione e classificazione incidenti ICT", 4: "Registro degli incidenti ICT",
+    5: "Registro dei fornitori terzi ICT", 6: "Programma dei test di resilienza",
+}
+_DP_DESC = {
+    1: "Politica di trattamento dati (GDPR)", 2: "Rischi IT e presidi",
+    3: "Piano di continuita operativa", 4: "Quadro del rischio ICT (DORA)",
+}
+_ROOT_DESC = [
+    ("knowledge_base", "Quadro d'insieme: anagrafica, autorizzazioni, gruppo, persone, dati, FAQ."),
+    ("indice_generale", "Indice generale e guida alla consultazione dell'archivio."),
+    ("storico_e_stato", "Storia dell'autorizzazione dal 2019 e stato attuale, con i punti aperti."),
+    ("organigramma", "Assetto proprietario/di controllo e struttura organizzativa interna."),
+    ("framework_compliance", "Architettura dei controlli: fonti, tre linee di difesa, presidi per rischio."),
+    ("manuale_dati", "Presidio operativo GDPR / rischi IT / continuita / DORA."),
+    ("processo_onboarding", "Ciclo dell'offerta passo-passo, con le comunicazioni che partono a ogni fase."),
+]
+_KEYWORD_DESC = [
+    ("nuovo_statuto", "Statuto vigente adottato nel 2025."),
+    ("domanda_autorizzaz", "Domanda di autorizzazione ai servizi di crowdfunding (ECSP)."),
+    ("nota_accompagn", "Nota di accompagnamento alla domanda."),
+    ("prospetto_dati", "Prospetto dati del programma di attivita."),
+    ("autodichiarazione", "Autodichiarazione resa dal proponente."),
+    ("lettera", "Lettera di scambio con l'Autorita di vigilanza."),
+    ("riscontro", "Documento di riscontro a una richiesta CONSOB."),
+    ("avvio", "Comunicazione di avvio attivita."),
+    ("vaglio", "Vaglio del materiale storico rispetto al regime ECSP."),
+    ("rilievi", "Rilievi sulla procedura di selezione."),
+    ("verbale", "Verbale societario."),
+    ("relazione", "Relazione interna della funzione di controllo."),
+    ("checklist", "Checklist operativa."),
+    ("registro", "Registro operativo."),
+    ("leggimi", "Nota di lettura della cartella."),
+    ("rettifiche", "Rettifiche e variazioni post-autorizzazione."),
+    ("variazioni", "Rettifiche e variazioni post-autorizzazione."),
+    ("advisory", "Parere dell'Advisory Committee (modello)."),
+    ("valutazione", "Valutazione del progetto (CVOI)."),
+    ("cvoi", "Verbale di valutazione del progetto (CVOI)."),
+    ("classificazione", "Classificazione dell'investitore."),
+    ("onorabilit", "Documenti di onorabilita di soci o gestori."),
+    ("conferma", "Comunicazione di conferma."),
+    ("notifica", "Notifica a un'autorita."),
+    ("segnalazione", "Segnalazione di un evento."),
+    ("modello", "Modello operativo di riferimento."),
+    ("modulo", "Modulo operativo."),
+    ("faq", "FAQ - domande e risposte frequenti."),
+    ("guida", "Guida informativa per l'investitore."),
+    ("informativa", "Informativa per gli investitori."),
+    ("contratto", "Contratto."),
+    ("obblighi", "Obblighi del gestore del portale."),
+    ("informazioni", "Informazioni per l'investitore."),
+    ("investitor", "Materiale informativo per gli investitori."),
+    ("education", "Materiale di investor education."),
+    ("mail", "Modello di comunicazione email."),
+    ("commenti", "Commenti e note di lavoro."),
+    ("statuto", "Statuto."),
+]
+
+
+def archive_doc_description(filename, relpath=""):
+    """Breve descrizione del contenuto di un documento d'archivio, in base al codice
+    (Allegato N, Mx, Cx, DORAx, DPx) o a parole chiave nel nome file."""
+    low = (filename or "").lower()
+    for key, desc in _ROOT_DESC:
+        if key in low:
+            return desc
+    m = re.match(r"dp(\d)", low)
+    if m and int(m.group(1)) in _DP_DESC:
+        return _DP_DESC[int(m.group(1))]
+    m = re.match(r"dora(\d)", low)
+    if m and int(m.group(1)) in _DORA_DESC:
+        return _DORA_DESC[int(m.group(1))]
+    m = re.match(r"m(\d+)[_ ]", low)
+    if m and int(m.group(1)) in _M_DESC:
+        return _M_DESC[int(m.group(1))]
+    m = re.match(r"c(\d+)[_ ]", low)
+    if m and int(m.group(1)) in _C_DESC:
+        return _C_DESC[int(m.group(1))]
+    m = re.search(r"allegato[_ ]?(\d+)(?:[_ (]+(\d+))?", low)
+    if m:
+        pair = f"{m.group(1)}_{m.group(2)}" if m.group(2) else ""
+        if pair in _ALLEGATO_DESC:
+            return _ALLEGATO_DESC[pair]
+        if m.group(1) in _ALLEGATO_DESC:
+            return _ALLEGATO_DESC[m.group(1)]
+    for key, desc in _KEYWORD_DESC:
+        if key in low:
+            return desc
+    return ""
 
 ROLE_LABELS = {
     "compliance": "Compliance officer",
@@ -65,16 +228,12 @@ PRACTICE_STATUSES = [
     ("verifiche_interne", "Verifiche interne Pariter in corso"),
     ("pronto_cvoi", "Pronto per CVOI"),
     ("cvoi_generato", "Report CVOI generato"),
-    ("attesa_cda1", "In attesa prima delibera CdA"),
-    ("cda1_positiva", "Prima delibera CdA positiva"),
-    ("cda1_positiva_condizioni", "Prima delibera CdA positiva con condizioni"),
-    ("cda1_negativa", "Prima delibera CdA negativa"),
     ("in_advisory", "In Advisory Committee"),
     ("advisory_ricevuto", "Parere Advisory Committee ricevuto"),
-    ("attesa_cda2", "In attesa seconda delibera CdA"),
-    ("cda2_positiva", "Seconda delibera CdA positiva"),
-    ("cda2_positiva_condizioni", "Seconda delibera CdA positiva con condizioni"),
-    ("cda2_negativa", "Seconda delibera CdA negativa"),
+    ("attesa_cda", "In attesa delibera CdA"),
+    ("cda_positiva", "Delibera CdA positiva"),
+    ("cda_positiva_condizioni", "Delibera CdA positiva con condizioni"),
+    ("cda_negativa", "Delibera CdA negativa"),
     ("in_pre_golive", "In pre go-live"),
     ("pronta_verifica_finale", "Pronta per verifica finale"),
     ("pronta_golive", "Pronta per go-live"),
@@ -85,8 +244,9 @@ PRACTICE_STATUSES = [
 PRACTICE_STATUS_LABELS = dict(PRACTICE_STATUSES)
 PRACTICE_STATUS_INDEX = {key: idx for idx, (key, _) in enumerate(PRACTICE_STATUSES)}
 
-# Transizioni ammesse. Regola cardine: Advisory Committee tra prima e seconda
-# delibera CdA; nessun salto di fase. Gli esiti negativi confluiscono in "respinta".
+# Transizioni ammesse. Regola cardine (Allegato 5.1): l'Advisory Committee esprime
+# il parere DOPO la valutazione CVOI e PRIMA dell'unica delibera del CdA; nessun
+# salto di fase. Gli esiti negativi confluiscono in "respinta".
 PRACTICE_FLOW = {
     "dossier_ricevuto": {"verifica_documentale", "respinta"},
     "verifica_documentale": {"da_integrare", "fase1_validata", "respinta"},
@@ -96,17 +256,13 @@ PRACTICE_FLOW = {
     "bozza_kiis_ricevuta": {"verifiche_interne", "respinta"},
     "verifiche_interne": {"pronto_cvoi", "da_integrare", "respinta"},
     "pronto_cvoi": {"cvoi_generato", "respinta"},
-    "cvoi_generato": {"attesa_cda1", "respinta"},
-    "attesa_cda1": {"cda1_positiva", "cda1_positiva_condizioni", "cda1_negativa"},
-    "cda1_positiva": {"in_advisory"},
-    "cda1_positiva_condizioni": {"in_advisory"},
-    "cda1_negativa": {"respinta"},
+    "cvoi_generato": {"in_advisory", "respinta"},
     "in_advisory": {"advisory_ricevuto"},
-    "advisory_ricevuto": {"attesa_cda2"},
-    "attesa_cda2": {"cda2_positiva", "cda2_positiva_condizioni", "cda2_negativa"},
-    "cda2_positiva": {"in_pre_golive"},
-    "cda2_positiva_condizioni": {"in_pre_golive"},
-    "cda2_negativa": {"respinta"},
+    "advisory_ricevuto": {"attesa_cda"},
+    "attesa_cda": {"cda_positiva", "cda_positiva_condizioni", "cda_negativa"},
+    "cda_positiva": {"in_pre_golive"},
+    "cda_positiva_condizioni": {"in_pre_golive"},
+    "cda_negativa": {"respinta"},
     "in_pre_golive": {"pronta_verifica_finale", "da_integrare"},
     "pronta_verifica_finale": {"pronta_golive", "in_pre_golive"},
     "pronta_golive": {"pubblicata"},
@@ -172,9 +328,8 @@ PRACTICE_TABS = [
     ("documentale", "Verifica documentale"),
     ("interne", "Verifiche interne"),
     ("cvoi", "CVOI"),
-    ("cda1", "Prima delibera CdA"),
     ("advisory", "Advisory Committee"),
-    ("cda2", "Seconda delibera CdA"),
+    ("cda", "Delibera CdA"),
     ("condizioni", "Condizioni pre go-live"),
     ("validazione", "Validazione Fase 4"),
     ("campagna", "Pagina campagna"),
@@ -1483,6 +1638,183 @@ def init_db():
         if conn.execute("SELECT COUNT(*) FROM platforms").fetchone()[0] == 0:
             seed(conn)
         ensure_demo_extensions(conn)
+        ensure_pariter_real_governance(conn)
+        ensure_practice_flow_v2(conn)
+
+
+def ensure_pariter_real_governance(conn):
+    """Allinea l'organigramma Pariter ai dati reali estratti dall'archivio
+    (CdA, Advisory Committee, organo di controllo, servizi in outsourcing).
+    Idempotente: la sostituzione degli organi avviene solo se i nomi reali non
+    sono ancora presenti; fornitori e nodi custom si inseriscono se mancanti."""
+    # Enforce dei tre organi a OGNI avvio (idempotente): aggiorna in place i membri
+    # esistenti (preserva gli id referenziati da committee_opinions ecc.), inserisce
+    # gli extra e DISATTIVA i nominativi demo non piu' previsti (es. Paolo Conti,
+    # Nadia Galli, che ensure_demo_extensions tenderebbe a re-inserire).
+    def set_committee(committee, targets):
+        ids = [r[0] for r in conn.execute(
+            "SELECT id FROM committee_members WHERE platform_id = 1 AND committee = ? ORDER BY id",
+            (committee,),
+        )]
+        for i, (name, role, email) in enumerate(targets):
+            if i < len(ids):
+                conn.execute(
+                    "UPDATE committee_members SET name = ?, role = ?, email = ?, active = 1 WHERE id = ?",
+                    (name, role, email, ids[i]),
+                )
+            else:
+                conn.execute(
+                    "INSERT INTO committee_members(platform_id, committee, name, role, email, active) VALUES (1, ?, ?, ?, ?, 1)",
+                    (committee, name, role, email),
+                )
+        for j in range(len(targets), len(ids)):
+            conn.execute("UPDATE committee_members SET active = 0 WHERE id = ?", (ids[j],))
+
+    set_committee("CdA", [
+        ("Gaetano De Vito", "Presidente e legale rappresentante", "gaetano.devito@example.test"),
+        ("Stefania Monotoni", "Consigliere - Responsabile controllo interno", "stefania.monotoni@example.test"),
+        ("Fabio Malerba", "Consigliere", "fabio.malerba@example.test"),
+    ])
+    set_committee("Advisory Committee", [
+        ("Rubina Galeotti", "Membro Advisory Committee (dal 12/11/2025)", "rubina.galeotti@example.test"),
+        ("Gioacchino Attanzio", "Membro Advisory Committee (dal 12/11/2025)", "gioacchino.attanzio@example.test"),
+    ])
+    # Comitato Tecnico: roster reale ancora da definire; placeholder Valerio Innamorati.
+    set_committee("Comitato Tecnico", [
+        ("Valerio Innamorati", "Referente tecnico (assetto da definire)", "valerio.innamorati@example.test"),
+    ])
+
+    # Fornitori reali per i servizi critici in outsourcing. Le diciture contengono
+    # le parole-chiave usate dagli slot dell'organigramma (istituto di pagamento,
+    # sviluppo piattaforma). Upsert auto-correttivo su service_area/notes.
+    for name, area, owner_role, notes in [
+        ("Banca Sella S.p.A.", "Istituto di pagamento e custodia (PSD2)", "board",
+         "Esternalizzazione pagamento, incassi e custodia somme ex art. 5 ECSP."),
+        ("Code Factory S.r.l.", "Sviluppo software piattaforma", "operator",
+         "Sviluppo e manutenzione software della piattaforma - referente Valerio Innamorati (G2R)."),
+        ("Amazon Web Services (AWS)", "Cloud e hosting infrastruttura piattaforma", "operator",
+         "Esternalizzazione cloud, hosting e infrastruttura della piattaforma."),
+    ]:
+        existing_id = conn.execute(
+            "SELECT id FROM suppliers WHERE platform_id = 1 AND name = ?", (name,)
+        ).fetchone()
+        if existing_id:
+            conn.execute(
+                "UPDATE suppliers SET service_area = ?, owner_role = ?, status = 'Attivo', notes = ? WHERE id = ?",
+                (area, owner_role, notes, existing_id[0]),
+            )
+        else:
+            conn.execute(
+                "INSERT INTO suppliers(platform_id, name, service_area, owner_role, status, notes, created_at) "
+                "VALUES (1, ?, ?, ?, 'Attivo', ?, ?)",
+                (name, area, owner_role, notes, now_iso()),
+            )
+
+    # Fornitori demo non riconosciuti. AstraLex subentra a "Studio Legale Verdi"
+    # (segue contabilita e compliance). CloudSign e KYC Data Provider rimossi: gli
+    # slot "Firma e conservazione" e "KYC/AML data provider" tornano "da censire"
+    # (i contratti collegati cadono in cascata, i costi finance vanno a NULL).
+    verdi = conn.execute("SELECT id FROM suppliers WHERE platform_id = 1 AND name = 'Studio Legale Verdi'").fetchone()
+    if verdi:
+        conn.execute(
+            "UPDATE suppliers SET name = 'AstraLex', service_area = 'Contabilita e compliance', "
+            "owner_role = 'compliance', notes = 'Studio che segue contabilita e compliance.' WHERE id = ?",
+            (verdi[0],),
+        )
+        conn.execute(
+            "UPDATE supplier_contracts SET title = 'Incarico contabilita e compliance', contract_type = 'Lettera incarico' "
+            "WHERE supplier_id = ?", (verdi[0],),
+        )
+    for demo_supplier in ("CloudSign S.r.l.", "KYC Data Provider S.p.A."):
+        row_ = conn.execute("SELECT id FROM suppliers WHERE platform_id = 1 AND name = ?", (demo_supplier,)).fetchone()
+        if row_:
+            conn.execute("DELETE FROM suppliers WHERE id = ?", (row_[0],))
+    # Accordi persona demo (Elena Martini, Giulia Ferri, Paolo Conti, Nadia Galli...).
+    conn.execute(
+        "DELETE FROM person_agreements WHERE platform_id = 1 AND person_name IN "
+        "('Elena Martini', 'Luca Serra', 'Giulia Ferri', 'Roberto Neri', 'Paolo Conti', 'Nadia Galli')"
+    )
+
+    # Partecipogramma reale di Pariter Equity S.r.l. (cap table, Knowledge Base sez. 3).
+    sh_targets = [
+        ("Gruppo 2DueRighe S.r.l.", 62.0,
+         "Controllata da Ammigest al 51%; presidia anche il 19% di Pariter che passa per Power Money."),
+        ("Power Money S.r.l.", 19.0,
+         "Soci: Gruppo 2DueRighe 51%, Marcello Aloisi 49%."),
+        ("Pariter Partners S.r.l.", 19.0,
+         "Socio qualificato. Presidente storico Jari Ognibeni."),
+    ]
+    sh_ids = [r[0] for r in conn.execute(
+        "SELECT id FROM shareholders WHERE platform_id = 1 ORDER BY id"
+    )]
+    for i, (name, stake, notes) in enumerate(sh_targets):
+        if i < len(sh_ids):
+            conn.execute(
+                "UPDATE shareholders SET name = ?, stake_percent = ?, notes = ? WHERE id = ?",
+                (name, stake, notes, sh_ids[i]),
+            )
+        else:
+            conn.execute(
+                "INSERT INTO shareholders(platform_id, name, stake_percent, notes) VALUES (1, ?, ?, ?)",
+                (name, stake, notes),
+            )
+    for j in range(len(sh_targets), len(sh_ids)):
+        conn.execute("DELETE FROM shareholders WHERE id = ? AND id NOT IN (SELECT shareholder_id FROM shareholder_documents)", (sh_ids[j],))
+
+    # Organo di controllo storico (sindaco unico) come nodo custom dell'area controllo.
+    if not conn.execute(
+        "SELECT COUNT(*) FROM org_assignments WHERE platform_id = 1 AND subject_name = 'Roberto Rizzuto'"
+    ).fetchone()[0]:
+        if not conn.execute(
+            "SELECT COUNT(*) FROM org_functions WHERE platform_id = 1 AND function_name = 'Organo di controllo (sindaco)'"
+        ).fetchone()[0]:
+            conn.execute(
+                "INSERT INTO org_functions(platform_id, area, function_name, kind, note, active, created_by, created_at, updated_at) "
+                "VALUES (1, 'Area di controllo', 'Organo di controllo (sindaco)', 'control', 'Vigilanza statutaria storica', 1, 1, ?, ?)",
+                (now_iso(), now_iso()),
+            )
+        conn.execute(
+            "INSERT INTO org_assignments(platform_id, subject_name, subject_type, function_name, area, role, start_date, status, notes, created_by, created_at, updated_at) "
+            "VALUES (1, 'Roberto Rizzuto', 'Persona', 'Organo di controllo (sindaco)', 'Area di controllo', 'Sindaco unico (storico)', '2020-05-20', 'Attivo', 'Organo di controllo del precedente regime.', 1, ?, ?)",
+            (now_iso(), now_iso()),
+        )
+
+    conn.commit()
+
+
+def ensure_practice_flow_v2(conn):
+    """Migra i dati esistenti al flusso a delibera CdA unica (Advisory PRIMA del CdA):
+    rimappa i vecchi stati a due delibere e rende coerenti le pratiche gia' aperte.
+    Idempotente."""
+    status_map = {
+        "attesa_cda1": "attesa_cda", "attesa_cda2": "attesa_cda",
+        "cda1_positiva": "cda_positiva", "cda2_positiva": "cda_positiva",
+        "cda1_positiva_condizioni": "cda_positiva_condizioni",
+        "cda2_positiva_condizioni": "cda_positiva_condizioni",
+        "cda1_negativa": "cda_negativa", "cda2_negativa": "cda_negativa",
+    }
+    for old, new in status_map.items():
+        conn.execute("UPDATE practices SET status = ? WHERE status = ?", (new, old))
+        conn.execute("UPDATE practice_status_history SET to_status = ? WHERE to_status = ?", (new, old))
+        conn.execute("UPDATE practice_status_history SET from_status = ? WHERE from_status = ?", (new, old))
+    # Le delibere collegiali ora usano un unico round.
+    conn.execute("UPDATE practice_board_decisions SET decision_round = 1 WHERE decision_round = 2")
+    # Pratiche arrivate alla delibera senza parere Advisory registrato: nel nuovo
+    # flusso l'Advisory precede il CdA, quindi si seedea un parere unanime coerente.
+    pending = conn.execute(
+        "SELECT id, created_by FROM practices WHERE status IN ('attesa_cda', 'cda_positiva', 'cda_positiva_condizioni') "
+        "AND id NOT IN (SELECT practice_id FROM advisory_opinions)"
+    ).fetchall()
+    for pr in pending:
+        conn.execute(
+            """INSERT INTO advisory_opinions(practice_id, meeting_date, attendees, agenda, summary, outcome,
+                workflow_status, created_by, created_at)
+               VALUES (?, '2026-01-21', 'Rubina Galeotti, Gioacchino Attanzio',
+                'Esame fascicolo CVOI e profili di conflitto', 'Parere favorevole non vincolante al CdA.',
+                'favorevole', 'unanime', ?, ?)""",
+            (pr["id"], pr["created_by"] or 11, now_iso()),
+        )
+    conn.commit()
 
 
 def seed(conn):
@@ -1537,8 +1869,9 @@ def seed(conn):
     conn.executemany(
         "INSERT INTO shareholders(platform_id, name, stake_percent, notes) VALUES (?, ?, ?, ?)",
         [
-            (1, "Holding Alfa S.r.l.", 38.5, "Socio qualificato"),
-            (1, "Fondatori Pariter", 22.0, "Patto parasociale in archivio"),
+            (1, "Gruppo 2DueRighe S.r.l.", 62.0, "Controllata da Ammigest al 51%; presidia anche il 19% via Power Money."),
+            (1, "Power Money S.r.l.", 19.0, "Soci: Gruppo 2DueRighe 51%, Marcello Aloisi 49%."),
+            (1, "Pariter Partners S.r.l.", 19.0, "Socio qualificato. Presidente storico Jari Ognibeni."),
             (2, "ISI Holding S.p.A.", 51.0, "Controllo diretto"),
             (2, "Club Investitori", 18.5, "Accordo quadro"),
         ],
@@ -1800,11 +2133,7 @@ def ensure_demo_extensions(conn):
     ]:
         ensure_committee_member(2, committee, name, role, email)
 
-    for name, role in [
-        ("Paolo Conti", "Relatore Advisory Committee"),
-        ("Nadia Galli", "Membro Advisory Committee"),
-    ]:
-        ensure_committee_member(1, "Advisory Committee", name, role, f"{name.lower().replace(' ', '.')}@example.test")
+    # (Advisory Committee di Pariter: roster reale gestito in ensure_pariter_real_governance.)
     isi_technical_reviewer = conn.execute(
         """
         SELECT id FROM committee_members
@@ -2128,8 +2457,8 @@ def ensure_demo_extensions(conn):
 
 
 def ensure_demo_practice_cda(conn):
-    """Seconda pratica demo ferma sulla Prima delibera CdA con votazione APERTA,
-    cosi' da mostrare dal vivo come il CdA vota e delibera."""
+    """Seconda pratica demo ferma sull'unica delibera CdA con votazione APERTA,
+    DOPO il parere dell'Advisory Committee, per mostrare dal vivo il voto del CdA."""
     if conn.execute("SELECT COUNT(*) FROM practices WHERE platform_id = 1").fetchone()[0] >= 2:
         return
     now = now_iso()
@@ -2137,7 +2466,7 @@ def ensure_demo_practice_cda(conn):
         """INSERT INTO practices(platform_id, project_title, proponent_name, status, instrument,
             target_amount, max_amount, pre_money, equity_percent, source_system, kiis_state,
             internal_owner, created_by, created_at, updated_at)
-           VALUES (1, 'MedTech Aurora - dispositivo diagnostico', 'MedTech Aurora S.p.A.', 'attesa_cda1',
+           VALUES (1, 'MedTech Aurora - dispositivo diagnostico', 'MedTech Aurora S.p.A.', 'attesa_cda',
             'Quote di S.r.l.', 250000, 500000, 2500000, '9%', 'Import file', 'completata',
             'Alessia Ricci', 1, ?, ?)""",
         (now, now),
@@ -2175,7 +2504,16 @@ def ensure_demo_practice_cda(conn):
             "INSERT INTO cvoi_member_reviews(cvoi_report_id, user_id, member_name, role, status, signed_at, updated_at) VALUES (?, ?, ?, 'technical_committee', 'approvato', ?, ?)",
             (rid, uid, nm["name"] if nm else "", now, now),
         )
-    # Prima delibera CdA gia' APERTA in votazione (nessun voto ancora espresso)
+    # Parere Advisory Committee gia' reso in versione unanime (precede la delibera CdA).
+    conn.execute(
+        """INSERT INTO advisory_opinions(practice_id, meeting_date, attendees, agenda, summary, outcome,
+            workflow_status, created_by, created_at)
+           VALUES (?, '2026-01-21', 'Rubina Galeotti, Gioacchino Attanzio',
+            'Esame fascicolo CVOI e profili di conflitto', 'Parere favorevole non vincolante al CdA.',
+            'favorevole', 'unanime', 11, ?)""",
+        (pid, now),
+    )
+    # Unica delibera CdA gia' APERTA in votazione (nessun voto ancora espresso).
     conn.execute(
         """INSERT INTO practice_board_decisions(practice_id, decision_round, meeting_date, agenda, outcome, decision_status, created_by, created_at)
            VALUES (?, 1, '2026-01-22', 'Valutazione pratica MedTech Aurora', '', 'in_votazione', 11, ?)""",
@@ -2183,7 +2521,7 @@ def ensure_demo_practice_cda(conn):
     )
     conn.execute(
         """INSERT INTO practice_status_history(practice_id, from_status, to_status, actor_id, notes, created_at)
-           VALUES (?, '', 'attesa_cda1', 1, 'Demo: CdA1 con votazione aperta', ?)""",
+           VALUES (?, '', 'attesa_cda', 1, 'Demo: delibera CdA aperta dopo parere Advisory unanime', ?)""",
         (pid, now),
     )
 
@@ -2862,8 +3200,8 @@ def set_practice_status(conn, practice, to_status, actor_id, notes="", condition
 
 
 def cvoi_is_validated(conn, practice_id):
-    """CVOI utilizzabile per la prima delibera: versione unanime del Comitato Tecnico
-    oppure validazione/forzatura (admin)."""
+    """CVOI utilizzabile per l'invio all'Advisory Committee: versione unanime del
+    Comitato Tecnico oppure validazione/forzatura (admin)."""
     return conn.execute(
         "SELECT 1 FROM cvoi_reports WHERE practice_id = ? AND (workflow_status = 'unanime' OR review_status = 'validato') LIMIT 1",
         (practice_id,),
@@ -2952,8 +3290,8 @@ def golive_blockers(conn, practice_id):
     ).fetchone()[0]
     if missing:
         blockers.append(f"Checklist Fase 4 incompleta: {missing} documenti non verificati.")
-    if board_decision_outcome(conn, practice_id, 2) not in {"approvata", "approvata_condizioni"}:
-        blockers.append("Manca la seconda delibera CdA positiva.")
+    if board_decision_outcome(conn, practice_id, 1) not in {"approvata", "approvata_condizioni"}:
+        blockers.append("Manca la delibera CdA positiva.")
     if not advisory_is_expressed(conn, practice_id):
         blockers.append("Manca il parere Advisory Committee.")
     return blockers
@@ -3042,9 +3380,8 @@ def _cvoi_summary_text(cvoi):
 
 def compose_decision_draft(practice, round_no, fields, cvoi, votes, extra_lines=None):
     """Bozza editabile del verbale CdA, precompilata con i dati caricati."""
-    odg = ("Valutazione preliminare del progetto e autorizzazione all'invio all'Advisory Committee"
-           if round_no == 1 else
-           "Valutazione finale e relative motivazioni sul progetto; autorizzazione alla prosecuzione verso il pre go-live")
+    odg = ("Valutazione finale del progetto, presa d'atto del parere dell'Advisory Committee e deliberazione; "
+           "autorizzazione alla prosecuzione verso il pre go-live")
     vote_lines = []
     if votes:
         for n, v in votes:
@@ -3138,7 +3475,7 @@ def compose_advisory_draft(practice, fields, cvoi):
 
 def build_decision_html(practice, round_no, fields, cvoi, extra_lines=None, votes=None):
     """Verbale di Consiglio di Amministrazione (fedele al template Pariter)."""
-    round_label = "Prima delibera CdA (preliminare)" if round_no == 1 else "Seconda delibera CdA (definitiva)"
+    round_label = "Delibera CdA (definitiva)"
     extra_html = "".join(f"<tr><th>{esc(k)}</th><td>{esc(v)}</td></tr>" for k, v in (extra_lines or []))
     outcome_label = DECISION_OUTCOME_LABELS.get(fields.get("outcome"), fields.get("outcome"))
     votes_html = ""
@@ -4539,12 +4876,10 @@ document.querySelectorAll('[data-campaign-form]').forEach((form) => {
             return self.practice_tab_interne(ctx, practice)
         if tab == "cvoi":
             return self.practice_tab_cvoi(ctx, practice)
-        if tab == "cda1":
-            return self.practice_tab_decision(ctx, practice, 1)
         if tab == "advisory":
             return self.practice_tab_advisory(ctx, practice)
-        if tab == "cda2":
-            return self.practice_tab_decision(ctx, practice, 2)
+        if tab == "cda":
+            return self.practice_tab_decision(ctx, practice, 1)
         if tab == "condizioni":
             return self.practice_tab_condizioni(ctx, practice)
         if tab == "validazione":
@@ -4958,17 +5293,12 @@ document.querySelectorAll('[data-campaign-form]').forEach((form) => {
 
     def practice_tab_decision(self, ctx, practice, round_no):
         pid = practice["id"]
-        title = "Prima delibera CdA" if round_no == 1 else "Seconda delibera CdA"
+        title = "Delibera CdA"
         can_act = user_can(ctx["user"], "board_decision")  # board + admin
         with connect() as conn:
-            if round_no == 1:
-                locked = not cvoi_is_validated(conn, pid)
-                lock_msg = "Per deliberare serve un Report CVOI approvato dal Comitato Tecnico (versione unanime)."
-                origins = ["CVOI", "Verifiche interne"]
-            else:
-                locked = not advisory_is_unanime(conn, pid)
-                lock_msg = "Per la seconda delibera serve il parere Advisory Committee in versione unanime."
-                origins = ["CVOI", "Delibera CdA 1", "Advisory Committee"]
+            locked = not advisory_is_unanime(conn, pid)
+            lock_msg = "Per deliberare serve il parere dell'Advisory Committee in versione unanime (interviene prima della delibera del CdA)."
+            origins = ["CVOI", "Advisory Committee", "Verifiche interne"]
             decision = conn.execute(
                 "SELECT * FROM practice_board_decisions WHERE practice_id = ? AND decision_round = ? ORDER BY id DESC LIMIT 1",
                 (pid, round_no),
@@ -5072,13 +5402,13 @@ document.querySelectorAll('[data-campaign-form]').forEach((form) => {
     def practice_tab_advisory(self, ctx, practice):
         pid = practice["id"]
         with connect() as conn:
-            locked = board_decision_outcome(conn, pid, 1) not in {"approvata", "approvata_condizioni"}
+            locked = not cvoi_is_validated(conn, pid)
             advisory = conn.execute("SELECT * FROM advisory_opinions WHERE practice_id = ? ORDER BY id DESC LIMIT 1", (pid,)).fetchone()
             cvoi = cvoi_summary_for(conn, pid)
-        recall = self.recall_documents_html(ctx, practice, ["CVOI", "Delibera CdA 1"],
+        recall = self.recall_documents_html(ctx, practice, ["CVOI", "Verifiche interne"],
                                             "Documenti richiamati per il parere")
         if locked and not advisory:
-            return recall + '<section class="panel"><div class="section-head"><h2>Advisory Committee</h2></div><p class="muted">L\'Advisory Committee interviene dopo una prima delibera CdA positiva (anche con condizioni) e prima della seconda delibera.</p></section>'
+            return recall + '<section class="panel"><div class="section-head"><h2>Advisory Committee</h2></div><p class="muted">L\'Advisory Committee interviene dopo la valutazione CVOI (versione unanime) e prima dell\'unica delibera del CdA.</p></section>'
         summary_panel = ""
         if advisory:
             wf = advisory["workflow_status"] if "workflow_status" in advisory.keys() else "bozza"
@@ -5154,7 +5484,7 @@ document.querySelectorAll('[data-campaign-form]').forEach((form) => {
   <div class="section-head"><h2>Advisory Committee - approvazioni e firme</h2>{head_badge}</div>
   <table class="data-table compact"><thead><tr><th>Membro</th><th>Stato</th><th>Firmato il</th><th></th></tr></thead><tbody>{rows_html}</tbody></table>
   <div class="form-actions">{force}</div>
-  <p class="muted">Come il CVOI: un membro redige, gli altri firmano o chiedono modifica; con tutte le firme il parere e' unanime e abilita la seconda delibera CdA. Ogni modifica azzera le firme.</p>
+  <p class="muted">Come il CVOI: un membro redige, gli altri firmano o chiedono modifica; con tutte le firme il parere e' unanime e abilita la delibera del CdA. Ogni modifica azzera le firme.</p>
 </section>"""
 
     def practice_tab_condizioni(self, ctx, practice):
@@ -5707,8 +6037,8 @@ document.querySelectorAll('[data-campaign-form]').forEach((form) => {
 
     def post_practice_board_decision(self, practice_id, form):
         ctx = self.ctx_from_form(form)
-        round_no = 2 if str(form.get("round", "1")) == "2" else 1
-        back_tab = "cda1" if round_no == 1 else "cda2"
+        round_no = 1  # delibera unica del CdA, dopo il parere dell'Advisory Committee
+        back_tab = "cda"
         practice = self._practice_guard(ctx, practice_id, back_tab, perm="board_decision")
         if not practice:
             return
@@ -5722,11 +6052,8 @@ document.querySelectorAll('[data-campaign-form]').forEach((form) => {
             ).fetchone()
 
             if action == "open":
-                if round_no == 1 and not cvoi_is_validated(conn, practice_id):
-                    self.redirect(f"/pariter/practices/{practice_id}", ctx, "Serve un CVOI in versione unanime.", {"tab": back_tab})
-                    return
-                if round_no == 2 and not advisory_is_unanime(conn, practice_id):
-                    self.redirect(f"/pariter/practices/{practice_id}", ctx, "Serve un parere Advisory in versione unanime.", {"tab": back_tab})
+                if not advisory_is_unanime(conn, practice_id):
+                    self.redirect(f"/pariter/practices/{practice_id}", ctx, "Serve il parere Advisory in versione unanime prima della delibera del CdA.", {"tab": back_tab})
                     return
                 if decision and decision["decision_status"] == "in_votazione":
                     self.redirect(f"/pariter/practices/{practice_id}", ctx, "Delibera gia' aperta.", {"tab": back_tab})
@@ -5775,7 +6102,7 @@ document.querySelectorAll('[data-campaign-form]').forEach((form) => {
             if action == "reopen":
                 conn.execute("UPDATE practice_board_decisions SET decision_status = 'in_votazione', outcome = '' WHERE id = ?", (rid,))
                 conn.execute("DELETE FROM board_member_votes WHERE board_decision_id = ?", (rid,))
-                set_practice_status(conn, practice, "attesa_cda1" if round_no == 1 else "attesa_cda2", ctx["user_id"], "Ridelibera CdA dopo sospensione")
+                set_practice_status(conn, practice, "attesa_cda", ctx["user_id"], "Ridelibera CdA dopo sospensione")
                 conn.commit()
                 self.redirect(f"/pariter/practices/{practice_id}", ctx, "Votazione riaperta per ridelibera.", {"tab": back_tab})
                 return
@@ -5800,23 +6127,20 @@ document.querySelectorAll('[data-campaign-form]').forEach((form) => {
             }
             cvoi = cvoi_summary_for(conn, practice_id)
             extra_lines = []
-            if round_no == 2:
-                o1 = board_decision_outcome(conn, practice_id, 1)
-                extra_lines.append(("Prima delibera CdA", DECISION_OUTCOME_LABELS.get(o1, o1 or "-")))
-                adv = conn.execute("SELECT outcome FROM advisory_opinions WHERE practice_id = ? ORDER BY id DESC LIMIT 1", (practice_id,)).fetchone()
-                if adv:
-                    extra_lines.append(("Parere Advisory", ADVISORY_OUTCOME_LABELS.get(adv["outcome"], adv["outcome"])))
+            adv = conn.execute("SELECT outcome FROM advisory_opinions WHERE practice_id = ? ORDER BY id DESC LIMIT 1", (practice_id,)).fetchone()
+            if adv:
+                extra_lines.append(("Parere Advisory Committee", ADVISORY_OUTCOME_LABELS.get(adv["outcome"], adv["outcome"])))
             verbale_text = form.get("verbale_text", "").strip()
-            round_label = "Prima delibera CdA" if round_no == 1 else "Seconda delibera CdA"
+            round_label = "Delibera CdA"
             if verbale_text:
                 html_doc = wrap_practice_doc(round_label, practice, verbale_text)
             else:
                 html_doc = build_decision_html(practice, round_no, fields, cvoi, extra_lines, votes)
             document_id = generated_document(
                 conn, ctx["platform_id"], None, practice["proponent_id"],
-                f"Delibera CdA {round_no}", "delibera",
-                f"{'Prima' if round_no == 1 else 'Seconda'} delibera CdA - {practice['project_title']}",
-                f"delibera_cda{round_no}.html", html_doc, ctx["user_id"],
+                "Delibera CdA", "delibera",
+                f"Delibera CdA - {practice['project_title']}",
+                "delibera_cda.html", html_doc, ctx["user_id"],
             )
             link_document_practice(conn, document_id, practice_id)
             new_status = "sospesa" if outcome == "sospesa" else "finalizzata"
@@ -5825,18 +6149,14 @@ document.querySelectorAll('[data-campaign-form]').forEach((form) => {
                    generated_document_id = ?, decision_status = ?, finalized_by = ?, finalized_at = ? WHERE id = ?""",
                 (fields["attendees"], fields["summary"], outcome, fields["conditions"], document_id, new_status, ctx["user_id"], now, rid),
             )
-            if round_no == 1:
-                target = {"approvata": "cda1_positiva", "approvata_condizioni": "cda1_positiva_condizioni",
-                          "respinta": "respinta", "sospesa": "da_integrare"}.get(outcome)
-            else:
-                target = {"approvata": "in_pre_golive", "approvata_condizioni": "in_pre_golive",
-                          "respinta": "respinta", "sospesa": "da_integrare"}.get(outcome)
+            target = {"approvata": "in_pre_golive", "approvata_condizioni": "in_pre_golive",
+                      "respinta": "respinta", "sospesa": "da_integrare"}.get(outcome)
             if target:
                 set_practice_status(conn, practice, target, ctx["user_id"],
-                                    f"Delibera CdA {round_no}: {DECISION_OUTCOME_LABELS.get(outcome, outcome)}", fields["conditions"])
+                                    f"Delibera CdA: {DECISION_OUTCOME_LABELS.get(outcome, outcome)}", fields["conditions"])
             conn.commit()
         if outcome.startswith("approvata"):
-            nxt = "Advisory Committee sbloccato." if round_no == 1 else "Fase 4 proponente sbloccata (pre go-live)."
+            nxt = "Delibera approvata: fase pre go-live sbloccata."
         elif outcome == "sospesa":
             nxt = "Pratica sospesa: in attesa di revisioni/integrazioni (resta schedulata in CdA)."
         else:
@@ -5853,8 +6173,8 @@ document.querySelectorAll('[data-campaign-form]').forEach((form) => {
         fields["outcome"] = outcome
         now = now_iso()
         with connect() as conn:
-            if board_decision_outcome(conn, practice_id, 1) not in {"approvata", "approvata_condizioni"}:
-                self.redirect(f"/pariter/practices/{practice_id}", ctx, "Serve una prima delibera CdA positiva.", {"tab": "advisory"})
+            if not cvoi_is_validated(conn, practice_id):
+                self.redirect(f"/pariter/practices/{practice_id}", ctx, "Serve un Report CVOI in versione unanime prima del parere Advisory.", {"tab": "advisory"})
                 return
             cvoi = cvoi_summary_for(conn, practice_id)
             parere_text = form.get("parere_text", "").strip()
@@ -5943,10 +6263,10 @@ document.querySelectorAll('[data-campaign-form]').forEach((form) => {
                 upsert(member_id, m["name"] if m else "", new_status, now if action == "sign" else "")
                 became_unanime = recompute_advisory_unanime(conn, aid)
             if became_unanime and PRACTICE_STATUS_INDEX.get(practice["status"], 0) < PRACTICE_STATUS_INDEX["advisory_ricevuto"]:
-                set_practice_status(conn, practice, "advisory_ricevuto", ctx["user_id"], "Parere Advisory unanime: seconda delibera sbloccata")
+                set_practice_status(conn, practice, "advisory_ricevuto", ctx["user_id"], "Parere Advisory unanime: delibera CdA sbloccata")
             log_audit(conn, ctx["platform_id"], ctx["user_id"], "practice", practice_id, "Advisory - firma membro", action)
             conn.commit()
-        msg = "Parere Advisory ora unanime: seconda delibera CdA sbloccata." if became_unanime else "Registrato."
+        msg = "Parere Advisory ora unanime: delibera CdA sbloccata." if became_unanime else "Registrato."
         self.redirect(f"/pariter/practices/{practice_id}", ctx, msg, {"tab": "advisory"})
 
     def post_practice_condition(self, practice_id, form):
@@ -6433,7 +6753,24 @@ document.querySelectorAll('[data-campaign-form]').forEach((form) => {
             (selected_shareholder_id, pid),
         ) if selected_shareholder_id else None
         agreements = rows("SELECT * FROM person_agreements WHERE platform_id = ? ORDER BY person_name, agreement_type", (pid,))
-        docs = rows("SELECT * FROM documents WHERE platform_id = ? AND origin = 'Compagine' ORDER BY created_at DESC", (pid,))
+        docs = rows(
+            """
+            SELECT * FROM documents
+            WHERE platform_id = ?
+              AND (
+                origin = 'Compagine'
+                OR (origin IN ('Archivio', 'Autorita') AND category IN (
+                  'Statuto', 'Domanda autorizzazione ECSP', 'Comunicazione CONSOB',
+                  'Comunicazione Banca d''Italia', 'Visura camerale', 'Patti parasociali',
+                  'Verbale CdA', 'Delibera CdA', 'Bilancio', 'Situazione contabile',
+                  'Prospetto requisiti prudenziali', 'Polizza assicurativa',
+                  'Data processing agreement', 'Business plan', 'Outsourcing'
+                ))
+              )
+            ORDER BY created_at DESC
+            """,
+            (pid,),
+        )
         balance_docs = [d for d in docs if d["category"] in {"Bilancio", "Situazione contabile", "Relazione revisore", "Prospetto requisiti prudenziali", "Polizza assicurativa"}]
         authorization_keywords = [
             "domanda autorizzazione",
@@ -6572,10 +6909,20 @@ document.querySelectorAll('[data-campaign-form]').forEach((form) => {
             names = [m["name"] for m in groups.get(group_name, []) if m["active"]]
             return ", ".join(names)
 
+        # Titolari reali delle funzioni Pariter (dai documenti d'archivio). Le funzioni
+        # non note restano vuote ("da censire"): niente piu' nomi demo come fallback.
+        pariter_function_owners = {
+            "Legale rappresentante": "Gaetano De Vito",
+            "Compliance interna": "Stefania Monotoni",
+            "Antiriciclaggio / antiterrorismo": "Stefania Monotoni",
+            "Risk control": "Stefania Monotoni",
+            "Conflitti di interesse": "Stefania Monotoni",
+        }
+
         def owner_for(label, fallback=""):
-            if is_isi and label in isi_function_owners:
-                return isi_function_owners[label]
-            return fallback
+            if is_isi:
+                return isi_function_owners.get(label, fallback)
+            return pariter_function_owners.get(label, "")
 
         def org_node(label, people):
             if isinstance(people, str):
@@ -6758,6 +7105,131 @@ document.querySelectorAll('[data-campaign-form]').forEach((form) => {
             </div>"""
             for d in balance_docs
         ) or '<p class="empty-state">Nessun bilancio o prospetto contabile caricato.</p>'
+
+        # Bucketizzazione dei documenti d'archivio per cartella (coerente con
+        # l'architettura dell'archivio): statuto, fascicolo autorizzazione +
+        # aggiornamenti, scambi con l'Autorita, template/allegati, documenti interni.
+        archive_docs = rows(
+            "SELECT * FROM documents WHERE platform_id = ? AND storage_path LIKE '@archive/%' ORDER BY title",
+            (pid,),
+        )
+        real_balance_cats = {"Bilancio", "Situazione contabile"}
+        # Sottocartelle di 09_ARCHIVIO_STORICO che sono SCAMBI con la vigilanza
+        # (lettere, riscontri CONSOB, vigilanza BdI) e non versioni depositate.
+        exchange_keys = ("Lettere", "CONSOB", "Vigilanza", "Cambio_assetto")
+        statuto_docs, auth_fascicolo_docs, auth_update_docs = [], [], []
+        auth_history_docs, authority_docs = [], []
+        template_docs, internal_docs, bilanci_docs = [], [], []
+
+        def _arel(d):
+            sp = d["storage_path"] or ""
+            return sp[len("@archive/"):] if sp.startswith("@archive/") else sp
+
+        for d in archive_docs:
+            r = _arel(d)
+            cat = d["category"]
+            seg = r.split("/")
+            sub = seg[1] if len(seg) > 1 else ""
+            if cat == "Statuto":
+                statuto_docs.append(d)
+            elif cat in real_balance_cats:
+                bilanci_docs.append(d)
+            elif r.startswith("06_AUTORIZZAZIONE_VIGENTE/B_"):
+                auth_update_docs.append(d)
+            elif r.startswith("06_AUTORIZZAZIONE_VIGENTE/A_") or cat == "Domanda autorizzazione ECSP":
+                auth_fascicolo_docs.append(d)
+            elif r.startswith("08_VAGLIO") or cat in ("Comunicazione CONSOB", "Comunicazione Banca d'Italia"):
+                authority_docs.append(d)
+            elif r.startswith("09_ARCHIVIO_STORICO"):
+                if any(k in sub for k in exchange_keys):
+                    authority_docs.append(d)
+                else:
+                    auth_history_docs.append(d)  # domande, integrazioni, depositi, legacy
+            elif r.startswith("07_TEMPLATE"):
+                template_docs.append(d)
+            else:
+                internal_docs.append(d)
+
+        def _doc_card(d):
+            desc = archive_doc_description(d["filename"], _arel(d))
+            desc_html = f'<small>{esc(desc)}</small>' if desc else ''
+            return (f'<div class="document-row"><div><strong>{esc(d["title"])}</strong>'
+                    f'<span class="doc-filename">{esc(d["filename"])}</span>{desc_html}</div>'
+                    f'<a class="button ghost" href="{rel_url("/documents/" + str(d["id"]) + "/download", ctx)}">Apri</a></div>')
+
+        def card_list(doclist, empty):
+            return "".join(_doc_card(d) for d in doclist) or f'<p class="empty-state">{esc(empty)}</p>'
+
+        def _clean_seg(name):
+            return re.sub(r"^[0-9A-Za-z]{1,3}_", "", name).replace("_", " ").strip()
+
+        def dossier_blocks(doclist, empty):
+            groups, order = {}, []
+            for d in doclist:
+                parts = _arel(d).split("/")
+                folder = parts[:-1]  # cartelle dossier, escluso il filename
+                key = "/".join(folder[:2]) if folder else parts[0]
+                if key not in groups:
+                    groups[key] = []
+                    order.append(key)
+                groups[key].append(d)
+            blocks = []
+            for key in sorted(order):
+                docs = groups[key]
+                title = _clean_seg(key.split("/")[-1])
+                blocks.append(
+                    f'<div class="dossier-block"><div class="section-head compact-head">'
+                    f'<h3>{esc(title)}</h3><span class="panel-kicker">{len(docs)} file</span></div>'
+                    f'<div class="document-list compact-document-list">{"".join(_doc_card(d) for d in docs)}</div></div>'
+                )
+            return "".join(blocks) or f'<p class="empty-state">{esc(empty)}</p>'
+
+        def _statuto_info(d):
+            r = _arel(d)
+            low = r.lower()
+            if "nuovo_statuto_2025" in low:
+                return ("Vigente", "Statuto vigente (2025)",
+                        "Statuto adottato nel 2025; supera l'Allegato 4 dell'autorizzazione.")
+            if "verbale_aucap" in low:
+                return ("Vigente", "Adozione nuovo statuto (2025)",
+                        "Verbale di aumento di capitale e adozione del nuovo statuto (lug. 2025).")
+            if low.startswith("06_autorizzazione_vigente/a_"):
+                part = " - parte 4.1a" if "4_1a" in low else (" - parte 4.1b" if "4_1b" in low else "")
+                return ("Autorizzato 2024", f"Statuto autorizzato 2024{part}",
+                        "Statuto come depositato nel fascicolo autorizzato da CONSOB (giugno 2024).")
+            seg = r.split("/")
+            folder = seg[1] if len(seg) > 1 else ""
+            m = re.search(r"(\d{4}-\d{2}-\d{2})", folder)
+            when = f" ({m.group(1)})" if m else ""
+            return ("Storico", f"Statuto - {_clean_seg(folder)}",
+                    f"Versione dello statuto depositata in questo passaggio{when}.")
+
+        def _statuto_card(d):
+            tag, title, desc = _statuto_info(d)
+            badge = {"Vigente": "ok", "Autorizzato 2024": "neutral", "Storico": "warning"}.get(tag, "neutral")
+            return (f'<div class="document-row"><div>'
+                    f'<strong>{esc(title)}</strong>'
+                    f'<span class="doc-filename">{esc(d["filename"])}</span>'
+                    f'<small>{esc(desc)}</small></div>'
+                    f'<div class="doc-row-actions"><span class="badge {badge}">{esc(tag)}</span>'
+                    f'<a class="button ghost" href="{rel_url("/documents/" + str(d["id"]) + "/download", ctx)}">Apri</a></div></div>')
+
+        _statuto_rank = {"Vigente": 0, "Autorizzato 2024": 1, "Storico": 2}
+        statuto_sorted = sorted(statuto_docs, key=lambda d: (_statuto_rank.get(_statuto_info(d)[0], 9), _arel(d)))
+        statuto_current_cards = "".join(
+            _statuto_card(d) for d in statuto_sorted if _statuto_info(d)[0] != "Storico"
+        ) or '<p class="empty-state">Nessuno statuto vigente o autorizzato in archivio.</p>'
+        statuto_history_cards = "".join(
+            _statuto_card(d) for d in statuto_sorted if _statuto_info(d)[0] == "Storico"
+        ) or '<p class="empty-state">Nessuna versione storica dello statuto.</p>'
+        auth_fascicolo_cards = card_list(auth_fascicolo_docs, "Nessun documento del fascicolo autorizzato.")
+        auth_update_cards = card_list(auth_update_docs, "Nessun aggiornamento vigente registrato.")
+        auth_history_cards = dossier_blocks(auth_history_docs, "Nessuna versione storica depositata.")
+        authority_dossiers = dossier_blocks(authority_docs, "Nessuno scambio con l'Autorita in archivio.")
+        internal_cards = card_list(internal_docs, "Nessun documento interno in archivio.")
+        template_cards = card_list(template_docs, "Nessun allegato o template in archivio.")
+        bilanci_cards = card_list(bilanci_docs, "Nessun bilancio o situazione contabile in archivio.")
+
         auth_requirements = [
             ("Domanda autorizzazione ECSP", "Template/domanda firmata e versione inviata"),
             ("Programma attivita", "Servizi ECSP, modello operativo, mercati e canali"),
@@ -6857,9 +7329,8 @@ document.querySelectorAll('[data-campaign-form]').forEach((form) => {
             ]
         else:
             outsourcing_nodes = [
-                supplier_slot("Fornitore servizi cloud", ["isi cloud", "gestione infrastruttura", "cloud operations", "infrastruttura piattaforma", "servizi cloud", "infrastruttura", "hosting"], "Cloud / hosting / infrastruttura da censire"),
-                supplier_slot("Merito creditizio", ["merito", "credit", "creditsafe", "rating"], "Provider merito creditizio da censire"),
-                supplier_slot("Istituto di pagamento", ["pagamento", "payment", "lemonway", "istituto"], "Payment institution / PSP da censire"),
+                supplier_slot("Fornitore servizi cloud", ["aws", "amazon web", "isi cloud", "gestione infrastruttura", "cloud operations", "infrastruttura piattaforma", "servizi cloud", "infrastruttura", "hosting", "cloud"], "Cloud / hosting / infrastruttura da censire"),
+                supplier_slot("Istituto di pagamento", ["pagamento", "payment", "lemonway", "istituto", "sella"], "Payment institution / PSP da censire"),
                 supplier_slot("Contabilita", ["contabil", "bilancio", "amministrazione"], "Fornitore contabilita da censire"),
                 supplier_slot("Compliance esterna", ["compliance", "legale", "avvocati", "consulenza"], "Advisor compliance/legale da censire"),
                 supplier_slot("Assicurazione / polizza", ["assicurazione", "polizza", "copertura", "professionale"], "Polizza professionale e coperture operative da censire"),
@@ -6893,7 +7364,6 @@ document.querySelectorAll('[data-campaign-form]').forEach((form) => {
                         responsibility_node("Whistleblowing", owner_for("Whistleblowing"), "Canali interni e segnalazioni", "function"),
                         responsibility_node("Privacy e archiviazione", owner_for("Privacy e archiviazione", legal_user["name"] if legal_user else ""), "Privacy, conservazione, documentazione", "function"),
                         responsibility_node("Contabilita", owner_for("Contabilita"), "Bilanci e dati prudenziali da collegare", "function"),
-                        responsibility_node("Presidio demo architettura", owner_for("Presidio demo architettura"), "Persona demo per verificare scheda, funzioni, accordi e documenti", "function"),
                     ] + custom_nodes_for("Funzioni responsabili"),
                 ),
                 responsibility_group(
@@ -7390,7 +7860,7 @@ document.querySelectorAll('[data-campaign-form]').forEach((form) => {
           <option>Documento identita</option>
           <option>Altro documento socio</option>
         </select></label>
-        <label>Titolo<input name="title" placeholder="es. Visura aggiornata Holding Alfa"></label>
+        <label>Titolo<input name="title" placeholder="es. Visura aggiornata socio"></label>
         <label>Data documento<input type="date" name="issued_at"></label>
         <label>Scadenza / aggiornamento<input type="date" name="expires_at"></label>
         <label class="full-span">Note<textarea name="notes" rows="2" placeholder="Ambito, soci coperti, soggetti firmatari, integrazioni richieste"></textarea></label>
@@ -7430,67 +7900,70 @@ document.querySelectorAll('[data-campaign-form]').forEach((form) => {
 </section>
 <section class="workspace-grid">
   <div class="panel statute-panel">
-    <div class="section-head"><h2>Statuto</h2><span class="panel-kicker">Atto costitutivo</span></div>
-    <div class="statute-list">
-      <div><span>Oggetto sociale</span><strong>-</strong></div>
-      <div><span>Capitale</span><strong>-</strong></div>
-      <div><span>Sede</span><strong>-</strong></div>
-      <div><span>Durata</span><strong>-</strong></div>
-      <div><span>Organo amministrativo</span><strong>-</strong></div>
+    <div class="section-head">
+      <div><h2>Statuto</h2><span class="muted">Atto costitutivo e statuto vigente.</span></div>
+      <a class="button primary" href="{rel_url('/documents', ctx, {'origin': 'Compagine', 'category': 'Statuto', 'mode': 'upload'})}">+ Statuto</a>
     </div>
-    <button class="button ghost" type="button">Modifica statuto</button>
+    <div class="statute-list">
+      <div><span>Sede</span><strong>Roma, Viale Parioli 39/C</strong></div>
+      <div><span>Capitale</span><strong>Euro 13.157,90 i.v.</strong></div>
+      <div><span>Durata</span><strong>fino al 31/12/2050</strong></div>
+      <div><span>Oggetto</span><strong>Equity crowdfunding (Reg. UE 2020/1503)</strong></div>
+    </div>
+    <div class="document-list compact-document-list">{statuto_current_cards}</div>
+    <details class="archive-history">
+      <summary>Storico delle versioni dello statuto</summary>
+      <div class="document-list compact-document-list">{statuto_history_cards}</div>
+    </details>
   </div>
   <div class="panel">
     <div class="section-head">
-      <div><h2>Statuto e atti societari</h2><span class="muted">Solo documenti societari puri: statuto, patti, procure e delibere non gia' classificate nei fascicoli autorizzativi o contabili.</span></div>
-      <a class="button primary" href="{rel_url('/documents', ctx, {'origin': 'Compagine', 'category': 'Atto societario', 'mode': 'upload'})}">+ Atto</a>
+      <div><h2>Autorizzazione ECSP vigente</h2><span class="muted">Fascicolo autorizzato (giugno 2024) con gli allegati come depositati presso le Autorita.</span></div>
+      <a class="button primary" href="{rel_url('/documents', ctx, {'origin': 'Compagine', 'category': 'Domanda autorizzazione ECSP', 'mode': 'upload'})}">+ Documento</a>
     </div>
-    <div class="document-list">{doc_cards}</div>
-  </div>
-</section>
-<section class="panel authorization-panel">
-  <div class="section-head">
-    <div>
-      <h2>Autorizzazione ECSP</h2>
-      <span class="muted">Domanda di autorizzazione, allegati e scambi con Autorita in un fascicolo unico per ricerca e contesto IA.</span>
+    <div class="document-list compact-document-list">{auth_fascicolo_cards}</div>
+    <div class="authorization-context">
+      <p class="panel-kicker">Aggiornamenti vigenti - allegati aggiornati (2025-2026)</p>
+      <p class="muted">Nota: quando variano persone o assetti, l'allegato corrispondente viene aggiornato qui senza rifare il fascicolo.</p>
+      <div class="document-list compact-document-list">{auth_update_cards}</div>
     </div>
-    <div class="inline-actions">
-      <a class="button primary" href="{rel_url('/documents', ctx, {'origin': 'Compagine', 'category': 'Domanda autorizzazione ECSP', 'mode': 'upload'})}">+ Domanda</a>
-      <a class="button ghost" href="{rel_url('/documents', ctx, {'origin': 'Compagine', 'category': 'Allegato autorizzazione', 'mode': 'upload'})}">+ Allegato</a>
-      <a class="button secondary" href="{rel_url('/documents', ctx, {'origin': 'Compagine', 'category': 'Domanda autorizzazione ECSP'})}">Apri archivio</a>
-    </div>
-  </div>
-  <div class="authorization-grid">
-    <div>
-      <p class="panel-kicker">Documenti rilevati</p>
-      <div class="document-list compact-document-list">{auth_doc_cards}</div>
-    </div>
-    <div>
-      <p class="panel-kicker">Indice contesto IA</p>
-      <ul class="auth-check-list">{auth_check_rows}</ul>
-    </div>
-  </div>
-  <div class="authorization-context">
-    <div class="section-head compact-head">
-      <div><h3>Fonti collegate al fascicolo</h3><span class="muted">La domanda autorizzativa non duplica questi contenuti: li richiama come fonti strutturate per generare contesto e comunicazioni.</span></div>
-      <span class="panel-kicker">mappa contesto</span>
-    </div>
-    <div class="context-link-grid">{context_matrix}</div>
+    <details class="archive-history">
+      <summary>Storico delle versioni depositate (domanda originale, integrazioni, depositi)</summary>
+      {auth_history_cards}
+    </details>
   </div>
 </section>
 <section class="panel">
   <div class="section-head">
-    <div><h2>Bilanci e situazione contabile</h2><span class="muted">Fonti per CF1, VIG12, patrimonio di vigilanza e comunicazioni periodiche.</span></div>
+    <div><h2>Scambi con l'Autorita</h2><span class="muted">Solo la corrispondenza con la vigilanza, ordinata per dossier: cosa ha chiesto CONSOB / Banca d'Italia e i file con cui abbiamo risposto.</span></div>
+  </div>
+  <div class="dossier-list">{authority_dossiers}</div>
+</section>
+<section class="panel">
+  <div class="section-head">
+    <div><h2>Documenti interni</h2><span class="muted">Knowledge base, framework compliance, procedure permanenti, DORA, organigramma e processo di onboarding.</span></div>
+  </div>
+  <div class="document-list">{internal_cards}</div>
+</section>
+<section class="panel">
+  <div class="section-head">
+    <div><h2>Bilanci e situazione contabile</h2><span class="muted">Solo bilanci e situazioni contabili. Fonti per CF1, VIG12 e patrimonio di vigilanza.</span></div>
     <a class="button primary" href="{rel_url('/documents', ctx, {'origin': 'Compagine', 'category': 'Bilancio', 'mode': 'upload'})}">+ Bilancio</a>
   </div>
-  <div class="document-list">{balance_cards}</div>
+  <div class="document-list">{bilanci_cards}</div>
 </section>
 <section class="panel">
   <div class="section-head">
-    <div><h2>Contratti attivi e scadenze</h2><span class="muted">I fornitori si gestiscono dai box dell'organigramma e dall'archivio documenti. Qui restano solo le scadenze operative da monitorare.</span></div>
+    <div><h2>Contratti e scadenze</h2><span class="muted">Contratti di fornitori e servizi critici in outsourcing, con relative scadenze operative.</span></div>
     <a class="button primary" href="{rel_url('/documents', ctx, {'origin': 'Contratto fornitore', 'mode': 'upload'})}">+ Contratto</a>
   </div>
   <div class="contract-alert-list">{contract_rows}</div>
+</section>
+<section class="panel">
+  <div class="section-head">
+    <div><h2>Allegati e template</h2><span class="muted">Modulistica, comunicazioni e modelli reali della cartella Template dell'archivio (M1-M14, C1-C9, modelli).</span></div>
+  </div>
+  <div class="document-list">{template_cards}</div>
 </section>
 <section class="panel">
   <div class="section-head"><h2>Accordi collegati</h2><span class="panel-kicker">Incarichi, patti, NDA</span></div>
@@ -7518,7 +7991,7 @@ document.querySelectorAll('[data-campaign-form]').forEach((form) => {
         <option>Holding</option>
         <option>Trust / veicolo</option>
       </select></label>
-      <label>Nome / ragione sociale<input name="name" required placeholder="es. Holding Alfa S.r.l."></label>
+      <label>Nome / ragione sociale<input name="name" required placeholder="es. Gruppo 2DueRighe S.r.l."></label>
       <label>Forma giuridica<input name="legal_form" placeholder="es. S.r.l., S.p.A."></label>
       <label>Codice fiscale / P.IVA<input name="tax_id"></label>
       <label>Email<input name="contact_email"></label>
@@ -12628,8 +13101,8 @@ li{{margin:5px 0;}}
         if not doc:
             self.not_found()
             return
-        file_path = (BASE_DIR / doc["storage_path"]).resolve()
-        if not str(file_path).startswith(str(BASE_DIR.resolve())) or not file_path.exists():
+        file_path, ok = resolve_storage_path(doc["storage_path"])
+        if not ok:
             self.not_found()
             return
         data = file_path.read_bytes()

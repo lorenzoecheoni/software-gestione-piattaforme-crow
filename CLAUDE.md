@@ -343,6 +343,28 @@ Upload handlers include:
 - `post_supplier_contract_upload`
 - `post_shareholder_document_upload`
 
+### Archivio documentale (master esterno + @archive/)
+
+The real Pariter document archive (~148 MB, 335 files: PDF/DOCX/XLSX) is NOT
+committed to git. It lives in a folder outside the repo, kept as master on
+Google Drive and synced locally (Google Drive Desktop).
+
+- `ARCHIVE_DIR` (in `app.py`) points to it. Default: sibling folder
+  `Pariter Equity — Archivio documentale`. Override per-machine with the env var
+  `ECSP_ARCHIVE_DIR` (e.g. wherever Drive Desktop synced it on that PC).
+- Archive documents use `storage_path = "@archive/<relative path>"`. The helper
+  `resolve_storage_path()` resolves these against `ARCHIVE_DIR` (with anti
+  path-traversal check); everything else still resolves under `BASE_DIR`.
+- The `documents` rows (metadata + links) ARE in the DB, so they travel via git
+  with the database; only the binary files stay on Drive.
+- Importer: `tools/import_archive.py` scans `ARCHIVE_DIR`, maps folders/filenames
+  to `origin`/`category`, and inserts `documents` rows. It is IDEMPOTENT (keyed on
+  `storage_path`), so re-running it ingests only new/changed files (delta updates).
+  Run: `python3 tools/import_archive.py` (or `--dry-run`).
+- On a new PC: sync the archive via Drive, set `ECSP_ARCHIVE_DIR` if the path
+  differs, then `git pull` already brings the document rows (no re-import needed
+  unless files were added).
+
 ## Governance
 
 Governance includes:
@@ -365,18 +387,27 @@ This is currently prototype/design-first; do not overbuild external email/Meet i
 
 ## Deals
 
-Deals are the core workflow:
+Deals are the core workflow.
 
-- create deal;
-- collect documentation;
-- due diligence/checklist;
-- Comitato Tecnico review;
-- Advisory Committee review when applicable;
-- CdA/Board approval;
-- contract;
-- pre-publication;
-- publication/campaign;
-- audit trail/report.
+### Onboarding flow (authoritative — `05_PROCESSO_ONBOARDING_passo_passo`)
+
+Per Allegato 5.1, the order is a **single CdA delibera AFTER the Advisory Committee**:
+
+1. Candidatura (9 docs) → comms C1 (PEC), C2 (proponente)
+2. Ammissibilità: KYC art.5 [M2], limite 5M [M3], relazione art.5/AML [M11] → C3/C4
+3. Valutazione CVOI: scoring [M4], fascicolo [M5], conflitti [M10], KIIS [M8]
+4. **Pareri e delibera**: Advisory Committee parere non vincolante [M6] → relazione
+   insussistenza conflitti del Resp. controllo [M12] → **UNICA delibera CdA** [M7] → C5/C6
+5. Pubblicazione: KIIS finale, C7, eventuale C9 (CONSOB SiCrowd)
+6. Raccolta investitori: classificazione [M9], C8
+7. Post-offerta: comunicazioni CONSOB continuative [C9], registri [M10]
+
+IMPORTANT: the earlier two-delibera model (`cda1` before Advisory + `cda2` after) was
+WRONG and has been removed. There is now ONE delibera. Practice state machine
+(`PRACTICE_STATUSES`/`PRACTICE_FLOW`/`PRACTICE_TABS`): `cvoi_generato → in_advisory →
+advisory_ricevuto → attesa_cda → cda_positiva|cda_negativa → in_pre_golive`. The board
+decision uses a single round (`decision_round = 1`), gated on a unanime Advisory opinion.
+Migration `ensure_practice_flow_v2()` remaps any legacy `cda1_*`/`cda2_*` rows.
 
 For future work, link deal progress to Finance campaign metrics and investor CRM.
 
