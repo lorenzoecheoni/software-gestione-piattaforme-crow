@@ -82,3 +82,83 @@ document.querySelectorAll("[data-field-state]").forEach((control) => {
   };
   control.addEventListener("input", syncFieldState);
 });
+
+// Filtro al volo per la sezione "Scambi con l'Autorita" (Compagine).
+(function () {
+  var list = document.getElementById("scambi-list");
+  if (!list) return;
+  var search = document.getElementById("scambi-search");
+  var chips = document.getElementById("scambi-chips");
+  var empty = document.getElementById("scambi-empty");
+  var moreBtn = document.getElementById("scambi-more");
+  var activeCat = "";
+  var showAll = false;
+  var LIMIT = 6;
+
+  function apply() {
+    var q = (search && search.value ? search.value : "").trim().toLowerCase();
+    var filtering = !!activeCat || !!q;
+    var rows = list.querySelectorAll(".document-row");
+    var matched = 0, shown = 0;
+    rows.forEach(function (b) {
+      var cat = b.getAttribute("data-cat") || "";
+      var text = b.getAttribute("data-text") || "";
+      var match = (!activeCat || cat === activeCat) && (!q || text.indexOf(q) !== -1);
+      // a riposo mostra solo i primi LIMIT; quando filtri o "mostra tutti", tutti
+      var visible = match && (filtering || showAll || matched < LIMIT);
+      b.style.display = visible ? "" : "none";
+      if (match) matched++;
+      if (visible) shown++;
+    });
+    if (empty) empty.hidden = shown !== 0;
+    if (moreBtn) {
+      if (!filtering && matched > LIMIT) {
+        moreBtn.hidden = false;
+        moreBtn.textContent = showAll ? "Mostra meno" : "Mostra tutti (" + matched + ")";
+      } else {
+        moreBtn.hidden = true;
+      }
+    }
+  }
+
+  if (moreBtn) moreBtn.addEventListener("click", function () { showAll = !showAll; apply(); });
+  if (search) search.addEventListener("input", apply);
+  if (chips) {
+    chips.addEventListener("click", function (e) {
+      var btn = e.target.closest(".chip");
+      if (!btn) return;
+      activeCat = btn.getAttribute("data-cat") || "";
+      chips.querySelectorAll(".chip").forEach(function (c) { c.classList.remove("active"); });
+      btn.classList.add("active");
+      apply();
+    });
+  }
+  apply();  // applica subito il limite "mostra alcuni"
+})();
+
+// Form documenti dedicato di Compagine: apre il modale con la categoria gia' impostata.
+(function () {
+  var modal = document.querySelector("[data-doc-modal]");
+  if (!modal) return;
+  var sel = modal.querySelector("[data-doc-category]");
+  var titleH = modal.querySelector("[data-doc-title-h]");
+  function openDoc(cat, label) {
+    if (sel && cat) {
+      for (var i = 0; i < sel.options.length; i++) {
+        if (sel.options[i].value === cat) { sel.selectedIndex = i; break; }
+      }
+    }
+    if (titleH && label) titleH.textContent = label;
+    modal.hidden = false;
+  }
+  function closeDoc() { modal.hidden = true; }
+  document.querySelectorAll("[data-open-doc]").forEach(function (btn) {
+    btn.addEventListener("click", function () {
+      openDoc(btn.getAttribute("data-category") || "", btn.getAttribute("data-doc-title") || "");
+    });
+  });
+  modal.querySelectorAll("[data-close-doc]").forEach(function (b) {
+    b.addEventListener("click", closeDoc);
+  });
+  modal.addEventListener("click", function (e) { if (e.target === modal) closeDoc(); });
+})();

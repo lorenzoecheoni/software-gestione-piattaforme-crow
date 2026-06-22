@@ -3291,3 +3291,120 @@ textarea {
   line-height: 1.5;
   white-space: pre-wrap;
 }
+
+/* --- Compagine: indice fascicolo autorizzato, impaginazione documenti, banner --- */
+.doc-filename {
+  text-transform: none !important;
+  letter-spacing: 0 !important;
+  font-size: 11px !important;
+  color: var(--muted) !important;
+}
+.document-row small {
+  display: block;
+  margin-top: 3px;
+  color: var(--text);
+  font-size: 12px;
+  line-height: 1.35;
+}
+.document-row > div:first-child { min-width: 0; }
+.doc-row-actions { display: flex; align-items: center; gap: 8px; flex-shrink: 0; }
+
+.auth-banner {
+  margin: 4px 0 14px;
+  padding: 10px 14px;
+  background: var(--paper);
+  border-left: 3px solid var(--accent);
+  border-radius: 3px;
+  font-size: 12.5px;
+  line-height: 1.45;
+  color: var(--text);
+}
+
+.fascicolo-index {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  border: 1px solid #e1d9ce;
+  border-radius: 3px;
+  background: var(--panel);
+}
+.fascicolo-row {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 10px 14px;
+  border-bottom: 1px solid #ece5db;
+}
+.fascicolo-row:last-child { border-bottom: 0; }
+.fascicolo-row > div:nth-child(2) { flex: 1; min-width: 0; }
+.fascicolo-row strong { display: block; font-size: 13px; color: var(--text); }
+.fascicolo-row small { display: block; color: var(--muted); font-size: 11.5px; margin-top: 2px; }
+.fascicolo-state { display: flex; align-items: center; gap: 8px; flex-shrink: 0; }
+.fascicolo-state .muted { font-size: 11px; }
+.deadline-dot.missing { background: #d8b9a6; }
+
+.dossier-block { margin: 0 0 16px; }
+.dossier-block:last-child { margin-bottom: 0; }
+.dossier-block h3 { font-size: 13px; }
+
+.more-docs { margin-top: 8px; }
+.more-docs > summary {
+  cursor: pointer;
+  list-style: none;
+  font-size: 12px;
+  color: var(--accent);
+  padding: 6px 0;
+  user-select: none;
+}
+.more-docs > summary::-webkit-details-marker { display: none; }
+.more-docs > summary:hover { text-decoration: underline; }
+.more-docs[open] > summary { color: var(--muted); }
+.more-docs > .document-list { margin-top: 6px; }
+
+.archive-history { margin-top: 14px; border-top: 1px dashed var(--line); padding-top: 10px; }
+.archive-history > summary {
+  cursor: pointer;
+  font-size: 12px;
+  color: var(--ink);
+  font-weight: 600;
+  user-select: none;
+}
+.archive-history > summary:hover { text-decoration: underline; }
+.archive-history > * { margin-top: 10px; }
+
+/* --- Scambi con l'Autorita: toolbar filtro --- */
+.scambi-toolbar {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 10px;
+  margin: 0 0 14px;
+}
+.scambi-toolbar input[type="search"] {
+  flex: 1 1 220px;
+  min-width: 200px;
+  padding: 8px 12px;
+  border: 1px solid var(--line);
+  border-radius: 4px;
+  background: var(--panel);
+  font-size: 13px;
+  color: var(--text);
+}
+.scambi-chips { display: flex; flex-wrap: wrap; gap: 6px; }
+.scambi-chips .chip {
+  border: 1px solid var(--line);
+  background: var(--panel);
+  color: var(--muted);
+  font-size: 12px;
+  padding: 6px 12px;
+  border-radius: 999px;
+  cursor: pointer;
+  transition: all 0.12s ease;
+}
+.scambi-chips .chip:hover { border-color: var(--accent); color: var(--text); }
+.scambi-chips .chip.active { background: var(--ink); border-color: var(--ink); color: #fff; }
+
+.more-row { margin-top: 10px; }
+.more-row .button { font-size: 12px; }
+
+.auth-banner-links { margin: -6px 0 12px; }

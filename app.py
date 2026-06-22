@@ -1618,6 +1618,8 @@ def init_db():
         ensure_column(conn, "finance_costs", "linked_contract_id", "INTEGER REFERENCES supplier_contracts(id) ON DELETE SET NULL")
         ensure_column(conn, "deals", "platform_fee_percent", "REAL NOT NULL DEFAULT 5")
         ensure_column(conn, "documents", "practice_id", "INTEGER REFERENCES practices(id) ON DELETE SET NULL")
+        ensure_column(conn, "documents", "doc_date", "TEXT NOT NULL DEFAULT ''")
+        ensure_column(conn, "documents", "description", "TEXT NOT NULL DEFAULT ''")
         # Iterazione 2: CVOI collaborativo + chiusura pratica
         ensure_column(conn, "cvoi_reports", "workflow_status", "TEXT NOT NULL DEFAULT 'bozza'")
         ensure_column(conn, "cvoi_reports", "notes_qualitative", "TEXT NOT NULL DEFAULT ''")
@@ -1714,11 +1716,13 @@ def ensure_pariter_real_governance(conn):
     # (segue contabilita e compliance). CloudSign e KYC Data Provider rimossi: gli
     # slot "Firma e conservazione" e "KYC/AML data provider" tornano "da censire"
     # (i contratti collegati cadono in cascata, i costi finance vanno a NULL).
-    verdi = conn.execute("SELECT id FROM suppliers WHERE platform_id = 1 AND name = 'Studio Legale Verdi'").fetchone()
+    verdi = conn.execute(
+        "SELECT id FROM suppliers WHERE platform_id = 1 AND name IN ('Studio Legale Verdi', 'AstraLex')"
+    ).fetchone()
     if verdi:
         conn.execute(
-            "UPDATE suppliers SET name = 'AstraLex', service_area = 'Contabilita e compliance', "
-            "owner_role = 'compliance', notes = 'Studio che segue contabilita e compliance.' WHERE id = ?",
+            "UPDATE suppliers SET name = 'AstraLex STA', service_area = 'Contabilita e compliance', "
+            "owner_role = 'compliance', notes = 'Studio (STA) che segue contabilita e compliance.' WHERE id = ?",
             (verdi[0],),
         )
         conn.execute(
@@ -2701,7 +2705,8 @@ def generated_document(conn, platform_id, deal_id, proponent_id, origin, categor
     return cur.lastrowid
 
 
-def save_uploaded_document(conn, file_item, platform_id, deal_id, proponent_id, origin, category, title, actor_id):
+def save_uploaded_document(conn, file_item, platform_id, deal_id, proponent_id, origin, category, title, actor_id,
+                           doc_date="", description=""):
     filename = sanitize_filename(file_item.filename)
     folder = UPLOAD_DIR / datetime.now().strftime("%Y%m")
     folder.mkdir(parents=True, exist_ok=True)
@@ -2712,8 +2717,8 @@ def save_uploaded_document(conn, file_item, platform_id, deal_id, proponent_id, 
         shutil.copyfileobj(file_item.file, out)
     cur = conn.execute(
         """
-        INSERT INTO documents(platform_id, deal_id, proponent_id, origin, category, title, filename, storage_path, generated, created_by, created_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?)
+        INSERT INTO documents(platform_id, deal_id, proponent_id, origin, category, title, filename, storage_path, generated, created_by, created_at, doc_date, description)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?, ?)
         """,
         (
             platform_id,
@@ -2726,6 +2731,8 @@ def save_uploaded_document(conn, file_item, platform_id, deal_id, proponent_id, 
             str(path.relative_to(BASE_DIR)),
             actor_id,
             now_iso(),
+            doc_date or "",
+            description or "",
         ),
     )
     return cur.lastrowid
@@ -7120,6 +7127,8 @@ document.querySelectorAll('[data-campaign-form]').forEach((form) => {
         statuto_docs, auth_fascicolo_docs, auth_update_docs = [], [], []
         auth_history_docs, authority_docs = [], []
         template_docs, internal_docs, bilanci_docs = [], [], []
+        legacy_docs, cda_docs = [], []
+        cda_cats = ("Verbale CdA", "Delibera CdA", "Verbale assemblea soci")
 
         def _arel(d):
             sp = d["storage_path"] or ""
@@ -7130,13 +7139,17 @@ document.querySelectorAll('[data-campaign-form]').forEach((form) => {
             cat = d["category"]
             seg = r.split("/")
             sub = seg[1] if len(seg) > 1 else ""
-            if cat == "Statuto":
+            if "12_LEGACY" in r:
+                legacy_docs.append(d)            # vecchio regime 2019-2021
+            elif cat == "Statuto":
                 statuto_docs.append(d)
             elif cat in real_balance_cats:
                 bilanci_docs.append(d)
+            elif cat in cda_cats:
+                cda_docs.append(d)               # verbali CdA / delibere / assemblee
             elif r.startswith("06_AUTORIZZAZIONE_VIGENTE/B_"):
                 auth_update_docs.append(d)
-            elif r.startswith("06_AUTORIZZAZIONE_VIGENTE/A_") or cat == "Domanda autorizzazione ECSP":
+            elif r.startswith("06_AUTORIZZAZIONE_VIGENTE/A_"):
                 auth_fascicolo_docs.append(d)
             elif r.startswith("08_VAGLIO") or cat in ("Comunicazione CONSOB", "Comunicazione Banca d'Italia"):
                 authority_docs.append(d)
@@ -7144,26 +7157,86 @@ document.querySelectorAll('[data-campaign-form]').forEach((form) => {
                 if any(k in sub for k in exchange_keys):
                     authority_docs.append(d)
                 else:
-                    auth_history_docs.append(d)  # domande, integrazioni, depositi, legacy
+                    auth_history_docs.append(d)  # domande, integrazioni, depositi
             elif r.startswith("07_TEMPLATE"):
                 template_docs.append(d)
             else:
                 internal_docs.append(d)
 
+        # Documenti caricati a mano dalla pagina (non in archivio): confluiscono nelle
+        # sezioni giuste per categoria, cosi' i tasti "+ Aggiungi" funzionano.
+        manual_docs = [d for d in docs if not (d["storage_path"] or "").startswith("@archive/")]
+        for d in manual_docs:
+            cat = d["category"]
+            if cat in cda_cats:
+                cda_docs.append(d)
+            elif cat == "Aggiornamento autorizzazione":
+                auth_update_docs.append(d)
+            elif cat in ("Comunicazione CONSOB", "Comunicazione Banca d'Italia"):
+                authority_docs.append(d)
+            elif cat == "Documento interno":
+                internal_docs.append(d)
+            elif cat == "Allegato o template":
+                template_docs.append(d)
+
         def _doc_card(d):
-            desc = archive_doc_description(d["filename"], _arel(d))
+            dd = (d["doc_date"] or "") if "doc_date" in d.keys() else ""
+            desc = ((d["description"] or "") if "description" in d.keys() else "") or archive_doc_description(d["filename"], _arel(d))
             desc_html = f'<small>{esc(desc)}</small>' if desc else ''
+            badge = f'<span class="badge neutral">{esc(dd[:7])}</span>' if dd else ''
             return (f'<div class="document-row"><div><strong>{esc(d["title"])}</strong>'
                     f'<span class="doc-filename">{esc(d["filename"])}</span>{desc_html}</div>'
-                    f'<a class="button ghost" href="{rel_url("/documents/" + str(d["id"]) + "/download", ctx)}">Apri</a></div>')
+                    f'<div class="doc-row-actions">{badge}'
+                    f'<a class="button ghost" href="{rel_url("/documents/" + str(d["id"]) + "/download", ctx)}">Apri</a></div></div>')
 
-        def card_list(doclist, empty):
-            return "".join(_doc_card(d) for d in doclist) or f'<p class="empty-state">{esc(empty)}</p>'
+        def _paginated(cards, visible=5, noun="documenti"):
+            """Mostra i primi `visible` elementi; il resto in un <details> richiamabile."""
+            cards = list(cards)
+            if len(cards) <= visible:
+                return "".join(cards)
+            head = "".join(cards[:visible])
+            rest = "".join(cards[visible:])
+            return (f'{head}<details class="more-docs"><summary>Mostra altri {len(cards) - visible} {noun}</summary>'
+                    f'<div class="document-list compact-document-list">{rest}</div></details>')
+
+        def card_list(doclist, empty, visible=5):
+            cards = [_doc_card(d) for d in doclist]
+            return _paginated(cards, visible) or f'<p class="empty-state">{esc(empty)}</p>'
 
         def _clean_seg(name):
             return re.sub(r"^[0-9A-Za-z]{1,3}_", "", name).replace("_", " ").strip()
 
-        def dossier_blocks(doclist, empty):
+        def _dossier_date(key):
+            if "05_2024-12-22_Deposito" in key:
+                return "2023-12-22"  # nome cartella con anno errato: in realta' dic 2023 (prima integrazione)
+            m = re.search(r"\d{4}-\d{2}-\d{2}", key)
+            if m:
+                return m.group(0)
+            m = re.search(r"\d{4}-\d{2}(?!\d)", key)
+            if m:
+                return m.group(0) + "-00"
+            m = re.search(r"(?:19|20)\d{2}", key)
+            if m:
+                return m.group(0) + "-00-00"
+            return "0000-00-00"
+
+        def _dossier_cat(key, text):
+            k = key.lower()
+            # il nome del dossier ha priorita' sul contenuto dei file
+            if "vigilanza" in k or "_bdi" in k or "banca_d" in k:
+                return "bdi"
+            if "vaglio" in k or "rilievi" in k:
+                return "vaglio"
+            if "avvio" in k or "cambio_assetto" in k:
+                return "avvio"
+            if "consob" in k or "lettere" in k:
+                return "consob"
+            t = text.lower()
+            if "vigilanza" in t or "banca d" in t:
+                return "bdi"
+            return "consob"
+
+        def dossier_blocks(doclist, empty, visible=5, filterable=False):
             groups, order = {}, []
             for d in doclist:
                 parts = _arel(d).split("/")
@@ -7173,14 +7246,22 @@ document.querySelectorAll('[data-campaign-form]').forEach((form) => {
                     groups[key] = []
                     order.append(key)
                 groups[key].append(d)
+            items = [(key, _clean_seg(key.split("/")[-1]), groups[key]) for key in order]
+            items.sort(key=lambda it: (_dossier_date(it[0]), it[1]), reverse=True)  # dal piu' recente
             blocks = []
-            for key in sorted(order):
-                docs = groups[key]
-                title = _clean_seg(key.split("/")[-1])
+            for key, title, dd in items:
+                date = _dossier_date(key)
+                date_label = date[:7] if date != "0000-00-00" else ""
+                kicker = f"{len(dd)} file" + (f" &middot; {date_label}" if date_label else "")
+                inner = _paginated([_doc_card(d) for d in dd], visible, "file")
+                attrs = ""
+                if filterable:
+                    text = (title + " " + " ".join(x["filename"] for x in dd)).lower()
+                    attrs = f' data-cat="{_dossier_cat(key, text)}" data-text="{esc(text)}"'
                 blocks.append(
-                    f'<div class="dossier-block"><div class="section-head compact-head">'
-                    f'<h3>{esc(title)}</h3><span class="panel-kicker">{len(docs)} file</span></div>'
-                    f'<div class="document-list compact-document-list">{"".join(_doc_card(d) for d in docs)}</div></div>'
+                    f'<div class="dossier-block"{attrs}><div class="section-head compact-head">'
+                    f'<h3>{esc(title)}</h3><span class="panel-kicker">{kicker}</span></div>'
+                    f'<div class="document-list compact-document-list">{inner}</div></div>'
                 )
             return "".join(blocks) or f'<p class="empty-state">{esc(empty)}</p>'
 
@@ -7222,13 +7303,128 @@ document.querySelectorAll('[data-campaign-form]').forEach((form) => {
         statuto_history_cards = "".join(
             _statuto_card(d) for d in statuto_sorted if _statuto_info(d)[0] == "Storico"
         ) or '<p class="empty-state">Nessuna versione storica dello statuto.</p>'
-        auth_fascicolo_cards = card_list(auth_fascicolo_docs, "Nessun documento del fascicolo autorizzato.")
+        # Indice ordinato del fascicolo autorizzato: Domanda + Allegati 4->19 in
+        # sequenza, con pallino presente/mancante. Cosi' un legale vede subito se e'
+        # completo e quale e' la versione finale depositata.
+        FASCICOLO_ORDER = [
+            ("domanda", "Domanda di autorizzazione ECSP", "Istanza di autorizzazione ai servizi di crowdfunding."),
+            ("4", "Allegato 4 - Statuto", "Statuto e atto costitutivo."),
+            ("5_1", "Allegato 5.1 - Servizi e selezione", "Tipologie di servizi e procedura di selezione delle offerte."),
+            ("5_2", "Allegato 5.2 - Piattaforma", "Descrizione della piattaforma."),
+            ("5_3", "Allegato 5.3 - Marketing", "Strategia di marketing."),
+            ("6_1", "Allegato 6.1 - Governance", "Governance e assetto organizzativo."),
+            ("7", "Allegato 7 - Trattamento dati", "Trattamento dei dati personali (GDPR)."),
+            ("8_1", "Allegato 8.1 - Rischi IT", "Rischi IT e presidi."),
+            ("9_1", "Allegato 9.1 - Presidi prudenziali", "Presidi prudenziali (art. 11)."),
+            ("9_4", "Allegato 9.4 - Piano triennale", "Piano triennale."),
+            ("10_1", "Allegato 10.1 - Fondi propri", "Fondi propri."),
+            ("10_2", "Allegato 10.2 - Fondi propri", "Fondi propri (integrazione)."),
+            ("11", "Allegato 11 - Continuita operativa", "Continuita operativa."),
+            ("12", "Allegato 12 - Onorabilita soci", "Onorabilita dei soci."),
+            ("13", "Allegato 13 - Onorabilita gestori", "Onorabilita e competenze dei gestori."),
+            ("14", "Allegato 14 - Conflitti di interesse", "Policy sui conflitti di interesse."),
+            ("16", "Allegato 16 - Reclami", "Gestione dei reclami."),
+            ("17", "Allegato 17 - Pagamenti", "Pagamenti e custodia (Banca Sella)."),
+            ("18", "Allegato 18 - KIIS", "Scheda con le informazioni chiave sull'investimento."),
+            ("19", "Allegato 19 - Limiti investitori", "Limiti di investimento e classificazione investitori."),
+        ]
+        _fasc_known_pairs = {"5_1", "5_2", "5_3", "6_1", "8_1", "9_1", "9_4", "10_1", "10_2"}
+
+        def _fascicolo_key(d):
+            low = d["filename"].lower()
+            if "domanda_autorizz" in low:
+                return "domanda"
+            m = re.search(r"allegato[_ ]?(\d+)(?:[_ (]+(\d+))?", low)
+            if not m:
+                return None
+            pair = f"{m.group(1)}_{m.group(2)}" if m.group(2) else ""
+            return pair if pair in _fasc_known_pairs else m.group(1)
+
+        # Lo statuto del fascicolo (Allegato 4) e' mostrato nella sezione Statuto: lo
+        # includo qui solo per far risultare l'Allegato 4 presente nell'indice.
+        _fasc_source = auth_fascicolo_docs + [
+            d for d in statuto_docs if _arel(d).startswith("06_AUTORIZZAZIONE_VIGENTE/A_")
+        ]
+        _fasc_by_key = {}
+        for d in _fasc_source:
+            _fasc_by_key.setdefault(_fascicolo_key(d), []).append(d)
+        _fasc_rows = []
+        for key, label, desc in FASCICOLO_ORDER:
+            items = _fasc_by_key.get(key, [])
+            if items:
+                links = "".join(
+                    f'<a class="button tiny" href="{rel_url("/documents/" + str(x["id"]) + "/download", ctx)}">Apri</a>'
+                    for x in items
+                )
+                dot, state = "ok", (f"{len(items)} file" if len(items) > 1 else "presente")
+            else:
+                links, dot, state = "", "missing", "non presente"
+            _fasc_rows.append(
+                f'<li class="fascicolo-row"><span class="deadline-dot {dot}"></span>'
+                f'<div><strong>{esc(label)}</strong><small>{esc(desc)}</small></div>'
+                f'<div class="fascicolo-state"><span class="muted">{esc(state)}</span>{links}</div></li>'
+            )
+        fascicolo_index = "".join(_fasc_rows)
+
         auth_update_cards = card_list(auth_update_docs, "Nessun aggiornamento vigente registrato.")
         auth_history_cards = dossier_blocks(auth_history_docs, "Nessuna versione storica depositata.")
-        authority_dossiers = dossier_blocks(authority_docs, "Nessuno scambio con l'Autorita in archivio.")
+        legacy_dossiers = dossier_blocks(legacy_docs, "Nessun documento del vecchio regime.")
+
+        # Scambi con l'Autorita: UN solo elenco cronologico (niente blocchi), ogni riga
+        # con categoria e testo per il filtro al volo (chip + ricerca).
+        def _scambio_row(d):
+            r = _arel(d)
+            cat = _dossier_cat(r, (d["filename"] + " " + r).lower())
+            manual_date = (d["doc_date"] or "") if "doc_date" in d.keys() else ""
+            date = manual_date or _dossier_date(r)
+            if not date or date == "0000-00-00":
+                date_label = ""
+            elif date[5:7] == "00":
+                date_label = date[:4]          # solo anno, mese ignoto
+            else:
+                date_label = date[:7]          # anno-mese
+            text = (d["title"] + " " + d["filename"]).lower()
+            manual_desc = (d["description"] or "") if "description" in d.keys() else ""
+            desc = manual_desc or archive_doc_description(d["filename"], r)
+            desc_html = f'<small>{esc(desc)}</small>' if desc else ''
+            badge = f'<span class="badge neutral">{esc(date_label)}</span>' if date_label else ''
+            return (f'<div class="document-row" data-cat="{cat}" data-text="{esc(text)}">'
+                    f'<div><strong>{esc(d["title"])}</strong>'
+                    f'<span class="doc-filename">{esc(d["filename"])}</span>{desc_html}</div>'
+                    f'<div class="doc-row-actions">{badge}'
+                    f'<a class="button ghost" href="{rel_url("/documents/" + str(d["id"]) + "/download", ctx)}">Apri</a></div></div>')
+
+        def _sort_date(d):
+            md = (d["doc_date"] or "") if "doc_date" in d.keys() else ""
+            return md or _dossier_date(_arel(d))
+        scambi_sorted = sorted(authority_docs, key=lambda d: (_sort_date(d), _arel(d)), reverse=True)
+        authority_list = "".join(_scambio_row(d) for d in scambi_sorted) or '<p class="empty-state">Nessuno scambio con l\'Autorita in archivio.</p>'
+        cda_cards = card_list(sorted(cda_docs, key=lambda d: d["created_at"], reverse=True),
+                              "Nessun verbale di CdA o assemblea in archivio. Usa \"+ Aggiungi\" per caricarne uno.")
         internal_cards = card_list(internal_docs, "Nessun documento interno in archivio.")
         template_cards = card_list(template_docs, "Nessun allegato o template in archivio.")
         bilanci_cards = card_list(bilanci_docs, "Nessun bilancio o situazione contabile in archivio.")
+
+        # Categorie predeterminate per il form documenti dedicato di Compagine.
+        compagine_doc_categories = [
+            "Statuto", "Atto societario", "Patti parasociali",
+            "Domanda autorizzazione ECSP", "Aggiornamento autorizzazione",
+            "Comunicazione CONSOB", "Comunicazione Banca d'Italia",
+            "Verbale CdA", "Delibera CdA", "Verbale assemblea soci",
+            "Bilancio", "Situazione contabile", "Visura camerale",
+            "Contratto fornitore", "Polizza assicurativa",
+            "Documento interno", "Allegato o template", "Documentazione",
+        ]
+        compagine_doc_category_options = "".join(
+            f'<option value="{esc(c)}">{esc(c)}</option>' for c in compagine_doc_categories
+        )
+
+        # Documento "Storico e stato attuale" richiamabile sotto il banner autorizzazione.
+        storico_doc = next((d for d in internal_docs if "storico_e_stato" in d["filename"].lower()), None)
+        storico_link = (
+            f'<a class="button ghost tiny" href="{rel_url("/documents/" + str(storico_doc["id"]) + "/download", ctx)}">Apri lo Storico e stato attuale</a>'
+            if storico_doc else ""
+        )
 
         auth_requirements = [
             ("Domanda autorizzazione ECSP", "Template/domanda firmata e versione inviata"),
@@ -7902,7 +8098,7 @@ document.querySelectorAll('[data-campaign-form]').forEach((form) => {
   <div class="panel statute-panel">
     <div class="section-head">
       <div><h2>Statuto</h2><span class="muted">Atto costitutivo e statuto vigente.</span></div>
-      <a class="button primary" href="{rel_url('/documents', ctx, {'origin': 'Compagine', 'category': 'Statuto', 'mode': 'upload'})}">+ Statuto</a>
+      <button type="button" class="button primary" data-open-doc data-category="Statuto" data-doc-title="Aggiungi statuto">+ Statuto</button>
     </div>
     <div class="statute-list">
       <div><span>Sede</span><strong>Roma, Viale Parioli 39/C</strong></div>
@@ -7918,13 +8114,18 @@ document.querySelectorAll('[data-campaign-form]').forEach((form) => {
   </div>
   <div class="panel">
     <div class="section-head">
-      <div><h2>Autorizzazione ECSP vigente</h2><span class="muted">Fascicolo autorizzato (giugno 2024) con gli allegati come depositati presso le Autorita.</span></div>
-      <a class="button primary" href="{rel_url('/documents', ctx, {'origin': 'Compagine', 'category': 'Domanda autorizzazione ECSP', 'mode': 'upload'})}">+ Documento</a>
+      <div><h2>Autorizzazione ECSP vigente</h2><span class="muted">Il fascicolo come autorizzato da CONSOB: versione finale di ogni allegato, in ordine.</span></div>
+      <span class="badge ok">VIGENTE</span>
     </div>
-    <div class="document-list compact-document-list">{auth_fascicolo_cards}</div>
+    <p class="auth-banner"><strong>Delibera CONSOB n. 23141 del 05/06/2024</strong> &middot; regime ECSP (Reg. UE 2020/1503) &middot; fascicolo CONSOB 178553. Per ogni allegato la versione vigente e' l'ultima depositata prima del 05/06/2024: questo e' il set definitivo. Le revisioni successive sono nella sezione "Aggiornamenti".</p>
+    <div class="auth-banner-links">{storico_link}</div>
+    <ul class="fascicolo-index">{fascicolo_index}</ul>
     <div class="authorization-context">
-      <p class="panel-kicker">Aggiornamenti vigenti - allegati aggiornati (2025-2026)</p>
-      <p class="muted">Nota: quando variano persone o assetti, l'allegato corrispondente viene aggiornato qui senza rifare il fascicolo.</p>
+      <div class="section-head compact-head">
+        <div><p class="panel-kicker">Aggiornamenti successivi (variazioni 2025-2026)</p>
+        <p class="muted">Quando cambiano persone o assetti, qui si aggiunge l'allegato aggiornato (es. "Allegato 14 aggiornato"), senza rifare il fascicolo.</p></div>
+        <button type="button" class="button primary" data-open-doc data-category="Aggiornamento autorizzazione" data-doc-title="Aggiungi aggiornamento all'autorizzazione">+ Aggiungi aggiornamento</button>
+      </div>
       <div class="document-list compact-document-list">{auth_update_cards}</div>
     </div>
     <details class="archive-history">
@@ -7933,22 +8134,50 @@ document.querySelectorAll('[data-campaign-form]').forEach((form) => {
     </details>
   </div>
 </section>
+<section class="panel" id="scambi-panel">
+  <div class="section-head">
+    <div><h2>Scambi con l'Autorita</h2><span class="muted">Corrispondenza con la vigilanza in ordine cronologico, per dossier. Filtra al volo per categoria o testo.</span></div>
+    <button type="button" class="button primary" data-open-doc data-category="Comunicazione CONSOB" data-doc-title="Aggiungi scambio con l'Autorita">+ Aggiungi scambio</button>
+  </div>
+  <div class="scambi-toolbar">
+    <input type="search" id="scambi-search" placeholder="Cerca per testo o nome file..." autocomplete="off">
+    <div class="scambi-chips" id="scambi-chips">
+      <button type="button" class="chip active" data-cat="">Tutti</button>
+      <button type="button" class="chip" data-cat="consob">CONSOB</button>
+      <button type="button" class="chip" data-cat="bdi">Banca d'Italia</button>
+      <button type="button" class="chip" data-cat="avvio">Avvio attivita</button>
+      <button type="button" class="chip" data-cat="vaglio">Vaglio / rilievi</button>
+    </div>
+  </div>
+  <div class="document-list" id="scambi-list">{authority_list}</div>
+  <p class="empty-state" id="scambi-empty" hidden>Nessuno scambio corrisponde al filtro.</p>
+  <div class="more-row"><button type="button" class="button ghost" id="scambi-more" hidden>Mostra tutti</button></div>
+  <details class="archive-history">
+    <summary>Vecchio regime 2019-2021 (materiale legacy, non rilevante)</summary>
+    <div class="dossier-list">{legacy_dossiers}</div>
+  </details>
+</section>
 <section class="panel">
   <div class="section-head">
-    <div><h2>Scambi con l'Autorita</h2><span class="muted">Solo la corrispondenza con la vigilanza, ordinata per dossier: cosa ha chiesto CONSOB / Banca d'Italia e i file con cui abbiamo risposto.</span></div>
+    <div><h2>CdA e assemblee dei soci</h2><span class="muted">Archivio dei verbali di Consiglio di Amministrazione e delle assemblee dei soci.</span></div>
+    <div class="inline-actions">
+      <button type="button" class="button primary" data-open-doc data-category="Verbale CdA" data-doc-title="Aggiungi verbale di CdA">+ Verbale CdA</button>
+      <button type="button" class="button ghost" data-open-doc data-category="Verbale assemblea soci" data-doc-title="Aggiungi verbale di assemblea soci">+ Assemblea soci</button>
+    </div>
   </div>
-  <div class="dossier-list">{authority_dossiers}</div>
+  <div class="document-list">{cda_cards}</div>
 </section>
 <section class="panel">
   <div class="section-head">
     <div><h2>Documenti interni</h2><span class="muted">Knowledge base, framework compliance, procedure permanenti, DORA, organigramma e processo di onboarding.</span></div>
+    <button type="button" class="button primary" data-open-doc data-category="Documento interno" data-doc-title="Aggiungi documento interno">+ Aggiungi</button>
   </div>
   <div class="document-list">{internal_cards}</div>
 </section>
 <section class="panel">
   <div class="section-head">
     <div><h2>Bilanci e situazione contabile</h2><span class="muted">Solo bilanci e situazioni contabili. Fonti per CF1, VIG12 e patrimonio di vigilanza.</span></div>
-    <a class="button primary" href="{rel_url('/documents', ctx, {'origin': 'Compagine', 'category': 'Bilancio', 'mode': 'upload'})}">+ Bilancio</a>
+    <button type="button" class="button primary" data-open-doc data-category="Bilancio" data-doc-title="Aggiungi bilancio o situazione contabile">+ Bilancio</button>
   </div>
   <div class="document-list">{bilanci_cards}</div>
 </section>
@@ -7962,6 +8191,7 @@ document.querySelectorAll('[data-campaign-form]').forEach((form) => {
 <section class="panel">
   <div class="section-head">
     <div><h2>Allegati e template</h2><span class="muted">Modulistica, comunicazioni e modelli reali della cartella Template dell'archivio (M1-M14, C1-C9, modelli).</span></div>
+    <button type="button" class="button primary" data-open-doc data-category="Allegato o template" data-doc-title="Aggiungi allegato o template">+ Aggiungi</button>
   </div>
   <div class="document-list">{template_cards}</div>
 </section>
@@ -7974,6 +8204,37 @@ document.querySelectorAll('[data-campaign-form]').forEach((form) => {
 </section>
 {person_modal}
 {shareholder_modal}
+<div class="assignment-modal" data-doc-modal hidden>
+  <section class="assignment-dialog">
+    <div class="section-head">
+      <div><h2 data-doc-title-h>Aggiungi documento</h2><span class="muted">Caricalo nell'archivio Compagine con la categoria corretta gia' impostata.</span></div>
+      <button class="modal-close buttonless" type="button" data-close-doc>x</button>
+    </div>
+    <form class="form-grid assignment-form" method="post" action="/documents/upload" enctype="multipart/form-data">
+      {hidden_ctx(ctx)}
+      <input type="hidden" name="origin" value="Compagine">
+      <label>Categoria
+        <select name="category" data-doc-category>{compagine_doc_category_options}</select>
+      </label>
+      <label>Data documento
+        <input type="date" name="doc_date">
+      </label>
+      <label>Titolo (opzionale)
+        <input name="title" placeholder="Se vuoto, usa il nome del file">
+      </label>
+      <label class="full-span">Descrizione (cosa contiene, in breve)
+        <textarea name="description" rows="2" placeholder="Es. Riscontro a CONSOB sulla prova d'uso; lettera di richiesta integrazioni; ..."></textarea>
+      </label>
+      <label class="full-span">File
+        <input type="file" name="file" required>
+      </label>
+      <div class="form-actions left full-span">
+        <button class="button primary" type="submit">Carica documento</button>
+        <button class="button ghost" type="button" data-close-doc>Annulla</button>
+      </div>
+    </form>
+  </section>
+</div>
 <div class="assignment-modal" data-shareholder-modal hidden>
   <section class="assignment-dialog">
     <div class="section-head">
@@ -10978,8 +11239,12 @@ Si prega di confermare la propria presenza.
             "Prospetto requisiti prudenziali",
             "Polizza assicurativa",
             "Domanda autorizzazione ECSP",
+            "Aggiornamento autorizzazione",
             "Delibera CdA",
             "Verbale CdA",
+            "Verbale assemblea soci",
+            "Documento interno",
+            "Allegato o template",
             "Visura camerale",
             "Patti parasociali",
             "Lettera di incarico",
@@ -13002,6 +13267,8 @@ li{{margin:5px 0;}}
             origin = "Deal"
         elif entity_kind == "proponent":
             origin = "Proponente"
+        doc_date = (form.get("doc_date") or "").strip()
+        description = (form.get("description") or "").strip()
         with connect() as conn:
             doc_id = save_uploaded_document(
                 conn,
@@ -13013,6 +13280,8 @@ li{{margin:5px 0;}}
                 category,
                 title,
                 ctx["user_id"],
+                doc_date,
+                description,
             )
             if entity_kind == "person":
                 person_ref = form.get("person_ref") or ""
@@ -13091,7 +13360,7 @@ li{{margin:5px 0;}}
             self.redirect(f"/proponents/{proponent_id}", ctx, "Documento caricato.")
         elif entity_kind == "deal" and deal_id:
             self.redirect(f"/deals/{deal_id}", ctx, "Documento caricato.")
-        elif entity_kind in {"person", "supplier"}:
+        elif entity_kind in {"person", "supplier"} or origin == "Compagine":
             self.redirect("/compagine", ctx, "Documento caricato.")
         else:
             self.redirect("/documents", ctx, "Documento caricato.")
