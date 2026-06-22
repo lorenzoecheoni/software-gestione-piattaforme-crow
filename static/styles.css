@@ -3408,3 +3408,5 @@ textarea {
 .more-row .button { font-size: 12px; }
 
 .auth-banner-links { margin: -6px 0 12px; }
+
+.node-storico { display: block; margin-top: 4px; color: var(--muted); font-style: italic; font-size: 10.5px; }

@@ -1681,10 +1681,9 @@ def ensure_pariter_real_governance(conn):
         ("Rubina Galeotti", "Membro Advisory Committee (dal 12/11/2025)", "rubina.galeotti@example.test"),
         ("Gioacchino Attanzio", "Membro Advisory Committee (dal 12/11/2025)", "gioacchino.attanzio@example.test"),
     ])
-    # Comitato Tecnico: roster reale ancora da definire; placeholder Valerio Innamorati.
-    set_committee("Comitato Tecnico", [
-        ("Valerio Innamorati", "Referente tecnico (assetto da definire)", "valerio.innamorati@example.test"),
-    ])
+    # Team di valutazione (CVOI / Comitato Tecnico): da ricomporre (3 figure, almeno una
+    # indipendente dal gruppo). Nessun membro confermato: casella "da censire".
+    set_committee("Comitato Tecnico", [])
 
     # Fornitori reali per i servizi critici in outsourcing. Le diciture contengono
     # le parole-chiave usate dagli slot dell'organigramma (istituto di pagamento,
@@ -1693,9 +1692,11 @@ def ensure_pariter_real_governance(conn):
         ("Banca Sella S.p.A.", "Istituto di pagamento e custodia (PSD2)", "board",
          "Esternalizzazione pagamento, incassi e custodia somme ex art. 5 ECSP."),
         ("Code Factory S.r.l.", "Sviluppo software piattaforma", "operator",
-         "Sviluppo e manutenzione software della piattaforma - referente Valerio Innamorati (G2R)."),
+         "Sviluppo e manutenzione della piattaforma (gruppo G2R); monitoraggio in capo a Stefania Monotoni."),
         ("Amazon Web Services (AWS)", "Cloud e hosting infrastruttura piattaforma", "operator",
          "Esternalizzazione cloud, hosting e infrastruttura della piattaforma."),
+        ("Gruppo 2DueRighe (G2R)", "Marketing e comunicazioni", "operator",
+         "Marketing e comunicazioni infragruppo; incarico a condizioni di mercato (parti correlate)."),
     ]:
         existing_id = conn.execute(
             "SELECT id FROM suppliers WHERE platform_id = 1 AND name = ?", (name,)
@@ -1765,23 +1766,47 @@ def ensure_pariter_real_governance(conn):
     for j in range(len(sh_targets), len(sh_ids)):
         conn.execute("DELETE FROM shareholders WHERE id = ? AND id NOT IN (SELECT shareholder_id FROM shareholder_documents)", (sh_ids[j],))
 
-    # Organo di controllo storico (sindaco unico) come nodo custom dell'area controllo.
-    if not conn.execute(
-        "SELECT COUNT(*) FROM org_assignments WHERE platform_id = 1 AND subject_name = 'Roberto Rizzuto'"
-    ).fetchone()[0]:
+    # Pulizia una-tantum dei vecchi nodi custom con etichette superate.
+    conn.execute("DELETE FROM org_assignments WHERE platform_id = 1 AND function_name = 'Organo di controllo (sindaco)'")
+    conn.execute("DELETE FROM org_assignments WHERE platform_id = 1 AND function_name = 'Responsabile IT' AND area = 'Area operativa'")
+    conn.execute("DELETE FROM org_functions WHERE platform_id = 1 AND (function_name = 'Organo di controllo (sindaco)' OR (function_name = 'Responsabile IT' AND area = 'Area operativa'))")
+
+    # Pre-assegnazione dei titolari NOTI alle funzioni del funzionigramma (org_assignments).
+    # Le funzioni senza titolare certo restano "da assegnare". Idempotente: salta se esiste
+    # gia' un'assegnazione (qualsiasi stato) per la coppia, cosi' un'archiviazione fatta
+    # dall'utente non viene annullata. Gli altri soggetti si collegano dalle anagrafiche.
+    funz_assign = [
+        ("Gaetano De Vito", "Gestione e approvazione delle offerte", "Governance", "Presidente", "2025-07-24"),
+        ("Stefania Monotoni", "Gestione e approvazione delle offerte", "Governance", "Consigliere", "2025-09-18"),
+        ("Fabio Malerba", "Gestione e approvazione delle offerte", "Governance", "Consigliere", "2024-06-05"),
+        ("Gaetano De Vito", "Rappresentanza legale e rapporti con la vigilanza", "Governance", "Presidente e legale rappresentante", "2025-07-24"),
+        ("Roberto Rizzuto", "Organo di controllo", "Governance", "Sindaco unico", "2023-12-22"),
+        ("Fabio Gallassi", "Revisione legale dei conti", "Governance", "Revisore legale (proposto)", "2026-06-01"),
+        ("Veronika Udod", "Responsabile IT", "Funzioni responsabili", "Responsabile IT (dipendente G2R)", "2026-02-09"),
+        ("Gaetano De Vito", "Continuita operativa", "Funzioni responsabili", "Referente continuita operativa", "2025-07-24"),
+        ("Stefania Monotoni", "Controllo di 2 livello (conformita e rischi)", "Area di controllo", "Responsabile delle funzioni di controllo", "2025-09-18"),
+        ("Stefania Monotoni", "Antiriciclaggio e adeguata verifica (art. 5)", "Area di controllo", "Responsabile dei controlli", "2025-09-18"),
+        ("Stefania Monotoni", "Conflitti di interesse", "Area di controllo", "Valutazione finale dei conflitti", "2025-09-18"),
+        ("Stefania Monotoni", "Monitoraggio dei fornitori esternalizzati", "Area di controllo", "Consigliere incaricato dei controlli", "2025-09-18"),
+        ("Rubina Galeotti", "Parere indipendente sulle offerte", "Advisory Committee", "Membro Advisory Committee", "2025-11-12"),
+        ("Gioacchino Attanzio", "Parere indipendente sulle offerte", "Advisory Committee", "Membro Advisory Committee", "2025-11-12"),
+        ("Gaetano De Vito", "Presidi prudenziali / fondi propri", "Funzioni responsabili", "Monitoraggio dei fondi propri", "2024-06-05"),
+        ("Stefania Monotoni", "Presidi prudenziali / fondi propri", "Funzioni responsabili", "Monitoraggio dei fondi propri", "2025-09-18"),
+        ("Fabio Malerba", "Presidi prudenziali / fondi propri", "Funzioni responsabili", "Monitoraggio dei fondi propri", "2024-06-05"),
+    ]
+    for subj, func, area, role, start in funz_assign:
         if not conn.execute(
-            "SELECT COUNT(*) FROM org_functions WHERE platform_id = 1 AND function_name = 'Organo di controllo (sindaco)'"
-        ).fetchone()[0]:
+            "SELECT 1 FROM org_assignments WHERE platform_id = 1 AND subject_name = ? AND function_name = ?",
+            (subj, func),
+        ).fetchone():
             conn.execute(
-                "INSERT INTO org_functions(platform_id, area, function_name, kind, note, active, created_by, created_at, updated_at) "
-                "VALUES (1, 'Area di controllo', 'Organo di controllo (sindaco)', 'control', 'Vigilanza statutaria storica', 1, 1, ?, ?)",
-                (now_iso(), now_iso()),
+                "INSERT INTO org_assignments(platform_id, subject_name, subject_type, function_name, area, role, start_date, status, notes, created_by, created_at, updated_at) "
+                "VALUES (1, ?, 'Persona', ?, ?, ?, ?, 'Attivo', '', 1, ?, ?)",
+                (subj, func, area, role, start, now_iso(), now_iso()),
             )
-        conn.execute(
-            "INSERT INTO org_assignments(platform_id, subject_name, subject_type, function_name, area, role, start_date, status, notes, created_by, created_at, updated_at) "
-            "VALUES (1, 'Roberto Rizzuto', 'Persona', 'Organo di controllo (sindaco)', 'Area di controllo', 'Sindaco unico (storico)', '2020-05-20', 'Attivo', 'Organo di controllo del precedente regime.', 1, ?, ?)",
-            (now_iso(), now_iso()),
-        )
+
+    # Presidi prudenziali: i nomi dei consiglieri (non la dicitura "Consiglio").
+    conn.execute("DELETE FROM org_assignments WHERE platform_id = 1 AND subject_name = 'Consiglio di Amministrazione'")
 
     conn.commit()
 
@@ -6859,6 +6884,7 @@ document.querySelectorAll('[data-campaign-form]').forEach((form) => {
             (pid,),
         )
         active_assignments_by_function = {}
+        archived_assignments_by_function = {}
         assignment_by_pair = {}
         assignment_status_by_pair = {}
         subject_type_by_name = {}
@@ -6869,6 +6895,8 @@ document.querySelectorAll('[data-campaign-form]').forEach((form) => {
             if assignment["status"] == "Attivo":
                 active_assignments_by_function.setdefault(assignment["function_name"], []).append(assignment)
                 assignment_by_pair[pair] = assignment
+            elif assignment["status"] in {"Archiviato", "Rimosso"}:
+                archived_assignments_by_function.setdefault(assignment["function_name"], []).append(assignment)
         removed_assignment_pairs = {
             pair for pair, status in assignment_status_by_pair.items()
             if status in {"Archiviato", "Rimosso"}
@@ -6918,12 +6946,21 @@ document.querySelectorAll('[data-campaign-form]').forEach((form) => {
 
         # Titolari reali delle funzioni Pariter (dai documenti d'archivio). Le funzioni
         # non note restano vuote ("da censire"): niente piu' nomi demo come fallback.
+        # Funzionigramma aggiornato (CdA - documento completo, giugno 2026): chi presidia
+        # oggi ogni funzione. Le caselle scoperte restano vuote ("da censire/designare").
         pariter_function_owners = {
             "Legale rappresentante": "Gaetano De Vito",
+            "Revisore dei conti": "Fabio Gallassi (proposto)",
+            "Continuita operativa": "Gaetano De Vito",
+            "Conflitti di interesse": "Stefania Monotoni",
+            "Contabilita": "AstraLex STA",
+            "Gestione reclami e default": "",        # da designare (un consigliere)
+            "Privacy e archiviazione": "",           # responsabile privacy da designare
             "Compliance interna": "Stefania Monotoni",
             "Antiriciclaggio / antiterrorismo": "Stefania Monotoni",
             "Risk control": "Stefania Monotoni",
-            "Conflitti di interesse": "Stefania Monotoni",
+            "Responsabile outsourcing": "Stefania Monotoni",
+            "Questionario appropriatezza": "",
         }
 
         def owner_for(label, fallback=""):
@@ -6976,12 +7013,21 @@ document.querySelectorAll('[data-campaign-form]').forEach((form) => {
                 linked_name = f'<a href="{href}">{esc(name)}</a>' if href and kind == "outsourcing" else person_link(name, label)
                 return linked_name
 
-            owner_html = ", ".join(owner_chip(name) for name in owners) if owners else '<span class="empty-owner">da censire</span>'
+            owner_html = ", ".join(owner_chip(name) for name in owners) if owners else '<span class="empty-owner">da assegnare</span>'
             source_link = f'<a class="node-source-link" href="{href}">archivio</a>' if href else ""
+            archived = archived_assignments_by_function.get(label, [])
+            storico_html = ""
+            if archived:
+                past = ", ".join(
+                    esc(a["subject_name"]) + (f" (fino {nice_date(a['end_date'])})" if a["end_date"] else "")
+                    for a in archived
+                )
+                storico_html = f'<small class="node-storico">Storico funzione: {past}</small>'
             return f"""<div class="{css}">
               <div class="node-topline"><span>{esc(label)}</span>{node_controls(label)}</div>
               <strong>{owner_html}</strong>
               <small>{esc(note)}</small>
+              {storico_html}
               <div class="node-bottom-actions"><button type="button" title="Elimina blocco" data-delete-block data-function="{esc(label)}">-</button></div>
               {source_link}
             </div>"""
@@ -7538,59 +7584,92 @@ document.querySelectorAll('[data-campaign-form]').forEach((form) => {
                 supplier_slot("Customer service", ["customer service", "customer", "assistenza utenti"], "Assistenza investitori e proponenti da censire", "operational"),
                 supplier_slot("Marketing", ["marketing", "campagne", "comunicazioni commerciali"], "Comunicazioni commerciali e campagne da censire", "operational"),
             ]
-        responsibility_map = "".join(
-            [
-                responsibility_group(
-                    "Governance",
-                    "organo e supervisione",
-                    [
-                        responsibility_node("Consiglio di Amministrazione", ", ".join(cda_names), "Organo di gestione", "governance"),
-                        responsibility_node("Legale rappresentante", owner_for("Legale rappresentante", cda_names[0] if cda_names else ""), "Firma, rappresentanza, deleghe", "governance"),
-                        responsibility_node("Revisore dei conti", owner_for("Revisore dei conti"), "Da collegare a incarico/revisione", "governance"),
-                    ] + custom_nodes_for("Governance"),
-                ),
-                responsibility_group(
-                    "Funzioni responsabili",
-                    "presidi interni",
-                    [
-                        responsibility_node("Gestione reclami e default", owner_for("Gestione reclami e default", compliance_user["name"] if compliance_user else ""), "Reclami, tassi di default, comunicazioni clienti", "function"),
-                        responsibility_node("Conflitti di interesse", owner_for("Conflitti di interesse", legal_user["name"] if legal_user else ""), "Policy conflitti, parti correlate, presidi", "function"),
-                        responsibility_node("Continuita operativa", owner_for("Continuita operativa", cda_names[0] if cda_names else ""), "BCP, incidenti, continuita servizi", "function"),
-                        responsibility_node("Prevenzione frodi", owner_for("Prevenzione frodi"), "Presidi antifrode e anomalie operative", "function"),
-                        responsibility_node("Whistleblowing", owner_for("Whistleblowing"), "Canali interni e segnalazioni", "function"),
-                        responsibility_node("Privacy e archiviazione", owner_for("Privacy e archiviazione", legal_user["name"] if legal_user else ""), "Privacy, conservazione, documentazione", "function"),
-                        responsibility_node("Contabilita", owner_for("Contabilita"), "Bilanci e dati prudenziali da collegare", "function"),
-                    ] + custom_nodes_for("Funzioni responsabili"),
-                ),
-                responsibility_group(
-                    "Area di controllo",
-                    "compliance, AML, risk",
-                    [
-                        responsibility_node("Compliance interna", owner_for("Compliance interna", compliance_user["name"] if compliance_user else ""), "Regole ECSP, controlli e monitoraggio", "control"),
-                        responsibility_node("Antiriciclaggio / antiterrorismo", owner_for("Antiriciclaggio / antiterrorismo", legal_user["name"] if legal_user else ""), "AML, KYC, questionario appropriatezza", "control"),
-                        responsibility_node("Risk control", owner_for("Risk control", names_for("Advisory Committee")), "Controlli interni e vigilanza", "control"),
-                        responsibility_node("Questionario appropriatezza", owner_for("Questionario appropriatezza"), "Presidio questionari e soglie investitori", "control"),
-                        responsibility_node("Responsabile outsourcing", owner_for("Responsabile outsourcing"), "Coordinamento fornitori critici", "control"),
-                    ] + custom_nodes_for("Area di controllo"),
-                ),
-                responsibility_group("Servizi in outsourcing", "fornitori critici", outsourcing_nodes + custom_nodes_for("Servizi in outsourcing")),
-                responsibility_group(
-                    "Comitato tecnico progetti",
-                    "valutazione offerte",
-                    technical_nodes + custom_nodes_for("Comitato tecnico progetti"),
-                ),
-                responsibility_group(
-                    "Advisory Committee",
-                    "approvazione successiva",
-                    advisory_nodes + custom_nodes_for("Advisory Committee"),
-                ),
-                responsibility_group(
-                    "Area operativa",
-                    "servizi e utenti",
-                    operational_nodes + custom_nodes_for("Area operativa"),
-                ),
-            ]
-        )
+        if is_isi:
+            responsibility_map = "".join(
+                [
+                    responsibility_group(
+                        "Governance",
+                        "organo e supervisione",
+                        [
+                            responsibility_node("Consiglio di Amministrazione", ", ".join(cda_names), "Organo di gestione", "governance"),
+                            responsibility_node("Legale rappresentante", owner_for("Legale rappresentante", cda_names[0] if cda_names else ""), "Firma, rappresentanza, deleghe", "governance"),
+                            responsibility_node("Revisore dei conti", owner_for("Revisore dei conti"), "Da collegare a incarico/revisione", "governance"),
+                        ] + custom_nodes_for("Governance"),
+                    ),
+                    responsibility_group(
+                        "Funzioni responsabili",
+                        "presidi interni",
+                        [
+                            responsibility_node("Gestione reclami e default", owner_for("Gestione reclami e default", compliance_user["name"] if compliance_user else ""), "Reclami, tassi di default, comunicazioni clienti", "function"),
+                            responsibility_node("Conflitti di interesse", owner_for("Conflitti di interesse", legal_user["name"] if legal_user else ""), "Policy conflitti, parti correlate, presidi", "function"),
+                            responsibility_node("Continuita operativa", owner_for("Continuita operativa", cda_names[0] if cda_names else ""), "BCP, incidenti, continuita servizi", "function"),
+                            responsibility_node("Prevenzione frodi", owner_for("Prevenzione frodi"), "Presidi antifrode e anomalie operative", "function"),
+                            responsibility_node("Whistleblowing", owner_for("Whistleblowing"), "Canali interni e segnalazioni", "function"),
+                            responsibility_node("Privacy e archiviazione", owner_for("Privacy e archiviazione", legal_user["name"] if legal_user else ""), "Privacy, conservazione, documentazione", "function"),
+                            responsibility_node("Contabilita", owner_for("Contabilita"), "Bilanci e dati prudenziali da collegare", "function"),
+                        ] + custom_nodes_for("Funzioni responsabili"),
+                    ),
+                    responsibility_group(
+                        "Area di controllo",
+                        "compliance, AML, risk",
+                        [
+                            responsibility_node("Compliance interna", owner_for("Compliance interna", compliance_user["name"] if compliance_user else ""), "Regole ECSP, controlli e monitoraggio", "control"),
+                            responsibility_node("Antiriciclaggio / antiterrorismo", owner_for("Antiriciclaggio / antiterrorismo", legal_user["name"] if legal_user else ""), "AML, KYC, questionario appropriatezza", "control"),
+                            responsibility_node("Risk control", owner_for("Risk control", names_for("Advisory Committee")), "Controlli interni e vigilanza", "control"),
+                            responsibility_node("Questionario appropriatezza", owner_for("Questionario appropriatezza"), "Presidio questionari e soglie investitori", "control"),
+                            responsibility_node("Responsabile outsourcing", owner_for("Responsabile outsourcing"), "Coordinamento fornitori critici", "control"),
+                        ] + custom_nodes_for("Area di controllo"),
+                    ),
+                    responsibility_group("Servizi in outsourcing", "fornitori critici", outsourcing_nodes + custom_nodes_for("Servizi in outsourcing")),
+                    responsibility_group("Comitato tecnico progetti", "valutazione offerte", technical_nodes + custom_nodes_for("Comitato tecnico progetti")),
+                    responsibility_group("Advisory Committee", "approvazione successiva", advisory_nodes + custom_nodes_for("Advisory Committee")),
+                    responsibility_group("Area operativa", "servizi e utenti", operational_nodes + custom_nodes_for("Area operativa")),
+                ]
+            )
+        else:
+            # Organigramma Pariter = funzionigramma del fascicolo autorizzato (con allegato).
+            adv_names = ", ".join(m["name"] for m in advisory_members) or "Membri da censire"
+            cda_str = ", ".join(cda_names)
+            responsibility_map = "".join(
+                [
+                    responsibility_group("Governance", "organi e amministrazione", [
+                        responsibility_node("Gestione e approvazione delle offerte", "", "Consiglio di Amministrazione - All. 6.1", "governance"),
+                        responsibility_node("Rappresentanza legale e rapporti con la vigilanza", "", "Presidente del CdA - All. 6.1", "governance"),
+                        responsibility_node("Organo di controllo", "", "Sindaco unico - All. 6.1", "governance"),
+                        responsibility_node("Revisione legale dei conti", "", "Soggetto distinto dal sindaco - All. 6.1", "governance"),
+                    ] + custom_nodes_for("Governance")),
+                    responsibility_group("Funzioni responsabili", "tutela investitori, dati, IT, continuita, prudenziale", [
+                        responsibility_node("Tutela dell'investitore", "", "Classificazione, test, simulazione, limiti (processo team/piattaforma) - All. 18, 19", "function"),
+                        responsibility_node("Protezione dei dati personali", "", "Responsabile privacy - All. 7", "function"),
+                        responsibility_node("Responsabile IT", "", "Sistemi informativi - All. 8.1", "function"),
+                        responsibility_node("Gestione reclami", "", "Responsabile reclami (un Consigliere) - All. 16", "function"),
+                        responsibility_node("Continuita operativa", "", "Presidente CdA + referenti esternalizzazioni - All. 11", "function"),
+                        responsibility_node("Presidi prudenziali / fondi propri", "", "Monitoraggio del Consiglio - All. 9.1, 10.1, 10.2", "function"),
+                    ] + custom_nodes_for("Funzioni responsabili")),
+                    responsibility_group("Area di controllo", "controlli interni di 2 livello", [
+                        responsibility_node("Controllo di 2 livello (conformita e rischi)", "", "Responsabile delle funzioni di controllo - All. 6.1", "control"),
+                        responsibility_node("Antiriciclaggio e adeguata verifica (art. 5)", "", "Valutazione finale del Responsabile dei controlli - All. 5.1", "control"),
+                        responsibility_node("Conflitti di interesse", "", "Team + Advisory + Responsabile dei controlli - All. 14", "control"),
+                        responsibility_node("Monitoraggio dei fornitori esternalizzati", "", "Consigliere incaricato dei controlli - All. 8.1, 11", "control"),
+                    ] + custom_nodes_for("Area di controllo")),
+                    responsibility_group("Comitato tecnico progetti", "team di valutazione (CVOI)", [
+                        responsibility_node("Valutazione e selezione delle offerte", "", "Scoring, fascicolo, coerenza KIIS (team da ricomporre) - All. 5.1, 6.1", "committee"),
+                        responsibility_node("Marketing editoriale delle offerte", "", "Presentazione delle singole offerte, distinto dal marketing corporate - All. 5.3, 6.1", "committee"),
+                    ] + custom_nodes_for("Comitato tecnico progetti")),
+                    responsibility_group("Advisory Committee", "parere indipendente sulle offerte", [
+                        responsibility_node("Parere indipendente sulle offerte", "", "Membri esterni indipendenti - All. 6.1, 5.1", "advisory"),
+                    ] + custom_nodes_for("Advisory Committee")),
+                    responsibility_group("Servizi in outsourcing", "esternalizzazioni", [
+                        supplier_slot("Gestione e manutenzione della piattaforma", ["software", "svilupp", "piattaforma", "code factory"], "Da censire - All. 8.1", "outsourcing"),
+                        supplier_slot("Infrastruttura cloud / hosting", ["aws", "amazon web", "cloud", "hosting", "infrastruttura"], "Da censire - All. 8.1", "outsourcing"),
+                        supplier_slot("Pagamenti e custodia", ["pagamento", "payment", "sella", "istituto", "custodia"], "Da censire - All. 17", "outsourcing"),
+                        supplier_slot("Marketing e comunicazioni", ["marketing", "comunicazioni", "2duerighe", "g2r"], "Da censire (infragruppo)", "outsourcing"),
+                        supplier_slot("Supporto legale, governance e compliance", ["compliance", "legale", "governance", "astralex"], "Da censire (infragruppo)", "outsourcing"),
+                        supplier_slot("Tenuta della contabilita ordinaria", ["contabil", "amministrazione", "astralex"], "Da censire (infragruppo)", "outsourcing"),
+                        responsibility_node("Coperture assicurative", "", "Polizza / compagnia da indicare", "outsourcing"),
+                    ] + custom_nodes_for("Servizi in outsourcing")),
+                ]
+            )
         agreement_rows = "".join(
             f"""<tr>
               <td>{person_link(a['person_name'], a['role'])}</td>
