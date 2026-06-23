@@ -289,6 +289,20 @@ textarea {
   color: var(--red);
 }
 
+/* Bucket della pratica nel deal-hub: grigio = in istruttoria, verde = in corso, blu = conclusa */
+.badge.bucket-istruttoria {
+  background: #ececec;
+  color: #5a5a5a;
+}
+.badge.bucket-in-corso {
+  background: #e3f3e8;
+  color: #1f7a44;
+}
+.badge.bucket-conclusi {
+  background: #e2ecf7;
+  color: #1f5aa8;
+}
+
 .notice {
   margin: 0 0 18px;
   border: 1px solid var(--line);
@@ -3310,6 +3324,161 @@ textarea {
 .info-panel {
   background: #f6f4ef;
   border-left: 3px solid var(--accent, #b88a3e);
+}
+
+.progress-track {
+  height: 8px;
+  background: #e7e2d8;
+  border-radius: 4px;
+  overflow: hidden;
+  margin: 10px 0 2px;
+}
+
+.progress-fill {
+  height: 100%;
+  background: var(--accent, #b88a3e);
+}
+
+.step-card {
+  border-left: 3px solid #d8d0c4;
+}
+
+.step-card.done {
+  border-left-color: #4f7a4f;
+}
+
+.step-num {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 22px;
+  height: 22px;
+  border-radius: 50%;
+  background: var(--ink);
+  color: #fff;
+  font-family: var(--mono);
+  font-size: 11px;
+  margin-right: 6px;
+}
+
+.comm-list {
+  margin-top: 8px;
+}
+
+.comm-block {
+  border: 1px solid var(--line);
+  padding: 8px 12px;
+  margin: 6px 0;
+  background: var(--paper);
+}
+
+.comm-block summary {
+  cursor: pointer;
+  font-size: 13px;
+}
+
+.comm-block .form-grid {
+  margin-top: 10px;
+}
+
+/* Barra di processo orizzontale (spina dorsale del fascicolo) */
+.process-bar {
+  display: flex;
+  gap: 0;
+  margin-top: 12px;
+  border: 1px solid var(--line);
+  border-radius: 4px;
+  overflow: hidden;
+  flex-wrap: wrap;
+}
+
+.proc-seg {
+  flex: 1 1 0;
+  min-width: 110px;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 9px 11px;
+  border-right: 1px solid var(--line);
+  background: var(--paper);
+  color: #6f6a64;
+  text-decoration: none;
+}
+
+.proc-seg:last-child { border-right: 0; }
+.proc-seg:hover { background: #efece6; }
+.proc-seg.active { background: var(--ink); color: #fff; }
+.proc-seg.done { background: #eef3ee; }
+.proc-seg.done.active { background: var(--ink); color: #fff; }
+
+.proc-num {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 22px;
+  height: 22px;
+  flex: none;
+  border-radius: 50%;
+  background: #d8d0c4;
+  color: var(--ink);
+  font-family: var(--mono);
+  font-size: 11px;
+}
+
+.proc-seg.active .proc-num { background: #fff; color: var(--ink); }
+.proc-seg.done .proc-num { background: #4f7a4f; color: #fff; }
+
+.proc-lab {
+  font-family: var(--mono);
+  font-size: 10px;
+  line-height: 1.25;
+  letter-spacing: 0.02em;
+}
+
+.proc-seg.active .proc-lab { color: #fff; }
+
+/* Bande del ciclo di vita sulla barra: grigio istruttoria, verde online/in corso, blu conclusa.
+   Una fascia colorata in alto mappa il segmento al suo stadio del ciclo del deal. */
+.proc-seg { border-top: 3px solid transparent; }
+.proc-seg.proc-band-istruttoria { border-top-color: #c9c4bb; }
+.proc-seg.proc-band-in_corso { border-top-color: #3f9a5f; }
+.proc-seg.proc-band-conclusi { border-top-color: #2f6fc0; }
+/* Evidenzia la banda in cui si trova attualmente il deal */
+.proc-seg.proc-band-istruttoria.band-current { background: #f0eee9; }
+.proc-seg.proc-band-in_corso.band-current { background: #e6f4ea; }
+.proc-seg.proc-band-conclusi.band-current { background: #e6eef9; }
+.proc-seg.band-current .proc-num { box-shadow: 0 0 0 2px rgba(0,0,0,0.06); }
+
+.band-legend {
+  display: flex;
+  gap: 16px;
+  margin-top: 8px;
+  font-family: var(--mono);
+  font-size: 10px;
+  letter-spacing: 0.02em;
+  color: #6f6a64;
+}
+.band-key { display: inline-flex; align-items: center; gap: 6px; }
+.band-key::before {
+  content: "";
+  width: 12px;
+  height: 12px;
+  border-radius: 2px;
+  display: inline-block;
+}
+.doc-links { display: inline-block; margin-top: 4px; }
+.doc-links .button.tiny { margin: 2px 4px 2px 0; }
+
+.band-key-istruttoria::before { background: #c9c4bb; }
+.band-key-in-corso::before { background: #3f9a5f; }
+.band-key-conclusi::before { background: #2f6fc0; }
+
+.firma-canvas {
+  border: 1px dashed var(--line);
+  background: #fff;
+  border-radius: 4px;
+  touch-action: none;
+  cursor: crosshair;
 }
 
 .info-panel p {

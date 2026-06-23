@@ -1,0 +1,6 @@
+{
+  "version": "0.0.1",
+  "configurations": [
+    { "name": "ecsp", "runtimeExecutable": "python3", "runtimeArgs": ["app.py", "8772"], "port": 8772 }
+  ]
+}

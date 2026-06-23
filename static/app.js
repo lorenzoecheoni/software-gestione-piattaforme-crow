@@ -173,3 +173,43 @@ document.querySelectorAll("select.guided-select").forEach((sel) => {
   sel.addEventListener("change", toggle);
   toggle();
 });
+
+// Processo: "Apri nel client email" costruisce un mailto dai campi del form.
+document.querySelectorAll(".mailto-send").forEach((btn) => {
+  btn.addEventListener("click", () => {
+    const f = btn.closest("form");
+    if (!f) return;
+    const get = (n) => { const el = f.querySelector("[name=" + n + "]"); return el ? el.value : ""; };
+    const url = "mailto:" + encodeURIComponent(get("recipient")) +
+      "?subject=" + encodeURIComponent(get("subject")) +
+      "&body=" + encodeURIComponent(get("body"));
+    window.location.href = url;
+  });
+});
+
+// Anagrafica team: disegno firma su canvas -> dataURL nel form.
+(function () {
+  const canvas = document.getElementById("firmaCanvas");
+  if (!canvas) return;
+  const ctx = canvas.getContext("2d");
+  ctx.lineWidth = 2; ctx.lineCap = "round"; ctx.strokeStyle = "#1f1b17";
+  let drawing = false;
+  const pos = (e) => {
+    const r = canvas.getBoundingClientRect();
+    const t = e.touches ? e.touches[0] : e;
+    return { x: t.clientX - r.left, y: t.clientY - r.top };
+  };
+  const start = (e) => { drawing = true; const p = pos(e); ctx.beginPath(); ctx.moveTo(p.x, p.y); e.preventDefault(); };
+  const move = (e) => { if (!drawing) return; const p = pos(e); ctx.lineTo(p.x, p.y); ctx.stroke(); e.preventDefault(); };
+  const end = () => { drawing = false; };
+  canvas.addEventListener("mousedown", start); canvas.addEventListener("mousemove", move);
+  document.addEventListener("mouseup", end);
+  canvas.addEventListener("touchstart", start); canvas.addEventListener("touchmove", move);
+  canvas.addEventListener("touchend", end);
+  const clearBtn = document.getElementById("firmaClear");
+  if (clearBtn) clearBtn.addEventListener("click", () => ctx.clearRect(0, 0, canvas.width, canvas.height));
+  const form = document.getElementById("firmaForm");
+  if (form) form.addEventListener("submit", () => {
+    document.getElementById("firmaData").value = canvas.toDataURL("image/png");
+  });
+})();
