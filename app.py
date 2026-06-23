@@ -354,7 +354,7 @@ ONBOARDING_STEPS = [
      "attore": "Proponente / Sistema", "tab": "documentale",
      "descrizione": "Il proponente si registra sul portale, carica i 9 documenti di progetto e invia la candidatura. "
                     "All'invio parte la PEC interna di ricezione e la conferma di presa in carico al proponente (con numero pratica).",
-     "comms": ["C1", "C2"]},
+     "comms": []},
     {"key": "fase2", "fase": "Fase 2", "titolo": "Istruttoria di ammissibilita'",
      "attore": "Team di valutazione / Responsabile dei controlli", "tab": "documentale",
      "descrizione": "Verifica completezza documentale (eventuale richiesta di integrazione), KYC art. 5 ECSP su titolare e "
@@ -4463,6 +4463,12 @@ class App(BaseHTTPRequestHandler):
                 self.post_practice_cda_verbale(int(path.split("/")[3]), form, files)
             elif re.fullmatch(r"/pariter/practices/\d+/kiis", path):
                 self.post_practice_kiis(int(path.split("/")[3]), form, files)
+            elif re.fullmatch(r"/pariter/practices/\d+/validate-ammissibilita", path):
+                self.post_practice_validate_ammissibilita(int(path.split("/")[3]), form)
+            elif re.fullmatch(r"/pariter/practices/\d+/anagrafica", path):
+                self.post_practice_anagrafica(int(path.split("/")[3]), form)
+            elif path == "/pariter/practices/create-manual":
+                self.post_practice_create_manual(form)
             elif re.fullmatch(r"/pariter/practices/\d+/advisory", path):
                 self.post_practice_advisory(int(path.split("/")[3]), form)
             elif re.fullmatch(r"/pariter/practices/\d+/advisory-member", path):
@@ -5659,7 +5665,24 @@ document.querySelectorAll('[data-campaign-form]').forEach((form) => {
                 f'</div><p>{esc(step["descrizione"])}</p></section>')
         # corpo specifico della fase, componendo i renderer esistenti
         if fase == "fase1":
-            body = self.render_intake_panel(ctx, practice) + self.render_docs_block(ctx, practice, ["fase1"], "Documenti di candidatura")
+            # Flusso guidato: registrazione candidatura (anagrafica + documenti, automatica) ->
+            # presa in carico (pulsante -> numero pratica) -> comunicazioni C1/C2 da inviare ->
+            # documenti allegati -> storico comunicazioni.
+            nr = practice["pratica_no"] if "pratica_no" in practice.keys() else ""
+            comms = ""
+            if nr:
+                comms = self.phase_emails_html(
+                    ctx, practice, ["C1", "C2"], "fase1",
+                    title="Comunicazioni di presa in carico",
+                    intro="Presa in carico effettuata: invia la PEC interna (C1) e l'email di presa in carico al proponente (C2) con il numero pratica. L'invio viene salvato nello storico.",
+                    open_codes=["C2"])
+            body = (self.render_registrazione_panel(ctx, practice)
+                    + self.render_anagrafica_panel(ctx, practice)
+                    + self.render_intake_panel(ctx, practice)
+                    + comms
+                    + self.render_docs_block(ctx, practice, ["fase1"], "Documenti allegati (i 9 di candidatura)",
+                                             intro="Documenti inviati dal proponente. I documenti mancanti vengono richiesti e validati nella Fase 2 (ammissibilita').")
+                    + self.render_comms_history(ctx, practice))
         elif fase == "fase2":
             # 1) verifica documentale (completezza): richiamati da fase1 + KYC/5M di fase2, con condizione bloccante
             # 2) richiesta integrazione documentale e dichiarazioni (mail C3) sotto i controlli
@@ -5668,16 +5691,18 @@ document.querySelectorAll('[data-campaign-form]').forEach((form) => {
             body = (self.render_docs_block(
                         ctx, practice, ["fase1", "fase2"],
                         "Istruttoria documentale (completezza e regolarita')",
-                        intro="I 9 documenti di candidatura sono richiamati dalla fase precedente; aggiungi le dichiarazioni "
-                              "KYC e le evidenze sul limite di 5 milioni. I documenti obbligatori mancanti sono condizione per proseguire.")
-                    + self.render_ammissibilita_checklist(ctx, practice)
+                        intro="I 9 documenti di candidatura sono richiamati dalla fase precedente; si aggiungono le dichiarazioni "
+                              "KYC e le evidenze sul limite di 5 milioni. Marca 'verificato' ogni documento; i documenti obbligatori mancanti sono condizione per proseguire.")
                     + self.phase_emails_html(ctx, practice, ["C3"], "fase2",
-                                             title="Richiesta di integrazione documentale e dichiarazioni",
-                                             intro="Se mancano documenti o dichiarazioni, invia qui la richiesta al proponente. Il termine resta sospeso fino al riscontro.")
+                                             title="Richiesta di integrazione documentale (C3)",
+                                             intro="Se mancano documenti o dichiarazioni, invia qui la richiesta al proponente: i documenti mancanti sono gia' elencati nel testo. Il termine resta sospeso fino al riscontro; le integrazioni si caricano sopra, di volta in volta.")
                     + self.practice_documentale_requests(ctx, practice)
-                    + self.render_internal_reviews(ctx, practice, ["aml_art5"]))
+                    + self.render_ammissibilita_checklist(ctx, practice)
+                    + self.render_internal_reviews(ctx, practice, ["aml_art5"])
+                    + self.render_validazione_ammissibilita(ctx, practice))
         elif fase == "fase3":
-            body = (self.practice_tab_cvoi(ctx, practice)
+            body = (self.render_full_dossier(ctx, practice)
+                    + self.practice_tab_cvoi(ctx, practice)
                     + self.render_internal_reviews(ctx, practice, ["coerenza_kiis"])
                     + self.render_kiis_panel(ctx, practice))
         elif fase == "fase4":
@@ -5729,8 +5754,18 @@ document.querySelectorAll('[data-campaign-form]').forEach((form) => {
         fill = lambda s: s.format(proponente=proponente, progetto=progetto, pratica=pratica)
         to_map = {"interno": "pariterequity@legalmail.it", "proponente": societa.get("pec") or "",
                   "investitore": "", "consob": ""}
+        body = fill(t["body"])
+        if code == "C3":
+            # elenca automaticamente i documenti obbligatori mancanti / da integrare
+            missing = rows(
+                """SELECT label FROM practice_documents WHERE practice_id = ? AND required = 1
+                   AND phase IN ('fase1','fase2')
+                   AND (document_id IS NULL OR doc_status IN ('mancante','da_integrare','non_utilizzabile'))
+                   ORDER BY phase, id""", (practice["id"],))
+            elenco = "\n".join(f"- {m['label']}" for m in missing) or "- (nessun documento mancante rilevato)"
+            body = body.replace("- [specificare i documenti mancanti]", elenco)
         return {"label": t["label"], "recipient": to_map.get(t["to"], ""),
-                "subject": fill(t["subject"]), "body": fill(t["body"])}
+                "subject": fill(t["subject"]), "body": body}
 
     def practice_tab_processo(self, ctx, practice):
         pid = practice["id"]
@@ -6033,8 +6068,15 @@ document.querySelectorAll('[data-campaign-form]').forEach((form) => {
                   <select name="doc_status">{status_opts}</select>
                   <input name="reviewer_notes" placeholder="Note" value="{esc(d['reviewer_notes'] or '')}">
                   <button class="button tiny" type="submit">Salva</button></form>"""
+                # tasto rapido "Verificato" quando il file e' presente e non gia' verificato
+                if present and d["doc_status"] != "verificato":
+                    stato += (f"""<form method="post" action="/pariter/practices/{pid}/document-status" class="inline-form" style="margin-top:4px">
+                      {hidden_ctx(ctx)}<input type="hidden" name="doc_id" value="{d['id']}"><input type="hidden" name="back_fase" value="{phases[-1]}">
+                      <input type="hidden" name="doc_status" value="verificato">
+                      <button class="button tiny primary" type="submit">&check; Verificato</button></form>""")
+            verif_badge = ('<span class="badge success">verificato</span>' if d["doc_status"] == "verificato" else "")
             body_rows += f"""<tr>
-              <td>{esc(d['label'])}</td>
+              <td>{esc(d['label'])} {verif_badge}</td>
               <td>{cond}</td>
               <td>{caricato}</td>
               <td>{stato}</td>
@@ -6066,13 +6108,18 @@ document.querySelectorAll('[data-campaign-form]').forEach((form) => {
 </section>"""
 
     # Controllo -> (etichetta, parole chiave per richiamare i documenti da esaminare)
+    # (chiave, gruppo, etichetta controllo, parole chiave per richiamare i documenti)
     AMMISSIBILITA_CHECKS = [
-        ("chk_kyc", "KYC art. 5: titolare effettivo e giurisdizioni",
-         ("visura", "statuto", "titolare", "kyc", "giurisdiz", "identita", "key manager", "onorabil", "dichiaraz")),
-        ("chk_casellario", "Casellario giudiziale / onorabilita' esponenti",
-         ("casellario", "onorabil", "penal", "carichi")),
-        ("chk_5m", "Rispetto del limite di raccolta di € 5.000.000",
-         ("offerta", "importo", "piano finanz", "fabbisogno", "valutazione", "bilanci")),
+        ("chk_casellario", "KYC art. 5 ECSP (checklist M2)", "Casellario giudiziale esponenti",
+         ("casellario", "penal")),
+        ("chk_carichi", "KYC art. 5 ECSP (checklist M2)", "Carichi pendenti esponenti",
+         ("carichi", "pendenti")),
+        ("chk_te", "KYC art. 5 ECSP (checklist M2)", "Titolare effettivo, residenza e giurisdizioni non cooperative",
+         ("titolare", "giurisdiz", "residenza")),
+        ("chk_autodich", "KYC art. 5 ECSP (checklist M2)", "Autodichiarazioni di onorabilita' acquisite",
+         ("autodichiar", "onorabil", "dichiaraz")),
+        ("chk_5m", "Limite di raccolta (checklist M3)", "Rispetto del limite di € 5.000.000 (raccolte ultimi 18 mesi)",
+         ("limite", "raccolt", "5.000.000", "evidenze", "bilanci")),
     ]
 
     def render_ammissibilita_checklist(self, ctx, practice):
@@ -6084,10 +6131,7 @@ document.querySelectorAll('[data-campaign-form]').forEach((form) => {
                     (pid,))
 
         def docs_for(keywords):
-            if keywords is None:
-                pool = docs
-            else:
-                pool = [d for d in docs if any(k in (d["label"] or "").lower() for k in keywords)]
+            pool = [d for d in docs if any(k in (d["label"] or "").lower() for k in keywords)]
             if not pool:
                 return '<span class="muted">nessun documento collegato</span>'
             return " ".join(
@@ -6095,7 +6139,11 @@ document.querySelectorAll('[data-campaign-form]').forEach((form) => {
                 for d in pool)
 
         rows_html = ""
-        for key, label, keywords in self.AMMISSIBILITA_CHECKS:
+        last_group = None
+        for key, group, label, keywords in self.AMMISSIBILITA_CHECKS:
+            if group != last_group:
+                rows_html += f'<tr class="group-row"><td colspan="3"><strong>{esc(group)}</strong></td></tr>'
+                last_group = group
             done = state.get(key) == "completata"
             badge = '<span class="badge success">Verificato</span>' if done else '<span class="badge neutral">Da verificare</span>'
             action = ""
@@ -6109,9 +6157,52 @@ document.querySelectorAll('[data-campaign-form]').forEach((form) => {
                           f'<td>{badge}</td><td>{action}</td></tr>')
         return f"""
 <section class="panel">
-  <div class="section-head"><h2>Controlli di ammissibilita' (responsabile compliance)</h2></div>
-  <p class="muted">Apri i documenti collegati a ciascun controllo, verificali e poi spunta "verificato". Sotto puoi generare/firmare/caricare e validare la relazione art. 5/AML.</p>
+  <div class="section-head"><h2>Verifiche di ammissibilita' (responsabile compliance)</h2></div>
+  <p class="muted">KYC art. 5 ECSP sul titolare del progetto e sul titolare effettivo, e rispetto del limite di 5 milioni. Apri i documenti collegati, verificali e spunta "verificato". Sotto si formalizza la relazione art. 5/AML.</p>
   <table class="data-table compact"><thead><tr><th>Controllo e documenti</th><th>Stato</th><th></th></tr></thead><tbody>{rows_html}</tbody></table>
+</section>"""
+
+    def ammissibilita_blockers(self, practice):
+        """Motivi che impediscono di validare l'ammissibilita' e passare alla valutazione."""
+        pid = practice["id"]
+        reasons = []
+        missing = rows(
+            """SELECT label FROM practice_documents WHERE practice_id = ? AND required = 1
+               AND phase IN ('fase1','fase2') AND (document_id IS NULL OR doc_status IN ('mancante','da_integrare','non_utilizzabile'))""",
+            (pid,))
+        if missing:
+            reasons.append(f"{len(missing)} documenti obbligatori da integrare/caricare")
+        aml = row("SELECT review_status FROM internal_reviews WHERE practice_id = ? AND review_type = 'aml_art5'", (pid,))
+        if not (aml and aml["review_status"] == "validata"):
+            reasons.append("relazione art. 5/AML non ancora validata")
+        return reasons
+
+    def render_validazione_ammissibilita(self, ctx, practice):
+        """Gate finale di Fase 2: se i documenti e l'AML sono validati, invia C4 e si passa alla valutazione."""
+        pid = practice["id"]
+        locked = bool(practice["closed_at"])
+        already = PRACTICE_STATUS_INDEX.get(practice["status"], 0) >= PRACTICE_STATUS_INDEX.get("pronto_cvoi", 999)
+        if already:
+            return ('<section class="panel"><div class="section-head"><h2>Validazione ammissibilita\'</h2>'
+                    '<span class="badge success">Ammissibilita\' validata</span></div>'
+                    '<p class="muted">Esito documentale positivo (C4) inviato: la pratica e\' passata alla valutazione di merito (CVOI).</p></section>')
+        reasons = self.ammissibilita_blockers(practice)
+        if reasons:
+            lis = "".join(f"<li>{esc(r)}</li>" for r in reasons)
+            inner = (f'<p class="muted">Per validare l\'ammissibilita\' e passare alla valutazione restano da completare:</p>'
+                     f'<ul class="clean-list">{lis}</ul>'
+                     f'<div class="form-actions"><button class="button primary" type="submit" disabled>Valida e avvia valutazione</button></div>')
+        else:
+            btn = ('<button class="button primary" type="submit">Valida ammissibilita\', invia C4 e avvia valutazione</button>'
+                   if not locked else "")
+            inner = (f'<p>Documenti obbligatori completi e relazione art. 5/AML validata: l\'ammissibilita\' puo\' essere validata. '
+                     f'Verra\' inviata la comunicazione di esito positivo (C4) e la pratica passera\' alla valutazione di merito (CVOI).</p>'
+                     f'<form method="post" action="/pariter/practices/{pid}/validate-ammissibilita">{hidden_ctx(ctx)}'
+                     f'<div class="form-actions">{btn}</div></form>')
+        return f"""
+<section class="panel">
+  <div class="section-head"><h2>Validazione ammissibilita'</h2><span class="badge warning">Da validare</span></div>
+  {inner}
 </section>"""
 
     def practice_documentale_requests(self, ctx, practice):
@@ -6128,35 +6219,155 @@ document.querySelectorAll('[data-campaign-form]').forEach((form) => {
   <table class="data-table compact"><thead><tr><th>Oggetto</th><th>Stato</th><th>Aperta</th></tr></thead><tbody>{req_rows}</tbody></table>
 </section>"""
 
+    def render_registrazione_panel(self, ctx, practice):
+        """Registrazione candidatura: avvenuta dal portale, carica anagrafica + documenti allegati."""
+        return f"""
+<section class="panel">
+  <div class="section-head"><h2>Registrazione candidatura</h2><span class="badge success">Registrata</span></div>
+  <p class="muted">Candidatura registrata dal portale www.pariterequity.com (e PEC interna): sono stati caricati l'anagrafica del proponente e i documenti allegati (sotto). <em>Connessione PEC/portale: design-first (connettore da collegare).</em></p>
+</section>"""
+
     def render_intake_panel(self, ctx, practice):
+        """Presa in carico: pulsante che genera il numero pratica e abilita la comunicazione C2."""
         pid = practice["id"]
         nr = practice["pratica_no"] if "pratica_no" in practice.keys() else ""
         locked = bool(practice["closed_at"])
+        can = user_can(ctx["user"], "manage_practice") and not locked
         if nr:
             ident = offer_identifier(practice)
+            annul = ""
+            if can:
+                annul = (f'<form method="post" action="/pariter/practices/{pid}/intake" style="display:inline" '
+                         f'onsubmit="return confirm(\'Annullare la presa in carico? Il numero pratica verra\\\' azzerato.\')">'
+                         f'{hidden_ctx(ctx)}<input type="hidden" name="action" value="annul">'
+                         f'<button class="button tiny" type="submit">Annulla presa in carico</button></form>')
             return f"""
 <section class="panel">
-  <div class="section-head"><h2>Presa in carico</h2><span class="badge success">Acquisita</span></div>
+  <div class="section-head"><h2>Presa in carico</h2><span class="badge success">Presa in carico</span></div>
   <div class="meta-grid">
     <div><span class="muted">Numero pratica (interno)</span><br><strong>{esc(nr)}</strong></div>
     <div><span class="muted">Identificativo offerta (in KIIS, alla pubblicazione)</span><br><span class="muted">LEI + nr →</span> {esc(ident)}</div>
   </div>
-  <p class="muted">All'invio della candidatura la PEC di ricezione e' inviata dal portale; qui si attesta. Il numero pratica a 8 cifre identifica la pratica interna e, unito al LEI di Pariter, forma l'Identificativo dell'offerta riportato nella KIIS in fase di pubblicazione.</p>
+  <p class="muted">Numero pratica generato. Invia ora la comunicazione di presa in carico (C2) al proponente, qui sotto. Lo stesso numero, unito al LEI di Pariter, forma l'Identificativo dell'offerta nella KIIS (pubblicazione).</p>
+  <div class="form-actions">{annul}</div>
 </section>"""
         action = ""
-        if not locked and user_can(ctx["user"], "manage_practice"):
+        if can:
             action = (f'<form method="post" action="/pariter/practices/{pid}/intake">{hidden_ctx(ctx)}'
-                      f'<button class="button primary" type="submit">Registra presa in carico (genera numero pratica)</button></form>')
+                      f'<input type="hidden" name="action" value="take">'
+                      f'<button class="button primary" type="submit">Prendi in carico (genera numero pratica)</button></form>')
         return f"""
 <section class="panel">
-  <div class="section-head"><h2>Presa in carico</h2><span class="badge warning">Da acquisire</span></div>
-  <p class="muted">Registra la presa in carico della candidatura: viene generato un numero pratica a 8 cifre. Lo stesso numero, unito al LEI di Pariter, formera' l'Identificativo dell'offerta nella KIIS.</p>
+  <div class="section-head"><h2>Presa in carico</h2><span class="badge warning">Da prendere in carico</span></div>
+  <p class="muted">Premi <strong>Prendi in carico</strong> per generare il numero pratica a 8 cifre e precompilare la comunicazione di presa in carico (C2) da inviare al proponente.</p>
   <div class="form-actions">{action}</div>
+</section>"""
+
+    def render_anagrafica_panel(self, ctx, practice):
+        """Anagrafica del proponente: dati caricati dal dossier, modificabili e risalvabili."""
+        pid = practice["id"]
+        locked = bool(practice["closed_at"])
+        can = user_can(ctx["user"], "manage_practice") and not locked
+        js = {}
+        try:
+            js = json.loads(practice["dossier_json"] or "{}")
+        except (ValueError, TypeError):
+            js = {}
+        ds = js.get("dati_struttura") or {}
+        soc = ds.get("societa") or {}
+        rep = ds.get("legaleRappresentante") or {}
+        off = ds.get("offertaFase1") or {}
+        denom = practice["proponent_name"] or soc.get("denominazione") or ""
+        def cell(lbl, val):
+            return f'<div><span class="muted">{esc(lbl)}</span><br><strong>{esc(val or "-")}</strong></div>'
+        rows_html = "".join([
+            cell("Denominazione", denom),
+            cell("Progetto", practice["project_title"]),
+            cell("Forma giuridica", soc.get("forma")),
+            cell("Sede legale", soc.get("sedeLegale")),
+            cell("P. IVA", soc.get("pIva")),
+            cell("PEC", soc.get("pec")),
+            cell("Legale rappresentante", (rep.get("nome") or "") + ((" (" + rep.get("carica") + ")") if rep.get("carica") else "")),
+            cell("Importo target", off.get("importoTarget")),
+            cell("Importo massimo", off.get("importoMax")),
+            cell("Pre-money", off.get("preMoney")),
+            cell("Equity offerta", off.get("equity")),
+            cell("Strumento", off.get("strumento")),
+        ])
+        edit = ""
+        if can:
+            def fld(name, label, val):
+                return f'<label>{esc(label)}<input name="{name}" value="{esc(val or "")}"></label>'
+            edit = f"""
+  <details class="comm-block">
+    <summary>Modifica anagrafica</summary>
+    <form class="form-grid" method="post" action="/pariter/practices/{pid}/anagrafica">
+      {hidden_ctx(ctx)}
+      {fld("denominazione", "Denominazione", denom)}
+      {fld("project_title", "Progetto", practice["project_title"])}
+      {fld("forma", "Forma giuridica", soc.get("forma"))}
+      {fld("sedeLegale", "Sede legale", soc.get("sedeLegale"))}
+      {fld("pIva", "P. IVA", soc.get("pIva"))}
+      {fld("pec", "PEC", soc.get("pec"))}
+      {fld("rep_nome", "Legale rappresentante", rep.get("nome"))}
+      {fld("rep_carica", "Carica", rep.get("carica"))}
+      {fld("importoTarget", "Importo target", off.get("importoTarget"))}
+      {fld("importoMax", "Importo massimo", off.get("importoMax"))}
+      {fld("preMoney", "Pre-money", off.get("preMoney"))}
+      {fld("equity", "Equity offerta", off.get("equity"))}
+      {fld("strumento", "Strumento", off.get("strumento"))}
+      <div class="form-actions"><button class="button primary" type="submit">Salva anagrafica</button></div>
+    </form>
+  </details>"""
+        return f"""
+<section class="panel">
+  <div class="section-head"><h2>Anagrafica proponente</h2><span class="badge neutral">Dati caricati</span></div>
+  <p class="muted">Dati acquisiti dal dossier inviato dal proponente. Puoi modificarli e risalvarli (fino al collegamento dell'API/portale, l'inserimento e' anche manuale).</p>
+  <div class="meta-grid">{rows_html}</div>
+  {edit}
+</section>"""
+
+    def render_full_dossier(self, ctx, practice, title="Dossier documentale completo per la valutazione"):
+        """Elenco di tutti i documenti collegati alla pratica (per il CVOI)."""
+        ds = rows("SELECT id, origin, category, title FROM documents WHERE practice_id = ? ORDER BY origin, id",
+                  (practice["id"],))
+        if not ds:
+            inner = '<p class="muted">Nessun documento collegato alla pratica.</p>'
+        else:
+            items = "".join(
+                f'<li><span class="muted">[{esc(d["origin"] or "-")}]</span> {esc(d["title"])} '
+                f'<a class="button tiny" href="{rel_url("/documents/" + str(d["id"]) + "/download", ctx)}">Apri</a></li>'
+                for d in ds)
+            inner = f'<ul class="clean-list">{items}</ul>'
+        return f"""
+<section class="panel">
+  <div class="section-head"><h2>{esc(title)}</h2><span class="badge neutral">{len(ds)} documenti</span></div>
+  <p class="muted">Il CVOI riceve l'intero dossier documentale della pratica insieme al template di valutazione (scoring) qui sotto.</p>
+  {inner}
+</section>"""
+
+    def render_comms_history(self, ctx, practice):
+        """Storico delle comunicazioni inviate (tutte le fasi)."""
+        ems = rows("SELECT * FROM practice_emails WHERE practice_id = ? ORDER BY id DESC", (practice["id"],))
+        if not ems:
+            inner = '<p class="muted">Nessuna comunicazione inviata finora.</p>'
+        else:
+            items = "".join(
+                f"""<tr><td><strong>{esc(e['code'])}</strong></td><td>{esc(e['recipient'] or '-')}</td>
+                <td>{esc(e['subject'] or '-')}</td><td class="muted">{esc((e['sent_at'] or '')[:16])}</td></tr>"""
+                for e in ems)
+            inner = (f'<table class="data-table compact"><thead><tr><th>Codice</th><th>Destinatario</th>'
+                     f'<th>Oggetto</th><th>Inviata</th></tr></thead><tbody>{items}</tbody></table>')
+        return f"""
+<section class="panel">
+  <div class="section-head"><h2>Storico comunicazioni</h2></div>
+  {inner}
 </section>"""
 
     def phase_emails_html(self, ctx, practice, codes, fase="",
                           title="Comunicazioni di questa fase",
-                          intro="La mail compare qui, nel momento del processo. Modificala, aprila nel client e registrala come inviata."):
+                          intro="La mail compare qui, nel momento del processo. Modificala, aprila nel client e registrala come inviata.",
+                          open_codes=()):
         if not codes:
             return ""
         pid = practice["id"]
@@ -6186,8 +6397,9 @@ document.querySelectorAll('[data-campaign-form]').forEach((form) => {
             if locked:
                 blocks += f'<p class="muted">{esc(d["label"])} - {badge}</p>'
                 continue
+            is_open = (code in open_codes) and not last
             blocks += f"""
-      <details class="comm-block">
+      <details class="comm-block"{' open' if is_open else ''}>
         <summary><strong>{esc(d['label'])}</strong> &middot; {badge}</summary>
         <form class="form-grid" method="post" action="/pariter/practices/{pid}/email">
           {hidden_ctx(ctx)}<input type="hidden" name="code" value="{code}"><input type="hidden" name="step_key" value="{fase}"><input type="hidden" name="back_fase" value="{fase}">
@@ -6940,8 +7152,9 @@ document.querySelectorAll('[data-campaign-form]').forEach((form) => {
             return
         body = f"""
 <section class="panel narrow">
-  <div class="section-head"><h2>Importa dossier proponente</h2></div>
-  <p class="muted">Carica il pacchetto dossier (.zip) esportato dal software proponente, oppure i singoli file JSON di fase.</p>
+  <div class="section-head"><h2>Nuova candidatura</h2></div>
+  <p class="muted">Crea una nuova candidatura importando il dossier del proponente, oppure inserendo l'anagrafica manualmente (fino al collegamento dell'API/portale). Dopo la creazione potrai modificare l'anagrafica, caricare i documenti e prendere in carico.</p>
+  <h3 style="margin:14px 0 6px">Da dossier (import)</h3>
   <form class="form-grid" method="post" action="/pariter/practices/import" enctype="multipart/form-data">
     {hidden_ctx(ctx)}
     <label>Pacchetto dossier (.zip)<input type="file" name="dossier_zip" accept=".zip"></label>
@@ -6950,9 +7163,27 @@ document.querySelectorAll('[data-campaign-form]').forEach((form) => {
     <label>Titolo progetto (se non desumibile)<input name="project_title" placeholder="Lascia vuoto per usare il dato del dossier"></label>
     <div class="form-actions"><button class="button primary" type="submit">Importa e crea pratica</button></div>
   </form>
+  <h3 style="margin:20px 0 6px">Inserimento manuale</h3>
+  <form class="form-grid" method="post" action="/pariter/practices/create-manual">
+    {hidden_ctx(ctx)}
+    <label>Denominazione proponente *<input name="denominazione" required></label>
+    <label>Titolo progetto<input name="project_title"></label>
+    <label>Forma giuridica<input name="forma" placeholder="S.r.l. / S.p.A."></label>
+    <label>Sede legale<input name="sedeLegale"></label>
+    <label>P. IVA<input name="pIva"></label>
+    <label>PEC<input name="pec"></label>
+    <label>Legale rappresentante<input name="rep_nome"></label>
+    <label>Carica<input name="rep_carica"></label>
+    <label>Importo target<input name="importoTarget"></label>
+    <label>Importo massimo<input name="importoMax"></label>
+    <label>Pre-money<input name="preMoney"></label>
+    <label>Equity offerta<input name="equity"></label>
+    <label>Strumento<input name="strumento" placeholder="Quote di S.r.l. / Azioni"></label>
+    <div class="form-actions"><button class="button primary" type="submit">Crea candidatura manuale</button></div>
+  </form>
 </section>
 """
-        self.render("Importa dossier", body, "deals")
+        self.render("Nuova candidatura", body, "deals")
 
     def page_practice_report(self, practice_id):
         ctx = self.get_ctx()
@@ -7098,16 +7329,128 @@ document.querySelectorAll('[data-campaign-form]').forEach((form) => {
         practice = self._practice_guard(ctx, practice_id, "fase1")
         if not practice:
             return
-        if not practice["pratica_no"]:
-            nr = f"{int(uuid.uuid4().int % 100000000):08d}"
-            with connect() as conn:
+        action = form.get("action", "take")
+        with connect() as conn:
+            if action == "annul":
+                conn.execute("UPDATE practices SET pratica_no = '', updated_at = ? WHERE id = ?", (now_iso(), practice_id))
+                log_audit(conn, ctx["platform_id"], ctx["user_id"], "practice", practice_id, "Presa in carico annullata", "")
+                conn.commit()
+                msg = "Presa in carico annullata: la pratica torna 'da prendere in carico'."
+            elif not practice["pratica_no"]:
+                nr = f"{int(uuid.uuid4().int % 100000000):08d}"
                 conn.execute("UPDATE practices SET pratica_no = ?, updated_at = ? WHERE id = ?", (nr, now_iso(), practice_id))
                 log_audit(conn, ctx["platform_id"], ctx["user_id"], "practice", practice_id, "Presa in carico", f"numero pratica {nr}")
                 conn.commit()
-            msg = f"Presa in carico registrata. Numero pratica: {nr}."
-        else:
-            msg = "Presa in carico gia' registrata."
+                msg = f"Presa in carico effettuata. Numero pratica: {nr}. Invia ora la comunicazione C2 al proponente."
+            else:
+                msg = "Presa in carico gia' effettuata."
         self.redirect(f"/pariter/practices/{practice_id}", ctx, msg, {"fase": "fase1"})
+
+    def post_practice_validate_ammissibilita(self, practice_id, form):
+        ctx = self.ctx_from_form(form)
+        practice = self._practice_guard(ctx, practice_id, "fase2")
+        if not practice:
+            return
+        reasons = self.ammissibilita_blockers(practice)
+        if reasons:
+            self.redirect(f"/pariter/practices/{practice_id}", ctx,
+                          "Non si puo' validare: " + "; ".join(reasons) + ".", {"fase": "fase2"})
+            return
+        d = self.practice_email_defaults(practice, "C4")
+        with connect() as conn:
+            # invia/registra C4 (verifica documentale positiva)
+            conn.execute(
+                """INSERT INTO practice_emails(practice_id, step_key, code, recipient, subject, body, sent_at, sent_by)
+                   VALUES (?, 'fase2', 'C4', ?, ?, ?, ?, ?)""",
+                (practice_id, d["recipient"], d["subject"], d["body"], now_iso(), ctx["user_id"]))
+            # marca completata la fase ammissibilita'
+            updated = conn.execute(
+                "UPDATE practice_process_steps SET status='completata', updated_at=?, updated_by=? WHERE practice_id=? AND step_key='fase2'",
+                (now_iso(), ctx["user_id"], practice_id)).rowcount
+            if not updated:
+                conn.execute(
+                    "INSERT INTO practice_process_steps(practice_id, step_key, status, updated_at, updated_by) VALUES (?, 'fase2', 'completata', ?, ?)",
+                    (practice_id, now_iso(), ctx["user_id"]))
+            # avanza lo stato verso la valutazione di merito, se ammesso dalla macchina a stati
+            block = can_transition_practice(conn, practice, "pronto_cvoi")
+            if not block:
+                conn.execute("UPDATE practices SET status='pronto_cvoi', updated_at=? WHERE id=?", (now_iso(), practice_id))
+                conn.execute(
+                    """INSERT INTO practice_status_history(practice_id, from_status, to_status, actor_id, notes, created_at)
+                       VALUES (?, ?, 'pronto_cvoi', ?, 'Ammissibilita validata: avvio valutazione di merito', ?)""",
+                    (practice_id, practice["status"], ctx["user_id"], now_iso()))
+            log_audit(conn, ctx["platform_id"], ctx["user_id"], "practice", practice_id, "Ammissibilita validata", "C4 inviata")
+            conn.commit()
+        self.redirect(f"/pariter/practices/{practice_id}", ctx,
+                      "Ammissibilita' validata: C4 inviata, pratica in valutazione di merito (CVOI).", {"fase": "fase3"})
+
+    def post_practice_anagrafica(self, practice_id, form):
+        ctx = self.ctx_from_form(form)
+        practice = self._practice_guard(ctx, practice_id, "fase1")
+        if not practice:
+            return
+        try:
+            js = json.loads(practice["dossier_json"] or "{}")
+        except (ValueError, TypeError):
+            js = {}
+        ds = js.setdefault("dati_struttura", {})
+        soc = ds.setdefault("societa", {})
+        rep = ds.setdefault("legaleRappresentante", {})
+        off = ds.setdefault("offertaFase1", {})
+        g = lambda k: (form.get(k, "") or "").strip()
+        denom = g("denominazione")
+        soc["denominazione"] = denom
+        soc["forma"] = g("forma")
+        soc["sedeLegale"] = g("sedeLegale")
+        soc["pIva"] = g("pIva")
+        soc["pec"] = g("pec")
+        rep["nome"] = g("rep_nome")
+        rep["carica"] = g("rep_carica")
+        off["importoTarget"] = g("importoTarget")
+        off["importoMax"] = g("importoMax")
+        off["preMoney"] = g("preMoney")
+        off["equity"] = g("equity")
+        off["strumento"] = g("strumento")
+        project_title = g("project_title") or practice["project_title"]
+        with connect() as conn:
+            conn.execute(
+                """UPDATE practices SET proponent_name = ?, project_title = ?, instrument = ?,
+                   target_amount = ?, max_amount = ?, pre_money = ?, equity_percent = ?,
+                   dossier_json = ?, updated_at = ? WHERE id = ?""",
+                (denom or practice["proponent_name"], project_title, off["strumento"],
+                 _parse_amount(off["importoTarget"]), _parse_amount(off["importoMax"]),
+                 _parse_amount(off["preMoney"]), off["equity"],
+                 json.dumps(js, ensure_ascii=False), now_iso(), practice_id))
+            log_audit(conn, ctx["platform_id"], ctx["user_id"], "practice", practice_id, "Anagrafica aggiornata", denom)
+            conn.commit()
+        self.redirect(f"/pariter/practices/{practice_id}", ctx, "Anagrafica salvata.", {"fase": "fase1"})
+
+    def post_practice_create_manual(self, form):
+        ctx = self.ctx_from_form(form)
+        if ctx["platform_id"] != 1 or not user_can(ctx["user"], "manage_practice"):
+            self.redirect("/deals", ctx, "Ruolo non abilitato.")
+            return
+        g = lambda k: (form.get(k, "") or "").strip()
+        denom = g("denominazione")
+        title = g("project_title") or (f"Offerta {denom}" if denom else "Nuova candidatura")
+        if not denom:
+            self.redirect("/pariter/practices/import", ctx, "Inserisci almeno la denominazione del proponente.")
+            return
+        dossier = {"jsons": {"dati_struttura": {
+            "meta": {"piattaforma": "Inserimento manuale"},
+            "societa": {"denominazione": denom, "forma": g("forma"), "sedeLegale": g("sedeLegale"),
+                        "pIva": g("pIva"), "pec": g("pec")},
+            "legaleRappresentante": {"nome": g("rep_nome"), "carica": g("rep_carica")},
+            "offertaFase1": {"importoTarget": g("importoTarget"), "importoMax": g("importoMax"),
+                             "preMoney": g("preMoney"), "equity": g("equity"), "strumento": g("strumento")},
+        }}, "files": []}
+        with connect() as conn:
+            mapped = map_dossier_to_practice(dossier, 1, title)
+            practice_id = ingest_practice(conn, dossier, mapped, 1, ctx["user_id"])
+            log_audit(conn, ctx["platform_id"], ctx["user_id"], "practice", practice_id, "Nuova candidatura manuale", denom)
+            conn.commit()
+        self.redirect(f"/pariter/practices/{practice_id}", ctx,
+                      "Nuova candidatura creata: completa l'anagrafica, carica i documenti e prendi in carico.", {"fase": "fase1"})
 
     def post_practice_step(self, practice_id, form):
         ctx = self.ctx_from_form(form)
