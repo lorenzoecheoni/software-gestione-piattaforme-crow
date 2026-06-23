@@ -4637,8 +4637,8 @@ class App(BaseHTTPRequestHandler):
             ("Documenti", "/documents", "documents"),
             ("Assistente IA", "/assistant", "assistant"),
         ]
-        if ctx["platform_id"] == 1 and ctx["user"]["role"] in {"compliance", "legal", "admin"}:
-            nav_items.insert(2, ("Team", "/pariter/team", "team"))
+        # (La voce "Team" e' stata integrata nel fascicolo persona di Compagine: CV,
+        # documento d'identita e firma si gestiscono dall'anagrafica del soggetto.)
         nav = "".join(
             f'<a class="nav-link {"active" if key == active else ""}" href="{rel_url(href, ctx)}">{label}</a>'
             for label, href, key in nav_items
@@ -5398,6 +5398,10 @@ document.querySelectorAll('[data-campaign-form]').forEach((form) => {
 
     def page_team(self):
         ctx = self.get_ctx()
+        # Pagina Team ritirata: CV, documento e firma sono ora nel fascicolo persona
+        # di Compagine (apri il soggetto dall'organigramma o dalla Lista anagrafica).
+        self.redirect("/compagine", ctx, "L'anagrafica (CV, documento, firma) e' ora nel fascicolo persona di Compagine.")
+        return
         if ctx["platform_id"] != 1:
             self.redirect("/compagine", ctx, "Anagrafica team disponibile su Pariter.")
             return
@@ -5486,18 +5490,49 @@ document.querySelectorAll('[data-campaign-form]').forEach((form) => {
             conn.commit()
         self.redirect("/pariter/team", ctx, "Anagrafica aggiornata.", {"id": form["id"]})
 
+    def _team_id_from_form(self, conn, ctx, form):
+        """Risolve la riga team_people da `id` o, se assente, dal `person_name`
+        (la crea se non esiste). Cosi' CV/firma si gestiscono dal fascicolo persona."""
+        if form.get("id"):
+            return int(form["id"])
+        name = (form.get("person_name") or "").strip()
+        if not name:
+            return None
+        r = conn.execute(
+            "SELECT id FROM team_people WHERE platform_id = ? AND name = ? ORDER BY id LIMIT 1",
+            (ctx["platform_id"], name),
+        ).fetchone()
+        if r:
+            return r["id"]
+        cur = conn.execute(
+            "INSERT INTO team_people(platform_id, name, role, active) VALUES (?, ?, ?, 1)",
+            (ctx["platform_id"], name, form.get("person_role", "")),
+        )
+        return cur.lastrowid
+
+    def _team_redirect(self, ctx, form, msg):
+        name = (form.get("person_name") or "").strip()
+        if name:
+            self.redirect("/compagine", ctx, msg, {"person": name, "role": form.get("person_role") or "Anagrafica organigramma"})
+        else:
+            self.redirect("/pariter/team", ctx, msg, {"id": form.get("id", "")})
+
     def post_team_upload(self, form, files):
         ctx = self.ctx_from_form(form)
         if not user_can(ctx["user"], "manage_compagine"):
-            self.redirect("/pariter/team", ctx, "Ruolo non abilitato.")
+            self._team_redirect(ctx, form, "Ruolo non abilitato.")
             return
         kind = form.get("kind", "")
-        tid = int(form["id"])
         file_item = files.get("file")
         if file_item is None or not getattr(file_item, "filename", ""):
-            self.redirect("/pariter/team", ctx, "Nessun file.", {"id": tid})
+            self._team_redirect(ctx, form, "Nessun file.")
             return
         with connect() as conn:
+            tid = self._team_id_from_form(conn, ctx, form)
+            if tid is None:
+                conn.commit()
+                self._team_redirect(ctx, form, "Soggetto non valido.")
+                return
             if kind == "firma":
                 # salva l'immagine firma come file e registra il percorso
                 filename = sanitize_filename(file_item.filename)
@@ -5516,29 +5551,30 @@ document.querySelectorAll('[data-campaign-form]').forEach((form) => {
                 col = "cv_document_id" if kind == "cv" else "id_document_id"
                 conn.execute(f"UPDATE team_people SET {col} = ? WHERE id = ?", (doc_id, tid))
             conn.commit()
-        self.redirect("/pariter/team", ctx, "Caricato.", {"id": tid})
+        self._team_redirect(ctx, form, "Caricato.")
 
     def post_team_firma_draw(self, form):
         ctx = self.ctx_from_form(form)
         if not user_can(ctx["user"], "manage_compagine"):
-            self.redirect("/pariter/team", ctx, "Ruolo non abilitato.")
+            self._team_redirect(ctx, form, "Ruolo non abilitato.")
             return
-        tid = int(form["id"])
         data = form.get("firma_data", "")
-        if data.startswith("data:image/png;base64,"):
-            raw = base64.b64decode(data.split(",", 1)[1])
-            folder = UPLOAD_DIR / "firme"
-            folder.mkdir(parents=True, exist_ok=True)
-            stored = folder / f"{datetime.now().strftime('%Y%m%d-%H%M%S')}-{uuid.uuid4().hex[:8]}-firma.png"
-            stored.write_bytes(raw)
-            with connect() as conn:
+        with connect() as conn:
+            tid = self._team_id_from_form(conn, ctx, form)
+            if tid is not None and data.startswith("data:image/png;base64,"):
+                raw = base64.b64decode(data.split(",", 1)[1])
+                folder = UPLOAD_DIR / "firme"
+                folder.mkdir(parents=True, exist_ok=True)
+                stored = folder / f"{datetime.now().strftime('%Y%m%d-%H%M%S')}-{uuid.uuid4().hex[:8]}-firma.png"
+                stored.write_bytes(raw)
                 conn.execute("UPDATE team_people SET firma_path = ?, firma_kind = 'disegnata' WHERE id = ?",
                              (str(stored.relative_to(BASE_DIR)), tid))
                 conn.commit()
-            msg = "Firma disegnata salvata."
-        else:
-            msg = "Disegna la firma prima di salvare."
-        self.redirect("/pariter/team", ctx, msg, {"id": tid})
+                msg = "Firma disegnata salvata."
+            else:
+                conn.commit()
+                msg = "Disegna la firma prima di salvare."
+        self._team_redirect(ctx, form, msg)
 
     def get_practice(self, practice_id):
         return row("SELECT * FROM practices WHERE id = ?", (practice_id,))
@@ -9839,6 +9875,47 @@ document.querySelectorAll('[data-campaign-form]').forEach((form) => {
             f'<a class="subtab {"active" if key == active_tab else ""}" href="{rel_url("/compagine", ctx, {"tab": key})}">{label}</a>'
             for key, label in [("organigramma", "Organigramma"), ("anagrafiche", "Lista anagrafica")]
         )
+        # CV, documento d'identita e firma del soggetto: integrati nel fascicolo persona
+        # (ex pagina Team). Solo per soggetti Persona; i dati stanno in team_people.
+        cv_firma_section = ""
+        if selected_person and "Persona" in selected_subject_type:
+            tp = row("SELECT * FROM team_people WHERE platform_id = ? AND name = ? ORDER BY id LIMIT 1", (pid, selected_person))
+
+            def _cvf_doc(doc_id, label, kind):
+                cur = (f'<a class="button tiny" href="{rel_url("/documents/" + str(doc_id) + "/download", ctx)}">Apri</a>'
+                       if doc_id else '<span class="muted">non caricato</span>')
+                return f"""<div class="cvf-row"><span>{esc(label)}</span>{cur}
+                  <form method="post" action="/pariter/team/upload" enctype="multipart/form-data" class="inline-form">
+                    {hidden_ctx(ctx)}<input type="hidden" name="person_name" value="{esc(selected_person)}"><input type="hidden" name="person_role" value="{esc(selected_role or 'Anagrafica organigramma')}"><input type="hidden" name="kind" value="{kind}">
+                    <input type="file" name="file" required><button class="button tiny" type="submit">Carica</button></form></div>"""
+
+            firma_img = '<span class="muted">nessuna firma</span>'
+            if tp and tp["firma_path"] and (BASE_DIR / tp["firma_path"]).exists():
+                b64 = base64.b64encode((BASE_DIR / tp["firma_path"]).read_bytes()).decode()
+                ext = tp["firma_path"].rsplit(".", 1)[-1].lower()
+                mime = "image/jpeg" if ext in ("jpg", "jpeg") else "image/png"
+                firma_img = f'<img src="data:{mime};base64,{b64}" style="max-height:72px;border:1px solid var(--line);background:#fff">'
+            cv_id = tp["cv_document_id"] if tp else None
+            id_doc = tp["id_document_id"] if tp else None
+            cv_firma_section = f"""
+      <div class="section-head compact-head"><h3>Curriculum, documento e firma</h3><span class="panel-kicker">soggetto persona</span></div>
+      <div class="cv-firma">
+        {_cvf_doc(cv_id, "Curriculum vitae", "cv")}
+        {_cvf_doc(id_doc, "Documento d'identita", "documento")}
+        <div class="cvf-row"><span>Firma</span>{firma_img}
+          <form method="post" action="/pariter/team/upload" enctype="multipart/form-data" class="inline-form">
+            {hidden_ctx(ctx)}<input type="hidden" name="person_name" value="{esc(selected_person)}"><input type="hidden" name="person_role" value="{esc(selected_role or 'Anagrafica organigramma')}"><input type="hidden" name="kind" value="firma">
+            <input type="file" name="file" accept="image/*" required><button class="button tiny" type="submit">Carica firma</button></form>
+        </div>
+        <form method="post" action="/pariter/team/firma-draw" id="firmaForm" style="margin-top:8px">
+          {hidden_ctx(ctx)}<input type="hidden" name="person_name" value="{esc(selected_person)}"><input type="hidden" name="person_role" value="{esc(selected_role or 'Anagrafica organigramma')}"><input type="hidden" name="firma_data" id="firmaData">
+          <canvas id="firmaCanvas" width="420" height="120" class="firma-canvas"></canvas>
+          <div class="form-actions left"><button type="button" class="button ghost" id="firmaClear">Cancella</button><button class="button primary" type="submit">Salva firma disegnata</button></div>
+        </form>
+        <p class="muted" style="font-size:11px">La firma vale per relazioni e verbali se la persona ha anche il documento d'identita caricato.</p>
+      </div>"""
+        cv_firma_panel = f'<section class="panel">{cv_firma_section}</section>' if cv_firma_section else ""
+
         person_modal = ""
         if selected_person and active_tab != "anagrafiche":
             selected_status = "Attivo" if selected_person_functions else "Da censire"
@@ -9903,6 +9980,7 @@ document.querySelectorAll('[data-campaign-form]').forEach((form) => {
         <button class="button ghost" type="button" data-open-action data-action="Collega documento">+ Collega documento</button>
       </div>
       {person_doc_rows}
+      {cv_firma_section}
     </div>
     <datalist id="org-function-options">{function_options}</datalist>
   </section>
@@ -10986,6 +11064,7 @@ if (shareholderModal) {{
     <div class="document-list">{person_doc_rows}</div>
   </div>
 </section>
+{cv_firma_panel}
 <div class="assignment-modal" data-action-modal hidden>
   <section class="assignment-dialog action-dialog">
     <div class="section-head">
