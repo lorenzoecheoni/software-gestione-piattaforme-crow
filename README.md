@@ -1,6 +1,8 @@
-# ECSP Compliance Suite
+# CrowdOS
 
-Prima versione funzionante per una suite interna di compliance & operations per piattaforme ECSP.
+**End-to-end Crowdfunding Platform Management.**
+
+Software gestionale interno per piattaforme di crowdfunding (ECSP, Reg. (UE) 2020/1503): compliance, governance, istruttoria offerte, investitori, proponenti, documenti e comunicazioni obbligatorie.
 
 ## Avvio
 

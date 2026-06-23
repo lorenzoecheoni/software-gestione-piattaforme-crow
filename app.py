@@ -359,28 +359,33 @@ ONBOARDING_STEPS = [
      "attore": "Team di valutazione / Responsabile dei controlli", "tab": "documentale",
      "descrizione": "Verifica completezza documentale (eventuale richiesta di integrazione), KYC art. 5 ECSP su titolare e "
                     "titolare effettivo, rispetto del limite di 5 milioni, relazione art. 5/AML. Se positiva, si avvia la valutazione di merito.",
-     "comms": ["C3", "C4"]},
+     "comms": ["C4"]},
     {"key": "fase3", "fase": "Fase 3", "titolo": "Valutazione di merito (CVOI)",
      "attore": "Comitato Valutazione Opportunita' di Investimento", "tab": "cvoi",
      "descrizione": "Scoring su 3 aree (soglia 19,05), reference call e incontri, accertamento conflitti, verifica coerenza "
                     "della KIIS e redazione del fascicolo di valutazione in 8 sezioni. Durata 30 giorni dalla documentazione.",
      "comms": []},
-    {"key": "fase4", "fase": "Fase 4", "titolo": "Pareri e delibera",
-     "attore": "Advisory Committee / Responsabile dei controlli / CdA", "tab": "advisory",
-     "descrizione": "Parere obbligatorio non vincolante dell'Advisory; valutazione formale finale dei conflitti; delibera "
-                    "del CdA (approva o respinge). Comunicazione dell'esito al proponente.",
+    {"key": "fase4", "fase": "Fase 4", "titolo": "Advisory Committee",
+     "attore": "Advisory Committee", "tab": "advisory",
+     "descrizione": "Sessione dedicata dell'Advisory Committee: esame del fascicolo CVOI e della bozza KIIS, parere "
+                    "obbligatorio non vincolante (favorevole / con condizioni / sospensivo / contrario) con redazione e firma dei membri.",
+     "comms": []},
+    {"key": "fase5", "fase": "Fase 5", "titolo": "Relazione conflitti e delibera CdA",
+     "attore": "Responsabile dei controlli / CdA", "tab": "cda",
+     "descrizione": "Valutazione formale finale dei conflitti di interesse (relazione), convocazione del CdA, delibera "
+                    "(approva o respinge) e verbale. Comunicazione dell'esito al proponente.",
      "comms": ["C5", "C6"]},
-    {"key": "fase5", "fase": "Fase 5", "titolo": "Strutturazione e pubblicazione",
+    {"key": "fase6", "fase": "Fase 6", "titolo": "Strutturazione e pubblicazione",
      "attore": "Team / Sistema", "tab": "validazione",
      "descrizione": "Strutturazione dell'offerta, finalizzazione KIIS, assegnazione dell'Identificativo dell'offerta e "
                     "pubblicazione sul portale. Eventuale comunicazione a CONSOB se dovuta.",
      "comms": ["C7", "C9"]},
-    {"key": "fase6", "fase": "Fase 6", "titolo": "Onboarding investitore e raccolta",
+    {"key": "fase7", "fase": "Fase 7", "titolo": "Onboarding investitore e raccolta",
      "attore": "Investitore / Sistema / Banca Sella", "tab": "",
      "descrizione": "Classificazione investitore (sofisticato/non), test di conoscenza e simulazione perdite, raccolta e "
                     "custodia somme presso Banca Sella, conferma ordine. A chiusura: accredito o restituzione.",
      "comms": ["C8"]},
-    {"key": "fase7", "fase": "Fase 7", "titolo": "Post-offerta e obblighi continuativi",
+    {"key": "fase8", "fase": "Fase 8", "titolo": "Post-offerta e obblighi continuativi",
      "attore": "Responsabile delle funzioni di controllo", "tab": "",
      "descrizione": "Monitoraggio campagna ed emittente, comunicazioni a CONSOB di ogni modifica sostanziale (SiCrowd), "
                     "segnalazioni di vigilanza periodiche.",
@@ -392,9 +397,9 @@ ONBOARDING_STEPS = [
 # blu = conclusa (post-offerta). Coerente con i bucket del deal-hub.
 PHASE_BAND = {
     "fase1": "istruttoria", "fase2": "istruttoria", "fase3": "istruttoria",
-    "fase4": "istruttoria", "fase5": "istruttoria",
-    "fase6": "in_corso",
-    "fase7": "conclusi",
+    "fase4": "istruttoria", "fase5": "istruttoria", "fase6": "istruttoria",
+    "fase7": "in_corso",
+    "fase8": "conclusi",
 }
 PHASE_BAND_LABELS = {"istruttoria": "In istruttoria", "in_corso": "In corso (online)", "conclusi": "Conclusa"}
 
@@ -441,21 +446,22 @@ EMAIL_TEMPLATES = {
 
 # Documenti attesi nel dossier proponente, per fase (spec sez. 2/7).
 PRACTICE_DOC_SEED = [
-    # Fase 1 - i 9 documenti di candidatura (procedura operativa Pariter)
-    ("fase1", "Progetto", "Presentazione del progetto", 1),
-    ("fase1", "Economico", "Piano finanziario: storico e proiezioni a 3 anni", 1),
-    ("fase1", "Societaria", "Visura camerale", 1),
-    ("fase1", "Societaria", "Statuto", 1),
-    ("fase1", "Economico", "Ultimi due bilanci", 1),
-    ("fase1", "Offerta", "Informazioni dell'operazione (fabbisogno, valutazione, condizioni)", 1),
-    ("fase1", "Progetto", "Sito web", 0),
-    ("fase1", "Team", "Key manager ed esperienze", 1),
-    ("fase1", "Progetto", "Documentazione integrativa (eventuale)", 0),
-    # Fase 2 - documenti KYC/ammissibilita' richiesti dopo l'invio (manuale onboarding)
-    ("fase2", "KYC", "Autodichiarazione onorabilita' esponenti", 1),
-    ("fase2", "KYC", "Casellario giudiziale esponenti", 1),
-    ("fase2", "KYC", "Dichiarazione titolare effettivo e giurisdizioni non cooperative", 1),
-    ("fase2", "KYC", "Evidenze raccolte ultimi 18 mesi (limite 5M)", 1),
+    # Fase 1 - i 9 documenti di candidatura, esatti dal manuale onboarding (checklist M1)
+    ("fase1", "Candidatura", "Presentazione del progetto imprenditoriale", 1),
+    ("fase1", "Candidatura", "Piano finanziario storico + proiezioni a 3 anni", 1),
+    ("fase1", "Candidatura", "Visura camerale aggiornata", 1),
+    ("fase1", "Candidatura", "Statuto", 1),
+    ("fase1", "Candidatura", "Ultimi due bilanci depositati", 1),
+    ("fase1", "Candidatura", "Informazioni operazione (fabbisogno, valutazione, condizioni)", 1),
+    ("fase1", "Candidatura", "Sito web", 0),
+    ("fase1", "Candidatura", "Key manager ed esperienze", 1),
+    ("fase1", "Candidatura", "Documentazione integrativa eventuale", 0),
+    # Fase 2 - integrazione ammissibilita' (richiesti dopo l'invio), per gruppi
+    ("fase2", "Dichiarazioni e verifiche KYC", "Autodichiarazione onorabilita' esponenti", 1),
+    ("fase2", "Dichiarazioni e verifiche KYC", "Casellario giudiziale esponenti", 1),
+    ("fase2", "Dichiarazioni e verifiche KYC", "Dichiarazione titolare effettivo e giurisdizioni non cooperative", 1),
+    ("fase2", "Limite di raccolta", "Dichiarazione sul rispetto del limite di 5.000.000 EUR", 1),
+    ("fase2", "Limite di raccolta", "Evidenze raccolte ultimi 18 mesi", 1),
     # Fase 3 - approfondimenti per la valutazione di merito (CVOI)
     ("fase3", "Offerta", "Scheda approfondita progetto", 0),
     ("fase3", "Offerta", "Scheda economico-finanziaria", 0),
@@ -1817,6 +1823,41 @@ def init_db():
         ensure_demo_extensions(conn)
         ensure_pariter_real_governance(conn)
         ensure_practice_flow_v2(conn)
+        backfill_practice_seed_docs(conn)
+
+
+def backfill_practice_seed_docs(conn):
+    """Riallinea i documenti delle pratiche al seed: rimuove gli orfani (senza file),
+    corregge fase/categoria/obbligo dei presenti, aggiunge i mancanti."""
+    seed = {label: (phase, category, required)
+            for phase, category, label, required in PRACTICE_DOC_SEED}
+    practices = conn.execute("SELECT id FROM practices").fetchall()
+    for pr in practices:
+        docs = conn.execute(
+            "SELECT id, label, phase, category, required, document_id FROM practice_documents WHERE practice_id = ?",
+            (pr["id"],)).fetchall()
+        have = set()
+        for d in docs:
+            if d["label"] not in seed:
+                # documento non previsto dal seed: rimuovilo solo se non c'e' un file caricato
+                if not d["document_id"]:
+                    conn.execute("DELETE FROM practice_documents WHERE id = ?", (d["id"],))
+                else:
+                    have.add(d["label"])
+                continue
+            have.add(d["label"])
+            phase, category, required = seed[d["label"]]
+            if d["phase"] != phase or d["category"] != category or d["required"] != required:
+                conn.execute(
+                    "UPDATE practice_documents SET phase = ?, category = ?, required = ? WHERE id = ?",
+                    (phase, category, required, d["id"]))
+        for label, (phase, category, required) in seed.items():
+            if label not in have:
+                conn.execute(
+                    """INSERT INTO practice_documents(practice_id, phase, category, label, required, doc_status, updated_at)
+                       VALUES (?, ?, ?, ?, ?, 'mancante', ?)""",
+                    (pr["id"], phase, category, label, required, now_iso()))
+    conn.commit()
 
 
 def ensure_pariter_real_governance(conn):
@@ -4607,16 +4648,16 @@ class App(BaseHTTPRequestHandler):
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>{esc(title)} - ECSP Suite</title>
+  <title>{esc(title)} - CrowdOS</title>
   <link rel="stylesheet" href="/static/styles.css">
 </head>
 <body>
   <header class="app-header">
     <div class="shell header-inner">
       <div class="brand-copy">
-        <p class="eyebrow">Compliance suite - ECSP - Reg. (UE) 2020/1503</p>
-        <h1>Vigilanza Crowdfunding</h1>
-        <p>Compliance interna ed esterna - CONSOB - Banca d'Italia</p>
+        <p class="eyebrow">CrowdOS - ECSP - Reg. (UE) 2020/1503</p>
+        <h1>CrowdOS</h1>
+        <p>End-to-end Crowdfunding Platform Management</p>
       </div>
       <div class="header-actions">
         <div class="platform-switch">{platform_switch}</div>
@@ -5577,8 +5618,8 @@ document.querySelectorAll('[data-campaign-form]').forEach((form) => {
         valid = {s["key"] for s in ONBOARDING_STEPS} | {"riepilogo", "storico"}
         # mappa i vecchi tab (usati nei redirect degli handler) sulle nuove fasi
         tab_to_fase = {"documentale": "fase2", "interne": "fase2", "cvoi": "fase3",
-                       "advisory": "fase4", "cda": "fase4", "condizioni": "fase5",
-                       "validazione": "fase5", "campagna": "fase5", "processo": "riepilogo"}
+                       "advisory": "fase4", "cda": "fase5", "condizioni": "fase6",
+                       "validazione": "fase6", "campagna": "fase6", "processo": "riepilogo"}
         fase = self.get_query_param("fase") or self.get_query_param("tab")
         if fase in tab_to_fase:
             fase = tab_to_fase[fase]
@@ -5620,21 +5661,35 @@ document.querySelectorAll('[data-campaign-form]').forEach((form) => {
         if fase == "fase1":
             body = self.render_intake_panel(ctx, practice) + self.render_docs_block(ctx, practice, ["fase1"], "Documenti di candidatura")
         elif fase == "fase2":
-            body = (self.render_ammissibilita_checklist(ctx, practice)
-                    + self.render_internal_reviews(ctx, practice, ["aml_art5"])
-                    + self.render_docs_block(ctx, practice, ["fase1", "fase2"], "Documenti da verificare")
-                    + self.practice_documentale_requests(ctx, practice))
+            # 1) verifica documentale (completezza): richiamati da fase1 + KYC/5M di fase2, con condizione bloccante
+            # 2) richiesta integrazione documentale e dichiarazioni (mail C3) sotto i controlli
+            # 3) controlli di ammissibilita' (KYC, casellario, 5M)
+            # 4) relazione art.5/AML con documento e azioni
+            body = (self.render_docs_block(
+                        ctx, practice, ["fase1", "fase2"],
+                        "Istruttoria documentale (completezza e regolarita')",
+                        intro="I 9 documenti di candidatura sono richiamati dalla fase precedente; aggiungi le dichiarazioni "
+                              "KYC e le evidenze sul limite di 5 milioni. I documenti obbligatori mancanti sono condizione per proseguire.")
+                    + self.render_ammissibilita_checklist(ctx, practice)
+                    + self.phase_emails_html(ctx, practice, ["C3"], "fase2",
+                                             title="Richiesta di integrazione documentale e dichiarazioni",
+                                             intro="Se mancano documenti o dichiarazioni, invia qui la richiesta al proponente. Il termine resta sospeso fino al riscontro.")
+                    + self.practice_documentale_requests(ctx, practice)
+                    + self.render_internal_reviews(ctx, practice, ["aml_art5"]))
         elif fase == "fase3":
             body = (self.practice_tab_cvoi(ctx, practice)
                     + self.render_internal_reviews(ctx, practice, ["coerenza_kiis"])
                     + self.render_kiis_panel(ctx, practice))
         elif fase == "fase4":
-            # Ordine: Advisory (si esprime anche sui conflitti) -> relazione formale
-            # conflitti (M12, ultimo presidio del Responsabile) -> Delibera CdA.
-            body = (self.practice_tab_advisory(ctx, practice)
-                    + self.render_internal_reviews(ctx, practice, ["conflitti"])
-                    + self.practice_tab_decision(ctx, practice, 1))
+            # Sessione dedicata Advisory Committee: esamina CVOI + bozza KIIS e rende il parere non vincolante.
+            body = (self.recall_documents_html(ctx, practice, ["CVOI", "KIIS", "Verifiche interne"],
+                                               "Fascicolo per l'Advisory Committee (CVOI, bozza KIIS, verifiche)")
+                    + self.practice_tab_advisory(ctx, practice))
         elif fase == "fase5":
+            # Relazione conflitti d'interesse (ultimo presidio) -> convocazione/delibera/verbale CdA.
+            body = (self.render_internal_reviews(ctx, practice, ["conflitti"])
+                    + self.practice_tab_decision(ctx, practice, 1))
+        elif fase == "fase6":
             nr = practice["pratica_no"] if "pratica_no" in practice.keys() else ""
             ident = offer_identifier(practice)
             if nr:
@@ -5649,11 +5704,11 @@ document.querySelectorAll('[data-campaign-form]').forEach((form) => {
                            '<p class="muted">L\'aumento di capitale e i casellari giudiziali sono condizioni '
                            'pre-pubblicazione (post delibera CdA): vanno acquisiti qui prima del go-live.</p></section>')
             body = ident_panel + self.practice_tab_validazione(ctx, practice) + self.practice_tab_campagna(ctx, practice)
-        elif fase == "fase6":
+        elif fase == "fase7":
             body = ('<section class="panel"><div class="section-head"><h2>Onboarding investitore e raccolta</h2></div>'
                     '<p class="muted">Classificazione investitore (sofisticato/non), test di conoscenza e simulazione perdite, '
                     'raccolta e custodia presso Banca Sella. Sezione design-first.</p></section>')
-        else:  # fase7
+        else:  # fase8
             body = ('<section class="panel"><div class="section-head"><h2>Post-offerta e obblighi continuativi</h2></div>'
                     '<p class="muted">Monitoraggio campagna/emittente e comunicazioni continuative a CONSOB (SiCrowd).</p></section>')
         emails = self.phase_emails_html(ctx, practice, step["comms"], fase)
@@ -5873,6 +5928,14 @@ document.querySelectorAll('[data-campaign-form]').forEach((form) => {
                     f'{hidden_ctx(ctx)}<input type="hidden" name="review_type" value="{rtype}">'
                     f'<input type="hidden" name="action" value="validate"><button class="button primary" type="submit">Valida</button></form>')
 
+        def preview(doc_id, open_default=False):
+            """Anteprima inline del documento, sotto il titolo della relazione."""
+            if not doc_id:
+                return ""
+            src = rel_url("/documents/" + str(doc_id) + "/download", ctx)
+            return (f'<details class="doc-preview"{" open" if open_default else ""}><summary>Visualizza documento</summary>'
+                    f'<iframe src="{src}" title="anteprima relazione"></iframe></details>')
+
         cards = ""
         for rtype in types:
             label = INTERNAL_REVIEW_LABELS.get(rtype, rtype)
@@ -5888,7 +5951,7 @@ document.querySelectorAll('[data-campaign-form]').forEach((form) => {
                 badge = '<span class="badge success">Validata - in istruttoria</span>'
                 line = f'<p class="muted">Documento validato.{(" Firmata da <strong>" + esc(signed_by) + "</strong>.") if signed_by else ""}</p>'
                 actions = dl + ("" if locked else " " + remove_btn(rtype, "Rimuovi e rifai"))
-                body_html = line + f'<div class="form-actions">{actions}</div>'
+                body_html = line + preview(doc_id) + f'<div class="form-actions">{actions}</div>'
             elif status in ("firmata", "caricata") and doc_id:
                 if status == "firmata":
                     badge = '<span class="badge warning">Firmata - da validare</span>'
@@ -5900,7 +5963,7 @@ document.querySelectorAll('[data-campaign-form]').forEach((form) => {
                     actions = dl
                 else:
                     actions = dl + " " + validate_btn(rtype) + " " + remove_btn(rtype)
-                body_html = line + f'<div class="form-actions">{actions}</div>'
+                body_html = line + preview(doc_id) + f'<div class="form-actions">{actions}</div>'
             elif status == "bozza" and not locked:
                 badge = '<span class="badge neutral">Bozza</span>'
                 body_val = esc(rev["body"] or compose_internal_review_draft(practice, rtype))
@@ -5920,6 +5983,7 @@ document.querySelectorAll('[data-campaign-form]').forEach((form) => {
     <label class="full-span">Testo della relazione (modificabile)<textarea name="body" rows="12" class="doc-draft">{body_val}</textarea></label>
     <div class="form-actions left"><button class="button secondary" type="submit">Salva modifiche</button>{dl}{sign_btn}{validate_btn(rtype)}{remove_btn(rtype)}</div>
   </form>
+  {preview(doc_id)}
   {upload_form(rtype, "Oppure carica la relazione a mano")}"""
             else:
                 badge = '<span class="badge neutral">Da generare</span>'
@@ -5940,34 +6004,47 @@ document.querySelectorAll('[data-campaign-form]').forEach((form) => {
 </section>"""
         return cards
 
-    def render_docs_block(self, ctx, practice, phases, title):
+    def render_docs_block(self, ctx, practice, phases, title, intro=""):
         pid = practice["id"]
         locked = bool(practice["closed_at"])
         placeholders = ",".join("?" for _ in phases)
         docs = rows(f"SELECT * FROM practice_documents WHERE practice_id = ? AND phase IN ({placeholders}) ORDER BY phase, id",
                     (pid, *phases))
+        missing_block = 0
         body_rows = ""
         for d in docs:
-            caricato = (f'<a class="button tiny" href="{rel_url("/documents/" + str(d["document_id"]) + "/download", ctx)}">Caricato</a>'
-                        if d["document_id"] else '<span class="badge warning">Mancante</span>')
+            present = bool(d["document_id"])
+            # condizione bloccante: documento obbligatorio non ancora presente/da integrare
+            is_block = bool(d["required"]) and (not present or d["doc_status"] in ("mancante", "da_integrare", "non_utilizzabile"))
+            if is_block:
+                missing_block += 1
+            cond = ('<span class="badge danger">Bloccante</span>' if d["required"]
+                    else '<span class="badge neutral">Facoltativo</span>')
+            caricato = (f'<a class="button tiny" href="{rel_url("/documents/" + str(d["document_id"]) + "/download", ctx)}">Apri</a>'
+                        if present else '<span class="badge warning">Mancante</span>')
             if locked:
-                validato = f'<span class="badge {badge_class(DOC_STATUS_LABELS.get(d["doc_status"], d["doc_status"]))}">{esc(DOC_STATUS_LABELS.get(d["doc_status"], d["doc_status"]))}</span>'
+                stato = f'<span class="badge {badge_class(DOC_STATUS_LABELS.get(d["doc_status"], d["doc_status"]))}">{esc(DOC_STATUS_LABELS.get(d["doc_status"], d["doc_status"]))}</span>'
             else:
                 status_opts = "".join(
                     f'<option value="{k}"{" selected" if k == d["doc_status"] else ""}>{esc(v)}</option>'
                     for k, v in DOC_STATUS_LABELS.items())
-                validato = f"""<form method="post" action="/pariter/practices/{pid}/document-status" class="inline-form">
+                stato = f"""<form method="post" action="/pariter/practices/{pid}/document-status" class="inline-form">
                   {hidden_ctx(ctx)}<input type="hidden" name="doc_id" value="{d['id']}"><input type="hidden" name="back_fase" value="{phases[-1]}">
                   <select name="doc_status">{status_opts}</select>
                   <input name="reviewer_notes" placeholder="Note" value="{esc(d['reviewer_notes'] or '')}">
                   <button class="button tiny" type="submit">Salva</button></form>"""
             body_rows += f"""<tr>
-              <td>{esc(d['label'])}{' <span class="muted">*</span>' if d['required'] else ''}</td>
+              <td>{esc(d['label'])}</td>
+              <td>{cond}</td>
               <td>{caricato}</td>
-              <td>{validato}</td>
+              <td>{stato}</td>
             </tr>"""
         if not body_rows:
-            body_rows = '<tr><td colspan="3" class="muted">Nessun documento atteso.</td></tr>'
+            body_rows = '<tr><td colspan="4" class="muted">Nessun documento atteso.</td></tr>'
+        summary = (f'<p><span class="badge danger">{missing_block} documenti obbligatori mancanti</span> '
+                   f'<span class="muted">condizione per proseguire: integrare prima di passare alla valutazione.</span></p>'
+                   if missing_block else
+                   '<p><span class="badge success">Documentazione obbligatoria completa</span></p>')
         upload = ""
         if not locked and docs:
             upload_opts = "".join(f'<option value="{d["id"]}">{esc(d["label"])}</option>' for d in docs)
@@ -5978,16 +6055,18 @@ document.querySelectorAll('[data-campaign-form]').forEach((form) => {
     <input type="file" name="file" required>
     <button class="button tiny" type="submit">Carica e collega</button>
   </form>"""
+        intro_html = f'<p class="muted">{esc(intro)}</p>' if intro else ""
         return f"""
 <section class="panel">
   <div class="section-head"><h2>{esc(title)}</h2></div>
-  <table class="data-table compact"><thead><tr><th>Documento</th><th>Caricato</th><th>Validazione</th></tr></thead><tbody>{body_rows}</tbody></table>
+  {intro_html}
+  {summary}
+  <table class="data-table compact"><thead><tr><th>Documento</th><th>Condizione</th><th>File</th><th>Stato</th></tr></thead><tbody>{body_rows}</tbody></table>
   {upload}
 </section>"""
 
     # Controllo -> (etichetta, parole chiave per richiamare i documenti da esaminare)
     AMMISSIBILITA_CHECKS = [
-        ("chk_completezza", "Completezza e regolarita' documentale", None),
         ("chk_kyc", "KYC art. 5: titolare effettivo e giurisdizioni",
          ("visura", "statuto", "titolare", "kyc", "giurisdiz", "identita", "key manager", "onorabil", "dichiaraz")),
         ("chk_casellario", "Casellario giudiziale / onorabilita' esponenti",
@@ -6075,7 +6154,9 @@ document.querySelectorAll('[data-campaign-form]').forEach((form) => {
   <div class="form-actions">{action}</div>
 </section>"""
 
-    def phase_emails_html(self, ctx, practice, codes, fase=""):
+    def phase_emails_html(self, ctx, practice, codes, fase="",
+                          title="Comunicazioni di questa fase",
+                          intro="La mail compare qui, nel momento del processo. Modificala, aprila nel client e registrala come inviata."):
         if not codes:
             return ""
         pid = practice["id"]
@@ -6121,8 +6202,8 @@ document.querySelectorAll('[data-campaign-form]').forEach((form) => {
       </details>"""
         return f"""
 <section class="panel">
-  <div class="section-head"><h2>Comunicazioni di questa fase</h2></div>
-  <p class="muted">La mail compare qui, nel momento del processo. Modificala, aprila nel client e registrala come inviata.</p>
+  <div class="section-head"><h2>{esc(title)}</h2></div>
+  <p class="muted">{esc(intro)}</p>
   {blocks}
 </section>"""
 
@@ -7101,8 +7182,10 @@ document.querySelectorAll('[data-campaign-form]').forEach((form) => {
             return
         rtype = form.get("review_type", "")
         action = form.get("action", "generate")
+        # ogni relazione vive nella sua fase: AML->fase2, coerenza KIIS->fase3, conflitti->fase5
+        back_fase = {"aml_art5": "fase2", "coerenza_kiis": "fase3", "conflitti": "fase5"}.get(rtype, "fase2")
         if rtype not in INTERNAL_REVIEW_LABELS:
-            self.redirect(f"/pariter/practices/{practice_id}", ctx, "Tipo relazione non valido.", {"tab": "interne"})
+            self.redirect(f"/pariter/practices/{practice_id}", ctx, "Tipo relazione non valido.", {"fase": back_fase})
             return
         with connect() as conn:
             existing = conn.execute(
@@ -7130,7 +7213,7 @@ document.querySelectorAll('[data-campaign-form]').forEach((form) => {
             # una relazione validata e' definitiva: per rigenerarla/modificarla va prima rimossa
             if cur_status == "validata" and action in ("generate", "save_body", "sign", "upload"):
                 self.redirect(f"/pariter/practices/{practice_id}", ctx,
-                              "Relazione gia' validata e in istruttoria: rimuovila per rigenerarla.", {"tab": "interne"})
+                              "Relazione gia' validata e in istruttoria: rimuovila per rigenerarla.", {"fase": back_fase})
                 return
 
             prev_doc = existing["generated_document_id"] if existing else None
@@ -7165,7 +7248,7 @@ document.querySelectorAll('[data-campaign-form]').forEach((form) => {
             elif action == "upload":
                 file_item = files.get("file")
                 if file_item is None or not getattr(file_item, "filename", ""):
-                    self.redirect(f"/pariter/practices/{practice_id}", ctx, "Nessun file relazione.", {"tab": "interne"})
+                    self.redirect(f"/pariter/practices/{practice_id}", ctx, "Nessun file relazione.", {"fase": back_fase})
                     return
                 _drop_doc(prev_doc)
                 title = INTERNAL_REVIEW_LABELS.get(rtype, rtype)
@@ -7178,7 +7261,7 @@ document.querySelectorAll('[data-campaign-form]').forEach((form) => {
             elif action == "validate":
                 if not (existing and existing["generated_document_id"]):
                     self.redirect(f"/pariter/practices/{practice_id}", ctx,
-                                  "Genera/firma o carica la relazione prima di validarla.", {"tab": "interne"})
+                                  "Genera/firma o carica la relazione prima di validarla.", {"fase": back_fase})
                     return
                 conn.execute(
                     "UPDATE internal_reviews SET review_status = 'validata', updated_by = ?, updated_at = ? WHERE id = ?",
@@ -7198,7 +7281,7 @@ document.querySelectorAll('[data-campaign-form]').forEach((form) => {
                 if not valid:
                     self.redirect(f"/pariter/practices/{practice_id}", ctx,
                                   f"Firma non disponibile: carica firma e documento d'identita' di {resp_name} in anagrafica team prima di firmare.",
-                                  {"tab": "interne"})
+                                  {"fase": back_fase})
                     return
                 # rimuove la bozza HTML scaricabile prima di archiviare il PDF definitivo
                 if prev_doc:
@@ -7231,11 +7314,11 @@ document.querySelectorAll('[data-campaign-form]').forEach((form) => {
             conn.execute("UPDATE practices SET updated_at = ? WHERE id = ?", (now_iso(), practice_id))
             log_audit(conn, ctx["platform_id"], ctx["user_id"], "practice", practice_id, f"Relazione {rtype}", action)
             conn.commit()
-        self.redirect(f"/pariter/practices/{practice_id}", ctx, msg, {"tab": "interne"})
+        self.redirect(f"/pariter/practices/{practice_id}", ctx, msg, {"fase": back_fase})
 
     def post_practice_cda_convoca(self, practice_id, form):
         ctx = self.ctx_from_form(form)
-        practice = self._practice_guard(ctx, practice_id, "fase4", perm="board_decision")
+        practice = self._practice_guard(ctx, practice_id, "fase5", perm="board_decision")
         if not practice:
             return
         meeting_date = form.get("meeting_date") or today_iso()
@@ -7260,16 +7343,16 @@ document.querySelectorAll('[data-campaign-form]').forEach((form) => {
                       "Convocazione CdA da fascicolo pratica", title)
             conn.commit()
         self.redirect(f"/pariter/practices/{practice_id}", ctx,
-                      "Convocazione CdA creata: visibile in Governance > Convocazioni.", {"fase": "fase4"})
+                      "Convocazione CdA creata: visibile in Governance > Convocazioni.", {"fase": "fase5"})
 
     def post_practice_cda_verbale(self, practice_id, form, files):
         ctx = self.ctx_from_form(form)
-        practice = self._practice_guard(ctx, practice_id, "fase4", perm="board_decision")
+        practice = self._practice_guard(ctx, practice_id, "fase5", perm="board_decision")
         if not practice:
             return
         file_item = files.get("file")
         if file_item is None or not getattr(file_item, "filename", ""):
-            self.redirect(f"/pariter/practices/{practice_id}", ctx, "Nessun file verbale.", {"fase": "fase4"})
+            self.redirect(f"/pariter/practices/{practice_id}", ctx, "Nessun file verbale.", {"fase": "fase5"})
             return
         with connect() as conn:
             doc_id = save_uploaded_document(
@@ -7290,7 +7373,7 @@ document.querySelectorAll('[data-campaign-form]').forEach((form) => {
                              (doc_id, meeting["id"]))
             log_audit(conn, ctx["platform_id"], ctx["user_id"], "practice", practice_id, "Verbale CdA caricato", "")
             conn.commit()
-        self.redirect(f"/pariter/practices/{practice_id}", ctx, "Verbale del CdA caricato e collegato.", {"fase": "fase4"})
+        self.redirect(f"/pariter/practices/{practice_id}", ctx, "Verbale del CdA caricato e collegato.", {"fase": "fase5"})
 
     def post_practice_integration_request(self, practice_id, form):
         ctx = self.ctx_from_form(form)
@@ -15207,7 +15290,7 @@ def main():
     init_db()
     port = int(sys.argv[1]) if len(sys.argv) > 1 else 8772
     server = ThreadingHTTPServer(("127.0.0.1", port), App)
-    print(f"ECSP Suite running at http://127.0.0.1:{port}")
+    print(f"CrowdOS running at http://127.0.0.1:{port}")
     try:
         server.serve_forever()
     except KeyboardInterrupt:
