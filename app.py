@@ -1637,6 +1637,17 @@ def init_db():
         ensure_column(conn, "practice_board_decisions", "finalized_at", "TEXT NOT NULL DEFAULT ''")
         ensure_column(conn, "advisory_opinions", "workflow_status", "TEXT NOT NULL DEFAULT 'bozza'")
         ensure_column(conn, "advisory_opinions", "drafter_user_id", "INTEGER")
+        # Registri conflitti/reclami secondo modello M10 (Allegati 14 e 16)
+        for col in ("reg_no", "soggetti", "natura_fonte", "rilevato_da", "valutazione", "misura", "esito", "atti_collegati"):
+            ensure_column(conn, "conflicts", col, "TEXT NOT NULL DEFAULT ''")
+        ensure_column(conn, "complaints", "protocollo", "TEXT NOT NULL DEFAULT ''")
+        ensure_column(conn, "complaints", "classificazione", "TEXT NOT NULL DEFAULT 'Reclamo'")
+        ensure_column(conn, "complaints", "motivi_danno", "TEXT NOT NULL DEFAULT ''")
+        ensure_column(conn, "complaints", "ricevibilita_date", "TEXT NOT NULL DEFAULT ''")
+        ensure_column(conn, "complaints", "riscontro_date", "TEXT NOT NULL DEFAULT ''")
+        ensure_column(conn, "complaints", "misure", "TEXT NOT NULL DEFAULT ''")
+        ensure_column(conn, "complaints", "esborso", "TEXT NOT NULL DEFAULT 'No'")
+        ensure_column(conn, "complaints", "esborso_note", "TEXT NOT NULL DEFAULT ''")
         if conn.execute("SELECT COUNT(*) FROM platforms").fetchone()[0] == 0:
             seed(conn)
         ensure_demo_extensions(conn)
@@ -3595,6 +3606,34 @@ CONDITION_STATUS_LABELS = {
     "non_applicabile": "Non piu' applicabile",
 }
 
+# Opzioni guidate del registro conflitti (valori suggeriti dal modello M10).
+CONFLICT_TIPO_SOGGETTO = ["Soggetto Rilevante", "Proponente", "Cliente / Investitore", "Socio",
+                          "Esponente aziendale", "Advisor / Collaboratore", "Altro"]
+CONFLICT_NATURA = ["rapporto d'affari", "rapporto partecipativo", "parentela o affinita'",
+                   "investimento di Soggetto Rilevante", "altro"]
+CONFLICT_FONTE = ["segnalazione di dipendente/collaboratore", "dichiarazione annuale degli interessi",
+                  "processo di selezione del progetto", "relazione di insussistenza dei conflitti", "altro"]
+CONFLICT_FONDATEZZA = ["fondato", "non fondato"]
+CONFLICT_GESTIBILITA = ["gestibile", "non gestibile"]
+CONFLICT_MISURA = ["astensione del soggetto in CdA", "delibera di insussistenza di anomalie",
+                   "informativa ai clienti con disclaimer", "non ammissione dell'iniziativa", "altro"]
+CONFLICT_ESITO = ["in lavorazione", "in monitoraggio", "gestito", "non ammesso"]
+CONFLICT_ATTI = ["verbale del CdA", "relazione di insussistenza dei conflitti", "disclaimer in piattaforma",
+                 "aggiornamento del registro", "nessuno", "altro"]
+
+
+def org_responsabile(platform_id, keywords, fallback=""):
+    """Restituisce il soggetto incaricato (dall'organigramma) la cui funzione contiene una keyword."""
+    assigns = rows(
+        "SELECT function_name, subject_name, role FROM org_assignments WHERE platform_id = ? AND status = 'Attivo'",
+        (platform_id,),
+    )
+    for kw in keywords:
+        for a in assigns:
+            if kw in (a["function_name"] or "").lower():
+                return a["subject_name"], a["function_name"]
+    return fallback, ""
+
 
 def build_campaign_review_html(practice, review):
     js = {}
@@ -3851,8 +3890,12 @@ class App(BaseHTTPRequestHandler):
             self.page_investor_detail(int(path.rsplit("/", 1)[1]))
         elif path == "/conflicts":
             self.page_conflicts()
+        elif path == "/conflicts/export":
+            self.export_conflicts_register()
         elif path == "/complaints":
             self.page_complaints()
+        elif path == "/complaints/export":
+            self.export_complaints_register()
         elif path == "/documents":
             self.page_documents()
         elif path in {"/person-documents/upload", "/supplier-contracts/upload"}:
@@ -3953,8 +3996,12 @@ class App(BaseHTTPRequestHandler):
                 self.post_investor_update(int(path.split("/")[2]), form)
             elif path == "/conflicts/create":
                 self.post_conflict_create(form)
+            elif path == "/conflicts/update":
+                self.post_conflict_update(form)
             elif path == "/complaints/create":
                 self.post_complaint_create(form)
+            elif path == "/complaints/update":
+                self.post_complaint_update(form)
             elif path == "/communications/generate":
                 self.post_communication_generate(form)
             elif path == "/communications/output-status":
@@ -9934,66 +9981,128 @@ Si prega di confermare la propria presenza.
         pid = ctx["platform_id"]
         params = parse_qs(urlparse(self.path).query)
         mode = (params.get("mode") or [""])[0]
+        edit_id = (params.get("id") or ["0"])[0]
         conflicts = rows(
             """
             SELECT c.*, d.title AS deal_title
             FROM conflicts c
             LEFT JOIN deals d ON d.id = c.deal_id
             WHERE c.platform_id = ?
-            ORDER BY c.opened_at DESC
+            ORDER BY c.opened_at DESC, c.id DESC
             """,
             (pid,),
         )
-        deals = rows("SELECT id, title AS name FROM deals WHERE platform_id = ? ORDER BY title", (pid,))
+
+        def cv(c, key, *fallbacks):
+            v = c[key] if key in c.keys() and c[key] else ""
+            for fb in fallbacks:
+                if v:
+                    break
+                v = c[fb] if fb in c.keys() and c[fb] else ""
+            return v
+
         open_count = sum(1 for c in conflicts if c["status"] in {"Aperto", "In analisi"})
         mitigated_count = sum(1 for c in conflicts if c["status"] in {"Mitigato", "Chiuso"})
-        conflict_rows = "".join(
-            f"""<tr>
-              <td>{esc(nice_date(c['opened_at']))}</td>
-              <td><strong>{esc(c['subject'])}</strong><br><span class="muted">{esc(c['description'])}</span></td>
-              <td>{esc(c['related_party'])}</td>
-              <td>{esc(c['deal_title'] or '-')}</td>
-              <td>{esc(c['mitigation'] or '-')}</td>
-              <td><span class="badge {badge_class(c['status'])}">{esc(c['status'])}</span></td>
-            </tr>"""
-            for c in conflicts
+        resp_name, resp_func = org_responsabile(
+            pid, ["conflitt", "funzioni di controllo", "controllo di 2", "controlli"],
+            fallback="Consigliere Incaricato (da assegnare)",
         )
+        can_edit = user_can(ctx["user"], "manage_registers")
+        rows_html = ""
+        for i, c in enumerate(conflicts, start=1):
+            esito = cv(c, "esito", "status")
+            edit_link = f'<a class="button tiny" href="{rel_url("/conflicts", ctx, {"mode": "edit", "id": c["id"]})}">Modifica</a>' if can_edit else ""
+            rows_html += f"""<tr>
+              <td>{esc(cv(c, 'reg_no') or i)}</td>
+              <td class="muted">{esc(nice_date(c['opened_at']))}</td>
+              <td>{esc(cv(c, 'soggetti', 'subject'))}{('<br><span class="muted">' + esc(c['related_party']) + '</span>') if c['related_party'] else ''}</td>
+              <td>{esc(cv(c, 'natura_fonte', 'description'))}</td>
+              <td>{esc(cv(c, 'rilevato_da'))}</td>
+              <td>{esc(cv(c, 'valutazione'))}</td>
+              <td>{esc(cv(c, 'misura', 'mitigation'))}</td>
+              <td><span class="badge {badge_class(esito)}">{esc(esito or '-')}</span></td>
+              <td>{esc(cv(c, 'atti_collegati') or (c['deal_title'] or '-'))}</td>
+              <td>{edit_link}</td>
+            </tr>"""
+        if not rows_html:
+            rows_html = '<tr><td colspan="10" class="muted">Registro vuoto.</td></tr>'
+
         action_button = ""
-        create_modal = ""
-        if user_can(ctx["user"], "manage_registers"):
-            action_button = f'<a class="button primary" href="{rel_url("/conflicts", ctx, {"mode": "new"})}">+ Nuovo conflitto</a>'
-            if mode == "new":
-                create_modal = f"""
+        modal = ""
+        if can_edit:
+            action_button = (
+                f'<a class="button tiny" href="{rel_url("/conflicts/export", ctx)}">Esporta registro</a> '
+                f'<a class="button primary" href="{rel_url("/conflicts", ctx, {"mode": "new"})}">+ Nuova voce</a>'
+            )
+            editing = None
+            if mode == "edit" and edit_id.isdigit():
+                editing = row("SELECT * FROM conflicts WHERE id = ? AND platform_id = ?", (int(edit_id), pid))
+            if mode == "new" or editing:
+                e = editing
+                stored_val = (cv(e, "valutazione") if e else "")
+                def sel(name, options, current, label, hint):
+                    altro_token = "altro" if "altro" in options else ("Altro" if "Altro" in options else None)
+                    is_custom = bool(current) and current not in options and altro_token
+                    selected = altro_token if is_custom else current
+                    opts = option_values(options, selected)
+                    extra = ""
+                    if altro_token:
+                        show = "block" if is_custom else "none"
+                        val = esc(current) if is_custom else ""
+                        extra = (f'<input name="{name}_altro" class="altro-input" placeholder="Specifica..." '
+                                 f'value="{val}" style="display:{show};margin-top:5px">')
+                    return (f'<label>{label}<small class="muted">{esc(hint)}</small>'
+                            f'<select name="{name}" class="guided-select">{opts}</select>{extra}</label>')
+                action = "/conflicts/update" if editing else "/conflicts/create"
+                hid = f'<input type="hidden" name="id" value="{editing["id"]}">' if editing else ""
+                fond_cur = "non fondato" if "non fondato" in stored_val else "fondato"
+                gest_cur = "non gestibile" if "non gestibile" in stored_val else "gestibile"
+                modal = f"""
 <div class="modal-backdrop">
-  <section class="person-modal entity-modal">
-    <div class="section-head">
-      <h2>Nuovo conflitto</h2>
-      <a class="modal-close" href="{rel_url('/conflicts', ctx)}">x</a>
-    </div>
-    <form class="form-grid" method="post" action="/conflicts/create">
-      {hidden_ctx(ctx)}
-      <label>Oggetto<input name="subject" required></label>
-      <label>Parte correlata<input name="related_party"></label>
-      <label>Deal<select name="deal_id"><option value="">-</option>{option_rows(deals, '')}</select></label>
-      <label>Stato<select name="status"><option>Aperto</option><option>In analisi</option><option>Mitigato</option><option>Chiuso</option></select></label>
-      <label class="full-span">Descrizione<textarea name="description" rows="3"></textarea></label>
-      <label class="full-span">Presidio / mitigazione<textarea name="mitigation" rows="3"></textarea></label>
-      <div class="form-actions left"><button class="button primary" type="submit">Registra conflitto</button><a class="button ghost" href="{rel_url('/conflicts', ctx)}">Annulla</a></div>
+  <section class="person-modal entity-modal wide">
+    <div class="section-head"><h2>{'Modifica voce' if editing else 'Nuova voce'} - Registro conflitti</h2><a class="modal-close" href="{rel_url('/conflicts', ctx)}">x</a></div>
+    <p class="muted" style="margin:0 0 10px">Compila i campi guidati: scegli dalle tendine i valori previsti dal modello (Allegato 14). Aggiungi un nominativo e, se serve, una nota libera.</p>
+    <form class="form-grid" method="post" action="{action}">
+      {hidden_ctx(ctx)}{hid}
+      <label>N. / protocollo<small class="muted">lascia vuoto per numerazione automatica</small><input name="reg_no" value="{esc(cv(e,'reg_no')) if e else ''}" placeholder="es. 2026/001"></label>
+      <label>Data<small class="muted">data di rilevazione</small><input name="opened_at" type="date" value="{(e['opened_at'][:10] if e and e['opened_at'] else today_iso())}"></label>
+      {sel("tipo_soggetto", CONFLICT_TIPO_SOGGETTO, "", "Tipo di soggetto", "chi e' coinvolto")}
+      <label>Nominativo / soggetto<small class="muted">nome o ragione sociale</small><input name="nominativo" value="{esc(cv(e,'soggetti','subject')) if e else ''}" placeholder="es. Mario Rossi / Quinte Parallele S.r.l." required></label>
+      {sel("natura_fonte", CONFLICT_NATURA, cv(e,"natura_fonte") if e else "", "Natura e fonte del conflitto", "tipo di rapporto")}
+      {sel("rilevato_da", CONFLICT_FONTE, cv(e,"rilevato_da") if e else "", "Rilevato / segnalato da", "come e' emerso")}
+      {sel("fondatezza", CONFLICT_FONDATEZZA, fond_cur, "Valutazione: fondatezza", "il conflitto sussiste?")}
+      {sel("gestibilita", CONFLICT_GESTIBILITA, gest_cur, "Valutazione: gestibilita'", "e' gestibile?")}
+      {sel("misura", CONFLICT_MISURA, cv(e,"misura","mitigation") if e else "", "Misura adottata", "presidio applicato")}
+      {sel("esito", CONFLICT_ESITO, cv(e,"esito") if e else "in lavorazione", "Esito", "stato del caso")}
+      {sel("atti_collegati", CONFLICT_ATTI, cv(e,"atti_collegati") if e else "", "Atti collegati", "documento di riferimento")}
+      <label class="full-span">Note (facoltative)<small class="muted">dettagli aggiuntivi liberi</small><textarea name="note" rows="2"></textarea></label>
+      <div class="form-actions left"><button class="button primary" type="submit">{'Salva modifiche' if editing else 'Registra voce'}</button><a class="button ghost" href="{rel_url('/conflicts', ctx)}">Annulla</a></div>
     </form>
   </section>
 </div>"""
         body = f"""
+<section class="panel">
+  <div class="section-head"><h2>Registro dei conflitti di interesse</h2><div class="header-badges">{action_button}</div></div>
+  <p class="muted">Responsabile della tenuta: <strong>{esc(resp_name)}</strong>{(' &middot; ' + esc(resp_func)) if resp_func else ' <span class="badge warning">assegna la funzione in Compagine</span>'} <span class="muted">(dall'organigramma)</span>. Base: Allegato 14 - Reg. del. (UE) 2022/2111 - art. 8 ECSP. Aggiornamento continuativo; presa visione del CdA semestrale; relazione scritta annuale.</p>
+</section>
 <section class="metric-grid">
-  <div class="metric"><span>Conflitti censiti</span><strong>{len(conflicts)}</strong></div>
-  <div class="metric"><span>Aperti / analisi</span><strong>{open_count}</strong></div>
-  <div class="metric"><span>Mitigati / chiusi</span><strong>{mitigated_count}</strong></div>
-  <div class="metric"><span>Deal collegati</span><strong>{sum(1 for c in conflicts if c['deal_id'])}</strong></div>
+  <div class="metric"><span>Voci a registro</span><strong>{len(conflicts)}</strong></div>
+  <div class="metric"><span>Aperti / in analisi</span><strong>{open_count}</strong></div>
+  <div class="metric"><span>Gestiti / chiusi</span><strong>{mitigated_count}</strong></div>
+  <div class="metric"><span>Collegati a deal</span><strong>{sum(1 for c in conflicts if c['deal_id'])}</strong></div>
 </section>
 <section class="panel">
-  <div class="section-head"><h2>Registro conflitti d'interesse</h2>{action_button}</div>
-  <table class="data-table roomy"><thead><tr><th>Apertura</th><th>Oggetto</th><th>Parte correlata</th><th>Deal</th><th>Mitigazione</th><th>Stato</th></tr></thead><tbody>{conflict_rows}</tbody></table>
+  <table class="data-table compact">
+    <thead><tr><th>N.</th><th>Data</th><th>Soggetti coinvolti</th><th>Natura e fonte</th><th>Rilevato/segnalato da</th><th>Valutazione</th><th>Misura adottata</th><th>Esito</th><th>Atti collegati</th><th></th></tr></thead>
+    <tbody>{rows_html}</tbody>
+  </table>
 </section>
-{create_modal}
+<section class="panel info-panel">
+  <div class="section-head"><h2>Cosa si fa in questa pagina</h2></div>
+  <p>Qui si tiene il <strong>registro dei conflitti di interesse</strong> della piattaforma. Ogni volta che emerge un possibile conflitto - da una segnalazione, dalla dichiarazione annuale degli interessi o durante la selezione di un progetto - lo si <strong>annota come nuova voce</strong> indicando soggetti, natura, valutazione e la misura adottata (es. astensione in CdA, disclaimer, non ammissione).</p>
+  <p>Il responsabile aggiorna il registro in via continuativa; il CdA ne prende visione ogni semestre e riceve una relazione annuale. Con <strong>"Esporta registro"</strong> si ottiene il documento ufficiale (o il CSV) conforme all'Allegato 14.</p>
+</section>
+{modal}
 """
         self.render("Conflitti", body, "conflicts")
 
@@ -10013,65 +10122,202 @@ Si prega di confermare la propria presenza.
             (pid,),
         )
         users = rows("SELECT id, name FROM users WHERE active = 1 ORDER BY name")
+        edit_id = (params.get("id") or ["0"])[0]
+        can_edit = user_can(ctx["user"], "manage_registers")
+
+        def cv(c, key, *fallbacks):
+            v = c[key] if key in c.keys() and c[key] else ""
+            for fb in fallbacks:
+                if v:
+                    break
+                v = c[fb] if fb in c.keys() and c[fb] else ""
+            return v
+
         open_count = sum(1 for c in complaints if c["status"] != "Chiuso")
         closed_count = sum(1 for c in complaints if c["status"] == "Chiuso")
         overdue_count = 0
         for c in complaints:
             if c["status"] != "Chiuso" and (date.today() - date.fromisoformat(c["received_at"][:10])).days > 30:
                 overdue_count += 1
-        complaint_rows = "".join(
-            f"""<tr>
-              <td>{esc(nice_date(c['received_at']))}</td>
+        resp_name, resp_func = org_responsabile(pid, ["reclam"], fallback="Responsabile Reclami (da assegnare)")
+        rows_html = ""
+        for i, c in enumerate(complaints, start=1):
+            rows_html += f"""<tr>
+              <td>{esc(cv(c, 'protocollo') or i)}</td>
+              <td class="muted">{esc(nice_date(c['received_at']))}</td>
               <td>{esc(c['complainant'])}</td>
-              <td>{esc(c['channel'])}</td>
-              <td><strong>{esc(c['object'])}</strong><br><span class="muted">{esc(c['outcome'] or '-')}</span></td>
-              <td>{esc(c['owner_name'] or '-')}</td>
+              <td>{esc(cv(c, 'classificazione') or 'Reclamo')}</td>
+              <td>{esc(cv(c, 'motivi_danno', 'object'))}</td>
+              <td class="muted">{esc(nice_date(c['ricevibilita_date']) if cv(c,'ricevibilita_date') else '-')}</td>
+              <td class="muted">{esc(nice_date(c['riscontro_date']) if cv(c,'riscontro_date') else '-')}</td>
+              <td>{esc(cv(c, 'misure', 'outcome'))}</td>
+              <td>{esc(cv(c, 'esborso') or 'No')}</td>
               <td><span class="badge {badge_class(c['status'])}">{esc(c['status'])}</span></td>
+              <td>{(f'<a class="button tiny" href="' + rel_url("/complaints", ctx, {"mode": "edit", "id": c["id"]}) + '">Modifica</a>') if can_edit else ''}</td>
             </tr>"""
-            for c in complaints
-        )
+        if not rows_html:
+            rows_html = '<tr><td colspan="11" class="muted">Registro vuoto.</td></tr>'
+
         action_button = ""
-        create_modal = ""
-        if user_can(ctx["user"], "manage_registers"):
-            action_button = f'<a class="button primary" href="{rel_url("/complaints", ctx, {"mode": "new"})}">+ Nuovo reclamo</a>'
-            if mode == "new":
-                create_modal = f"""
+        modal = ""
+        if can_edit:
+            action_button = (
+                f'<a class="button tiny" href="{rel_url("/complaints/export", ctx)}">Esporta registro</a> '
+                f'<a class="button primary" href="{rel_url("/complaints", ctx, {"mode": "new"})}">+ Nuova voce</a>'
+            )
+            editing = None
+            if mode == "edit" and edit_id.isdigit():
+                editing = row("SELECT * FROM complaints WHERE id = ? AND platform_id = ?", (int(edit_id), pid))
+            if mode == "new" or editing:
+                e = editing
+                def fv(k, *fb):
+                    return esc(cv(e, k, *fb)) if e else ""
+                action = "/complaints/update" if editing else "/complaints/create"
+                hid = f'<input type="hidden" name="id" value="{editing["id"]}">' if editing else ""
+                cls_opts = option_values(["Reclamo", "Richiesta di informazioni"], cv(e, "classificazione") if e else "Reclamo")
+                stato_opts = option_values(["pendente", "chiuso", "accolto", "respinto"], (e["status"] if e else "pendente"))
+                esb_opts = option_values(["No", "Si - autorizz. organo"], cv(e, "esborso") if e else "No")
+                modal = f"""
 <div class="modal-backdrop">
   <section class="person-modal entity-modal">
-    <div class="section-head">
-      <h2>Nuovo reclamo</h2>
-      <a class="modal-close" href="{rel_url('/complaints', ctx)}">x</a>
-    </div>
-    <form class="form-grid" method="post" action="/complaints/create">
-      {hidden_ctx(ctx)}
-      <label>Data ricezione<input name="received_at" type="date" value="{today_iso()}" required></label>
-      <label>Soggetto<input name="complainant" required></label>
-      <label>Canale<select name="channel"><option>Email</option><option>Portale</option><option>PEC</option><option>Telefono</option><option>Altro</option></select></label>
-      <label>Owner<select name="owner_user_id">{option_rows(users, ctx['user_id'])}</select></label>
-      <label>Stato<select name="status"><option>Aperto</option><option>In istruttoria</option><option>In attesa cliente</option><option>Chiuso</option></select></label>
-      <label class="full-span">Oggetto<textarea name="object" rows="3" required></textarea></label>
-      <label class="full-span">Esito / prossima azione<textarea name="outcome" rows="3"></textarea></label>
-      <div class="form-actions left"><button class="button primary" type="submit">Registra reclamo</button><a class="button ghost" href="{rel_url('/complaints', ctx)}">Annulla</a></div>
+    <div class="section-head"><h2>{'Modifica voce' if editing else 'Nuova voce'} - Registro reclami</h2><a class="modal-close" href="{rel_url('/complaints', ctx)}">x</a></div>
+    <form class="form-grid" method="post" action="{action}">
+      {hidden_ctx(ctx)}{hid}
+      <label>N. / Prot.<input name="protocollo" value="{fv('protocollo')}"></label>
+      <label>Data ricezione<input name="received_at" type="date" value="{(e['received_at'][:10] if e and e['received_at'] else today_iso())}" required></label>
+      <label>Reclamante<input name="complainant" value="{fv('complainant')}" required></label>
+      <label>Classificazione<select name="classificazione">{cls_opts}</select></label>
+      <label class="full-span">Oggetto, motivi e danno lamentato<textarea name="motivi_danno" rows="2" required>{fv('motivi_danno','object')}</textarea></label>
+      <label>Comunic. ricevibilita (&le;10 gg lav.)<input name="ricevibilita_date" type="date" value="{(e['ricevibilita_date'][:10] if e and cv(e,'ricevibilita_date') else '')}"></label>
+      <label>Data riscontro (&le;30 gg)<input name="riscontro_date" type="date" value="{(e['riscontro_date'][:10] if e and cv(e,'riscontro_date') else '')}"></label>
+      <label class="full-span">Misure adottate per il riscontro<textarea name="misure" rows="2">{fv('misure','outcome')}</textarea></label>
+      <label>Esborso<select name="esborso">{esb_opts}</select></label>
+      <label>Stato<select name="status">{stato_opts}</select></label>
+      <label>Canale<select name="channel">{option_values(['Email','Portale','PEC','Telefono','Altro'], (e['channel'] if e else 'Email'))}</select></label>
+      <label>Responsabile<select name="owner_user_id">{option_rows(users, (e['owner_user_id'] if e else ctx['user_id']))}</select></label>
+      <div class="form-actions left"><button class="button primary" type="submit">{'Salva modifiche' if editing else 'Registra voce'}</button><a class="button ghost" href="{rel_url('/complaints', ctx)}">Annulla</a></div>
     </form>
   </section>
 </div>"""
         body = f"""
+<section class="panel">
+  <div class="section-head"><h2>Registro dei reclami</h2><div class="header-badges">{action_button}</div></div>
+  <p class="muted">Responsabile: <strong>{esc(resp_name)}</strong>{(' &middot; ' + esc(resp_func)) if resp_func else ' <span class="badge warning">assegna la funzione Reclami in Compagine</span>'} <span class="muted">(dall'organigramma)</span>. Base: Allegato 16 - art. 7 §3 ECSP - Reg. del. (UE) 2022/2117. Canale: help@pariterequity.com. Tempistiche: ricevibilita &le;10 gg lavorativi; riscontro scritto &le;30 gg solari; chiusura dopo 180 gg senza contestazioni.</p>
+</section>
 <section class="metric-grid">
-  <div class="metric"><span>Reclami totali</span><strong>{len(complaints)}</strong></div>
-  <div class="metric"><span>Aperti</span><strong>{open_count}</strong></div>
+  <div class="metric"><span>Voci a registro</span><strong>{len(complaints)}</strong></div>
+  <div class="metric"><span>Aperti / pendenti</span><strong>{open_count}</strong></div>
   <div class="metric"><span>Chiusi</span><strong>{closed_count}</strong></div>
   <div class="metric"><span>Oltre 30 giorni</span><strong>{overdue_count}</strong></div>
 </section>
 <section class="panel">
-  <div class="section-head">
-    <h2>Registro reclami</h2>
-    <div class="header-badges"><span class="source-chip">Base reportistica CONSOB</span>{action_button}</div>
-  </div>
-  <table class="data-table roomy"><thead><tr><th>Data</th><th>Soggetto</th><th>Canale</th><th>Oggetto ed esito</th><th>Owner</th><th>Stato</th></tr></thead><tbody>{complaint_rows}</tbody></table>
+  <table class="data-table compact">
+    <thead><tr><th>N./Prot.</th><th>Ricezione</th><th>Reclamante</th><th>Classif.</th><th>Oggetto, motivi e danno</th><th>Ricevib. &le;10gg</th><th>Riscontro &le;30gg</th><th>Misure</th><th>Esborso</th><th>Stato</th><th></th></tr></thead>
+    <tbody>{rows_html}</tbody>
+  </table>
 </section>
-{create_modal}
+<section class="panel info-panel">
+  <div class="section-head"><h2>Cosa si fa in questa pagina</h2></div>
+  <p>Qui si tiene il <strong>registro dei reclami</strong>. Quando arriva un reclamo (in forma scritta, anche via help@pariterequity.com) si <strong>annota una nuova voce</strong> entro il giorno successivo: reclamante, oggetto/motivi/danno, classificazione e stato.</p>
+  <p>Le scadenze da rispettare: comunicare la <strong>ricevibilita' entro 10 giorni lavorativi</strong> e dare <strong>riscontro scritto entro 30 giorni</strong>. Se la chiusura comporta un esborso, va autorizzata dall'organo competente. Con <strong>"Esporta registro"</strong> si genera il documento ufficiale (o CSV) conforme all'Allegato 16.</p>
+</section>
+{modal}
 """
         self.render("Reclami", body, "complaints")
+
+    def _send_register_html(self, title, subtitle, intestazione, headers, data_rows, note):
+        head = "".join(f"<th>{esc(h)}</th>" for h in headers)
+        body = "".join("<tr>" + "".join(f"<td>{esc(v)}</td>" for v in r) + "</tr>" for r in data_rows) \
+            or f'<tr><td colspan="{len(headers)}">Registro vuoto.</td></tr>'
+        note_html = "".join(f"<p class='muted'>{esc(n)}</p>" for n in note)
+        doc = f"""<!doctype html><html lang="it"><head><meta charset="utf-8"><title>{esc(title)}</title>
+<style>body{{font-family:Georgia,serif;color:#1f1b17;margin:24px;}}h1{{font-size:19px;margin:0 0 2px}}
+.sub{{font-family:Consolas,monospace;font-size:11px;color:#5f5a55;margin:0 0 4px}}
+table{{width:100%;border-collapse:collapse;font-size:11px;margin:10px 0}}th,td{{border:1px solid #c9c2b6;padding:5px 6px;text-align:left;vertical-align:top}}
+th{{background:#efeae0}}.muted{{color:#6f6a64;font-size:11px}}</style></head><body>
+<h1>{esc(title)}</h1><p class="sub">{esc(subtitle)}</p>
+<p>{esc(intestazione)}</p>
+<table><thead><tr>{head}</tr></thead><tbody>{body}</tbody></table>
+{note_html}
+<p class="muted">Documento generato dalla compliance suite il {esc(now_iso())} - conforme al modello M10 (Allegati 14 e 16).</p>
+</body></html>"""
+        self.send_html(doc)
+
+    def _send_csv(self, filename, headers, data_rows):
+        out = io.StringIO()
+        import csv as _csv
+        w = _csv.writer(out, delimiter=";")
+        w.writerow(headers)
+        for r in data_rows:
+            w.writerow(r)
+        data = out.getvalue().encode("utf-8-sig")
+        self.send_response(200)
+        self.send_header("Content-Type", "text/csv; charset=utf-8")
+        self.send_header("Content-Disposition", f'attachment; filename="{filename}"')
+        self.send_header("Content-Length", str(len(data)))
+        self.end_headers()
+        self.wfile.write(data)
+
+    def export_conflicts_register(self):
+        ctx = self.get_ctx()
+        fmt = self.get_query_param("format")
+        conflicts = rows("SELECT * FROM conflicts WHERE platform_id = ? ORDER BY opened_at, id", (ctx["platform_id"],))
+        headers = ["N.", "Data", "Soggetti coinvolti", "Natura e fonte del conflitto", "Rilevato / segnalato da",
+                   "Valutazione del Consigliere Incaricato", "Misura adottata", "Esito", "Atti collegati"]
+        def val(c, k, *fb):
+            v = c[k] if k in c.keys() and c[k] else ""
+            for f in fb:
+                v = v or (c[f] if f in c.keys() and c[f] else "")
+            return v
+        data_rows = [[
+            val(c, "reg_no") or i, nice_date(c["opened_at"]), val(c, "soggetti", "subject"), val(c, "natura_fonte", "description"),
+            val(c, "rilevato_da"), val(c, "valutazione"), val(c, "misura", "mitigation"), val(c, "esito", "status"), val(c, "atti_collegati"),
+        ] for i, c in enumerate(conflicts, start=1)]
+        if fmt == "csv":
+            self._send_csv("Registro_conflitti_interesse.csv", headers, data_rows)
+            return
+        self._send_register_html(
+            "Registro dei conflitti di interesse", "Pariter Equity S.r.l. - modello M10 conforme all'Allegato 14",
+            "Responsabile della tenuta: Consigliere Incaricato delle funzioni di controllo (Stefania Monotoni). "
+            "Base: Allegato 14 - Reg. del. (UE) 2022/2111 - art. 8 ECSP.",
+            headers, data_rows,
+            ["Tipi di misura (Allegato 14): astensione del Soggetto Rilevante in conflitto; delibera di insussistenza di "
+             "circostanze anomale; informativa ai clienti con disclaimer; in ultima istanza non ammissione dell'iniziativa.",
+             "La Mappatura delle fattispecie e' documento distinto dal Registro, aggiornato almeno annualmente e validato dal CdA."],
+        )
+
+    def export_complaints_register(self):
+        ctx = self.get_ctx()
+        fmt = self.get_query_param("format")
+        complaints = rows("SELECT * FROM complaints WHERE platform_id = ? ORDER BY received_at, id", (ctx["platform_id"],))
+        headers = ["N. / Prot.", "Data ricezione", "Reclamante", "Classificazione", "Oggetto, motivi e danno lamentato",
+                   "Comunic. ricevibilita (<=10 gg lav.)", "Data riscontro (<=30 gg)", "Misure adottate per il riscontro",
+                   "Esborso", "Stato"]
+        def val(c, k, *fb):
+            v = c[k] if k in c.keys() and c[k] else ""
+            for f in fb:
+                v = v or (c[f] if f in c.keys() and c[f] else "")
+            return v
+        data_rows = [[
+            val(c, "protocollo") or i, nice_date(c["received_at"]), c["complainant"], val(c, "classificazione") or "Reclamo",
+            val(c, "motivi_danno", "object"),
+            nice_date(c["ricevibilita_date"]) if val(c, "ricevibilita_date") else "",
+            nice_date(c["riscontro_date"]) if val(c, "riscontro_date") else "",
+            val(c, "misure", "outcome"), val(c, "esborso") or "No", c["status"],
+        ] for i, c in enumerate(complaints, start=1)]
+        if fmt == "csv":
+            self._send_csv("Registro_reclami.csv", headers, data_rows)
+            return
+        self._send_register_html(
+            "Registro dei reclami", "Pariter Equity S.r.l. - modello M10 conforme all'Allegato 16",
+            "Responsabile: Responsabile Reclami (Fabio Malerba). Base: Allegato 16 - art. 7 §3 ECSP - Reg. del. (UE) 2022/2117. "
+            "Tenuto in forma elettronica; annotazione entro il giorno successivo alla ricezione.",
+            headers, data_rows,
+            ["Tempistiche (Allegato 16): ricevibilita entro 10 giorni lavorativi; riscontro scritto entro 30 giorni solari; "
+             "il reclamo si considera chiuso decorsi 180 giorni dalla risposta senza contestazioni.",
+             "Campi obbligatori art. 7 §3 ECSP: data di ricezione; estremi essenziali (motivi e danno); data di evasione; "
+             "misure adottate; stato (pendente/chiuso/accolto/respinto)."],
+        )
 
     def page_proponents(self):
         ctx = self.get_ctx()
@@ -12697,59 +12943,130 @@ Si prega di confermare la propria presenza.
             conn.commit()
         self.redirect(f"/investors/{investor_id}", ctx, "Investitore aggiornato.")
 
+    def _conflict_fields(self, form):
+        def g(name):
+            v = form.get(name, "")
+            if v.strip().lower() == "altro":
+                return form.get(name + "_altro", "").strip() or v
+            return v
+        nominativo = form.get("nominativo", "").strip()
+        tipo = g("tipo_soggetto").strip()
+        soggetti = f"{nominativo} ({tipo})" if (nominativo and tipo) else (nominativo or tipo)
+        note = form.get("note", "").strip()
+        valutazione = f"{form.get('fondatezza', 'fondato')}; {form.get('gestibilita', 'gestibile')}"
+        if note:
+            valutazione += f" - {note}"
+        esito = form.get("esito", "in lavorazione")
+        status = "Chiuso" if esito in {"gestito", "non ammesso"} else ("In analisi" if esito == "in monitoraggio" else "Aperto")
+        return {
+            "reg_no": form.get("reg_no", ""),
+            "opened_at": form.get("opened_at") or today_iso(),
+            "soggetti": soggetti,
+            "natura_fonte": g("natura_fonte"),
+            "rilevato_da": g("rilevato_da"),
+            "valutazione": valutazione,
+            "misura": g("misura"),
+            "esito": esito,
+            "atti_collegati": g("atti_collegati"),
+            "status": status,
+        }
+
     def post_conflict_create(self, form):
         ctx = self.ctx_from_form(form)
         if not user_can(ctx["user"], "manage_registers"):
             self.redirect("/conflicts", ctx, "Ruolo non abilitato.")
             return
-        deal_id = int(form["deal_id"]) if form.get("deal_id") else None
+        f = self._conflict_fields(form)
         with connect() as conn:
             cur = conn.execute(
-                """
-                INSERT INTO conflicts(platform_id, subject, related_party, deal_id, description, mitigation, status, opened_at, closed_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """,
-                (
-                    ctx["platform_id"],
-                    form["subject"].strip(),
-                    form.get("related_party", ""),
-                    deal_id,
-                    form.get("description", ""),
-                    form.get("mitigation", ""),
-                    form.get("status", "Aperto"),
-                    today_iso(),
-                    today_iso() if form.get("status") == "Chiuso" else "",
-                ),
+                """INSERT INTO conflicts(platform_id, subject, related_party, deal_id, description, mitigation, status, opened_at, closed_at,
+                       reg_no, soggetti, natura_fonte, rilevato_da, valutazione, misura, esito, atti_collegati)
+                   VALUES (?, ?, '', NULL, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (ctx["platform_id"], f["soggetti"], f["natura_fonte"], f["misura"], f["status"],
+                 f["opened_at"], today_iso() if f["status"] == "Chiuso" else "",
+                 f["reg_no"], f["soggetti"], f["natura_fonte"], f["rilevato_da"],
+                 f["valutazione"], f["misura"], f["esito"], f["atti_collegati"]),
             )
-            log_audit(conn, ctx["platform_id"], ctx["user_id"], "conflict", cur.lastrowid, "Registrazione conflitto", form["subject"].strip())
+            log_audit(conn, ctx["platform_id"], ctx["user_id"], "conflict", cur.lastrowid, "Registro conflitti", f["soggetti"])
             conn.commit()
-        self.redirect("/conflicts", ctx, "Conflitto registrato.")
+        self.redirect("/conflicts", ctx, "Voce registrata nel registro conflitti.")
+
+    def post_conflict_update(self, form):
+        ctx = self.ctx_from_form(form)
+        if not user_can(ctx["user"], "manage_registers"):
+            self.redirect("/conflicts", ctx, "Ruolo non abilitato.")
+            return
+        cid = int(form["id"])
+        f = self._conflict_fields(form)
+        with connect() as conn:
+            conn.execute(
+                """UPDATE conflicts SET reg_no=?, opened_at=?, soggetti=?, subject=?, natura_fonte=?, description=?,
+                       rilevato_da=?, valutazione=?, misura=?, mitigation=?, esito=?, status=?, atti_collegati=?
+                   WHERE id=? AND platform_id=?""",
+                (f["reg_no"], f["opened_at"], f["soggetti"], f["soggetti"], f["natura_fonte"], f["natura_fonte"],
+                 f["rilevato_da"], f["valutazione"], f["misura"], f["misura"], f["esito"], f["status"], f["atti_collegati"],
+                 cid, ctx["platform_id"]),
+            )
+            log_audit(conn, ctx["platform_id"], ctx["user_id"], "conflict", cid, "Registro conflitti", "modifica")
+            conn.commit()
+        self.redirect("/conflicts", ctx, "Voce aggiornata.")
+
+    def _complaint_fields(self, form):
+        return {
+            "protocollo": form.get("protocollo", ""),
+            "received_at": form.get("received_at") or today_iso(),
+            "complainant": form.get("complainant", "").strip(),
+            "classificazione": form.get("classificazione", "Reclamo"),
+            "object": form.get("motivi_danno", "").strip(),
+            "motivi_danno": form.get("motivi_danno", "").strip(),
+            "ricevibilita_date": form.get("ricevibilita_date", ""),
+            "riscontro_date": form.get("riscontro_date", ""),
+            "misure": form.get("misure", ""),
+            "outcome": form.get("misure", ""),
+            "esborso": form.get("esborso", "No"),
+            "status": form.get("status", "pendente"),
+            "channel": form.get("channel", "Email"),
+            "owner_user_id": int(form.get("owner_user_id") or self.ctx_from_form(form)["user_id"]),
+        }
 
     def post_complaint_create(self, form):
         ctx = self.ctx_from_form(form)
         if not user_can(ctx["user"], "manage_registers"):
             self.redirect("/complaints", ctx, "Ruolo non abilitato.")
             return
+        f = self._complaint_fields(form)
         with connect() as conn:
             cur = conn.execute(
-                """
-                INSERT INTO complaints(platform_id, received_at, complainant, channel, object, status, outcome, owner_user_id)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-                """,
-                (
-                    ctx["platform_id"],
-                    form.get("received_at") or today_iso(),
-                    form["complainant"].strip(),
-                    form.get("channel", "Email"),
-                    form["object"].strip(),
-                    form.get("status", "Aperto"),
-                    form.get("outcome", ""),
-                    int(form.get("owner_user_id") or ctx["user_id"]),
-                ),
+                """INSERT INTO complaints(platform_id, received_at, complainant, channel, object, status, outcome, owner_user_id,
+                       protocollo, classificazione, motivi_danno, ricevibilita_date, riscontro_date, misure, esborso)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (ctx["platform_id"], f["received_at"], f["complainant"], f["channel"], f["object"], f["status"], f["outcome"],
+                 f["owner_user_id"], f["protocollo"], f["classificazione"], f["motivi_danno"], f["ricevibilita_date"],
+                 f["riscontro_date"], f["misure"], f["esborso"]),
             )
-            log_audit(conn, ctx["platform_id"], ctx["user_id"], "complaint", cur.lastrowid, "Registrazione reclamo", form["complainant"].strip())
+            log_audit(conn, ctx["platform_id"], ctx["user_id"], "complaint", cur.lastrowid, "Registro reclami", f["complainant"])
             conn.commit()
-        self.redirect("/complaints", ctx, "Reclamo registrato.")
+        self.redirect("/complaints", ctx, "Voce registrata nel registro reclami.")
+
+    def post_complaint_update(self, form):
+        ctx = self.ctx_from_form(form)
+        if not user_can(ctx["user"], "manage_registers"):
+            self.redirect("/complaints", ctx, "Ruolo non abilitato.")
+            return
+        f = self._complaint_fields(form)
+        cid = int(form["id"])
+        with connect() as conn:
+            conn.execute(
+                """UPDATE complaints SET received_at=?, complainant=?, channel=?, object=?, status=?, outcome=?, owner_user_id=?,
+                       protocollo=?, classificazione=?, motivi_danno=?, ricevibilita_date=?, riscontro_date=?, misure=?, esborso=?
+                   WHERE id=? AND platform_id=?""",
+                (f["received_at"], f["complainant"], f["channel"], f["object"], f["status"], f["outcome"], f["owner_user_id"],
+                 f["protocollo"], f["classificazione"], f["motivi_danno"], f["ricevibilita_date"], f["riscontro_date"],
+                 f["misure"], f["esborso"], cid, ctx["platform_id"]),
+            )
+            log_audit(conn, ctx["platform_id"], ctx["user_id"], "complaint", cid, "Registro reclami", "modifica")
+            conn.commit()
+        self.redirect("/complaints", ctx, "Voce aggiornata.")
 
     def post_person_document_upload(self, form, files):
         ctx = self.ctx_from_form(form)

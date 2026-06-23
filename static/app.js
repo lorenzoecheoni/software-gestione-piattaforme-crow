@@ -162,3 +162,14 @@ document.querySelectorAll("[data-field-state]").forEach((control) => {
   });
   modal.addEventListener("click", function (e) { if (e.target === modal) closeDoc(); });
 })();
+
+// Registri: campo "altro" rivelato quando si seleziona l'opzione "altro" in una tendina guidata.
+document.querySelectorAll("select.guided-select").forEach((sel) => {
+  const toggle = () => {
+    const inp = sel.parentNode.querySelector(".altro-input");
+    if (!inp) return;
+    inp.style.display = (sel.value || "").trim().toLowerCase() === "altro" ? "block" : "none";
+  };
+  sel.addEventListener("change", toggle);
+  toggle();
+});

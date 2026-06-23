@@ -3292,6 +3292,33 @@ textarea {
   white-space: pre-wrap;
 }
 
+.entity-modal.wide {
+  max-width: 760px;
+  width: 92%;
+}
+
+.form-grid label small {
+  display: block;
+  font-weight: 400;
+  color: #8a837b;
+  font-size: 10.5px;
+  margin: 1px 0 3px;
+  letter-spacing: 0;
+  text-transform: none;
+}
+
+.info-panel {
+  background: #f6f4ef;
+  border-left: 3px solid var(--accent, #b88a3e);
+}
+
+.info-panel p {
+  font-size: 13px;
+  line-height: 1.55;
+  color: #4a443e;
+  margin: 6px 0;
+}
+
 /* --- Compagine: indice fascicolo autorizzato, impaginazione documenti, banner --- */
 .doc-filename {
   text-transform: none !important;
