@@ -448,10 +448,10 @@ EMAIL_TEMPLATES = {
 PRACTICE_DOC_SEED = [
     # Fase 1 - i 9 documenti di candidatura, esatti dal manuale onboarding (checklist M1)
     ("fase1", "Candidatura", "Presentazione del progetto imprenditoriale", 1),
-    ("fase1", "Candidatura", "Piano finanziario storico + proiezioni a 3 anni", 1),
+    ("fase1", "Candidatura", "Piano finanziario storico + proiezioni a 3 anni", 0),
     ("fase1", "Candidatura", "Visura camerale aggiornata", 1),
     ("fase1", "Candidatura", "Statuto", 1),
-    ("fase1", "Candidatura", "Ultimi due bilanci depositati", 1),
+    ("fase1", "Candidatura", "Ultimi due bilanci depositati", 0),
     ("fase1", "Candidatura", "Informazioni operazione (fabbisogno, valutazione, condizioni)", 1),
     ("fase1", "Candidatura", "Sito web", 0),
     ("fase1", "Candidatura", "Key manager ed esperienze", 1),
@@ -1564,6 +1564,17 @@ def init_db():
                 updated_at TEXT NOT NULL DEFAULT ''
             );
 
+            CREATE TABLE IF NOT EXISTS practice_onorabilita (
+                id INTEGER PRIMARY KEY,
+                practice_id INTEGER NOT NULL REFERENCES practices(id) ON DELETE CASCADE,
+                role TEXT NOT NULL,                 -- 'lr' | 'te' | 'both'
+                subject_name TEXT NOT NULL DEFAULT '',
+                autodich INTEGER NOT NULL DEFAULT 0,
+                casellario INTEGER NOT NULL DEFAULT 0,
+                notes TEXT NOT NULL DEFAULT '',
+                updated_at TEXT NOT NULL DEFAULT ''
+            );
+
             CREATE TABLE IF NOT EXISTS internal_reviews (
                 id INTEGER PRIMARY KEY,
                 practice_id INTEGER NOT NULL REFERENCES practices(id) ON DELETE CASCADE,
@@ -1780,6 +1791,13 @@ def init_db():
         ensure_column(conn, "documents", "practice_id", "INTEGER REFERENCES practices(id) ON DELETE SET NULL")
         ensure_column(conn, "documents", "doc_date", "TEXT NOT NULL DEFAULT ''")
         ensure_column(conn, "documents", "description", "TEXT NOT NULL DEFAULT ''")
+        # Completezza documentale Fase 2 (Allegato 5_1): esercizi chiusi/depositati (per la
+        # regola bilanci) e numero di bilanci presenti. esercizi_chiusi NULL = non indicato.
+        ensure_column(conn, "practices", "esercizi_chiusi", "INTEGER")
+        ensure_column(conn, "practices", "bilanci_presenti", "INTEGER NOT NULL DEFAULT 0")
+        # I documenti "se disponibili" non sono piu' obbligatori generici (regola Allegato 5_1).
+        conn.execute("UPDATE practice_documents SET required = 0 WHERE phase = 'fase1' AND label IN "
+                     "('Piano finanziario storico + proiezioni a 3 anni', 'Ultimi due bilanci depositati')")
         # Iterazione 2: CVOI collaborativo + chiusura pratica
         ensure_column(conn, "cvoi_reports", "workflow_status", "TEXT NOT NULL DEFAULT 'bozza'")
         ensure_column(conn, "cvoi_reports", "notes_qualitative", "TEXT NOT NULL DEFAULT ''")
@@ -3802,9 +3820,115 @@ def recompute_advisory_unanime(conn, advisory_id):
     return True
 
 
+DOCS_SEMPRE_DOVUTI = [
+    "Presentazione del progetto imprenditoriale",
+    "Visura camerale aggiornata",
+    "Statuto",
+    "Informazioni operazione (fabbisogno, valutazione, condizioni)",
+    "Key manager ed esperienze",
+]
+DOCS_SE_DISPONIBILI = [
+    "Ultimi due bilanci depositati",
+    "Piano finanziario storico + proiezioni a 3 anni",
+    "Sito web",
+]
+
+
+def fascicolo_completezza(conn, practice):
+    """Completezza del fascicolo del proponente in Fase 2 (Allegato 5_1, sez. 5.1.e).
+
+    - SEMPRE DOVUTI (presentazione, visura, statuto, informazioni operazione, key manager):
+      la loro assenza rende il fascicolo incompleto -> richiesta di integrazione (C3).
+    - CONDIZIONATI "se disponibili" (ultimi due bilanci, piano finanziario storico, sito web):
+      l'assenza per indisponibilita' oggettiva NON e' bloccante ("non disponibile").
+    - BILANCI: bilanci_dovuti = min(2, esercizi_chiusi); completi se presenti >= dovuti.
+      Neo costituita (0 esercizi chiusi) -> 0 dovuti -> completi anche senza bilanci.
+    - fascicolo_completo = tutti i sempre dovuti presenti AND bilanci_completi.
+    """
+    pid = practice["id"]
+    docs = {d["label"]: d for d in conn.execute(
+        "SELECT label, document_id FROM practice_documents WHERE practice_id = ? AND phase = 'fase1'", (pid,))}
+
+    def present(label):
+        d = docs.get(label)
+        return bool(d and d["document_id"])
+
+    sempre = [{"label": l, "present": present(l)} for l in DOCS_SEMPRE_DOVUTI]
+    missing_sempre = [s["label"] for s in sempre if not s["present"]]
+
+    keys = practice.keys()
+    esercizi = practice["esercizi_chiusi"] if "esercizi_chiusi" in keys else None
+    bil_pres = (practice["bilanci_presenti"] if "bilanci_presenti" in keys else 0) or 0
+    bil_dovuti = min(2, esercizi) if esercizi is not None else None
+    bilanci_completi = (bil_dovuti is not None) and (bil_pres >= bil_dovuti)
+
+    cond = [{"label": l, "present": present(l)}
+            for l in ("Piano finanziario storico + proiezioni a 3 anni", "Sito web")]
+
+    fascicolo_completo = (not missing_sempre) and bilanci_completi
+    integrazione = list(missing_sempre)
+    if bil_dovuti is not None and bil_pres < bil_dovuti:
+        integrazione.append(f"Bilanci depositati: {bil_pres} su {bil_dovuti} dovuti")
+    return {
+        "sempre": sempre, "missing_sempre": missing_sempre, "condizionati": cond,
+        "esercizi": esercizi, "esercizi_set": esercizi is not None,
+        "bilanci_dovuti": bil_dovuti, "bilanci_presenti": bil_pres,
+        "bilanci_completi": bilanci_completi,
+        "fascicolo_completo": fascicolo_completo, "integrazione": integrazione,
+    }
+
+
+ONORAB_ROLE_LABELS = {
+    "lr": "Legale rappresentante",
+    "te": "Titolare effettivo",
+    "both": "Legale rappresentante e titolare effettivo (stessa persona)",
+}
+
+
+def onorabilita_subjects(conn, practice_id):
+    return conn.execute(
+        "SELECT * FROM practice_onorabilita WHERE practice_id = ? "
+        "ORDER BY CASE role WHEN 'both' THEN 0 WHEN 'lr' THEN 1 ELSE 2 END",
+        (practice_id,),
+    ).fetchall()
+
+
+def onorabilita_status(conn, practice_id):
+    """Stato dell'onorabilita' art. 5, par. 2, lett. a.
+
+    - L'AUTODICHIARAZIONE di ciascun soggetto dovuto rende la pratica PROCEDIBILE
+      (istruttoria, scoring, parere Advisory, delibera CdA): il casellario NON e'
+      bloccante in queste fasi.
+    - I CASELLARI di TUTTI i soggetti dovuti (1 se i ruoli coincidono, 2 se distinti)
+      sono il riscontro documentale e diventano BLOCCANTI solo alla Fase 5: solo allora
+      la pratica e' PUBBLICABILE.
+    """
+    subs = onorabilita_subjects(conn, practice_id)
+    if not subs:
+        return {"configured": False, "coincide": None, "subjects": [],
+                "procedibile": False, "pubblicabile": False,
+                "missing_autodich": [], "missing_casellario": [], "due_casellari": 0}
+    coincide = any(s["role"] == "both" for s in subs)
+    missing_ad = [ONORAB_ROLE_LABELS.get(s["role"], s["role"]) for s in subs if not s["autodich"]]
+    missing_cas = [ONORAB_ROLE_LABELS.get(s["role"], s["role"]) for s in subs if not s["casellario"]]
+    procedibile = not missing_ad
+    return {"configured": True, "coincide": coincide, "subjects": subs,
+            "procedibile": procedibile, "pubblicabile": procedibile and not missing_cas,
+            "missing_autodich": missing_ad, "missing_casellario": missing_cas,
+            "due_casellari": len(subs)}
+
+
 def golive_blockers(conn, practice_id):
     """Elenco dei requisiti bloccanti ancora aperti per il go-live (spec sez. 22)."""
     blockers = []
+    # Cancello di pubblicazione onorabilita' art. 5: tutti i casellari dovuti presenti.
+    ob = onorabilita_status(conn, practice_id)
+    if not ob["configured"]:
+        blockers.append("Onorabilita' art. 5: definire i soggetti (legale rappresentante / titolare effettivo) e acquisire i casellari.")
+    elif ob["missing_autodich"]:
+        blockers.append("Onorabilita' art. 5: autodichiarazione mancante per " + ", ".join(ob["missing_autodich"]) + ".")
+    elif ob["missing_casellario"]:
+        blockers.append("Casellario giudiziale mancante per " + ", ".join(ob["missing_casellario"]) + " (richiesto per la pubblicazione).")
     if conn.execute(
         "SELECT 1 FROM practice_alerts WHERE practice_id = ? AND severity = 'bloccante' AND alert_status = 'aperto' LIMIT 1", (practice_id,)
     ).fetchone():
@@ -4433,6 +4557,10 @@ class App(BaseHTTPRequestHandler):
                 self.post_team_firma_draw(form)
             elif re.fullmatch(r"/pariter/practices/\d+/document-status", path):
                 self.post_practice_document_status(int(path.split("/")[3]), form)
+            elif re.fullmatch(r"/pariter/practices/\d+/onorabilita", path):
+                self.post_practice_onorabilita(int(path.split("/")[3]), form)
+            elif re.fullmatch(r"/pariter/practices/\d+/completezza", path):
+                self.post_practice_completezza(int(path.split("/")[3]), form)
             elif re.fullmatch(r"/pariter/practices/\d+/phase", path):
                 self.post_practice_phase(int(path.split("/")[3]), form)
             elif re.fullmatch(r"/pariter/practices/\d+/intake", path):
@@ -4654,16 +4782,16 @@ class App(BaseHTTPRequestHandler):
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>{esc(title)} - CrowdOS</title>
+  <title>{esc(title)} - OmniCrowd</title>
   <link rel="stylesheet" href="/static/styles.css">
 </head>
 <body>
   <header class="app-header">
     <div class="shell header-inner">
       <div class="brand-copy">
-        <p class="eyebrow">CrowdOS - ECSP - Reg. (UE) 2020/1503</p>
-        <h1>CrowdOS</h1>
-        <p>End-to-end Crowdfunding Platform Management</p>
+        <p class="eyebrow">OmniCrowd - ECSP - Reg. (UE) 2020/1503</p>
+        <h1>OmniCrowd</h1>
+        <p>The all-in-one crowdfunding operating system</p>
       </div>
       <div class="header-actions">
         <div class="platform-switch">{platform_switch}</div>
@@ -5729,11 +5857,13 @@ document.querySelectorAll('[data-campaign-form]').forEach((form) => {
                         "Istruttoria documentale (completezza e regolarita')",
                         intro="I 9 documenti di candidatura sono richiamati dalla fase precedente; si aggiungono le dichiarazioni "
                               "KYC e le evidenze sul limite di 5 milioni. Marca 'verificato' ogni documento; i documenti obbligatori mancanti sono condizione per proseguire.")
+                    + self.render_completezza_panel(ctx, practice)
                     + self.phase_emails_html(ctx, practice, ["C3"], "fase2",
                                              title="Richiesta di integrazione documentale (C3)",
                                              intro="Se mancano documenti o dichiarazioni, invia qui la richiesta al proponente: i documenti mancanti sono gia' elencati nel testo. Il termine resta sospeso fino al riscontro; le integrazioni si caricano sopra, di volta in volta.")
                     + self.practice_documentale_requests(ctx, practice)
                     + self.render_ammissibilita_checklist(ctx, practice)
+                    + self.practice_onorabilita_panel(ctx, practice)
                     + self.render_internal_reviews(ctx, practice, ["aml_art5"])
                     + self.render_validazione_ammissibilita(ctx, practice))
         elif fase == "fase3":
@@ -5764,7 +5894,8 @@ document.querySelectorAll('[data-campaign-form]').forEach((form) => {
                            f'<h2>Identificativo dell\'offerta (KIIS)</h2></div>{ident_inner}'
                            '<p class="muted">L\'aumento di capitale e i casellari giudiziali sono condizioni '
                            'pre-pubblicazione (post delibera CdA): vanno acquisiti qui prima del go-live.</p></section>')
-            body = ident_panel + self.practice_tab_validazione(ctx, practice) + self.practice_tab_campagna(ctx, practice)
+            body = (ident_panel + self.practice_onorabilita_panel(ctx, practice)
+                    + self.practice_tab_validazione(ctx, practice) + self.practice_tab_campagna(ctx, practice))
         elif fase == "fase7":
             body = ('<section class="panel"><div class="section-head"><h2>Onboarding investitore e raccolta</h2></div>'
                     '<p class="muted">Classificazione investitore (sofisticato/non), test di conoscenza e simulazione perdite, '
@@ -6198,16 +6329,93 @@ document.querySelectorAll('[data-campaign-form]').forEach((form) => {
   <table class="data-table compact"><thead><tr><th>Controllo e documenti</th><th>Stato</th><th></th></tr></thead><tbody>{rows_html}</tbody></table>
 </section>"""
 
+    def render_completezza_panel(self, ctx, practice):
+        """Completezza del fascicolo in Fase 2: sempre dovuti vs 'se disponibili' + regola bilanci."""
+        pid = practice["id"]
+        locked = bool(practice["closed_at"])
+        with connect() as conn:
+            comp = fascicolo_completezza(conn, practice)
+
+        def line(label, present, present_txt="Presente", absent_txt="Mancante", absent_cls="danger"):
+            b = (f'<span class="badge success">{present_txt}</span>' if present
+                 else f'<span class="badge {absent_cls}">{absent_txt}</span>')
+            return f'<tr><td>{esc(label)}</td><td>{b}</td></tr>'
+
+        sempre_rows = "".join(line(s["label"], s["present"]) for s in comp["sempre"])
+        # condizionati non-bilanci: assenza = "non disponibile", mai bloccante
+        cond_rows = "".join(
+            line(c["label"], c["present"], absent_txt="Non disponibile", absent_cls="neutral")
+            for c in comp["condizionati"])
+
+        # blocco bilanci con regola min(2, esercizi_chiusi)
+        if comp["esercizi_set"]:
+            dov = comp["bilanci_dovuti"]
+            if dov == 0:
+                bil_badge = '<span class="badge success">Nessun bilancio dovuto (neo costituita)</span>'
+            elif comp["bilanci_completi"]:
+                bil_badge = f'<span class="badge success">{comp["bilanci_presenti"]} su {dov} dovuti</span>'
+            else:
+                bil_badge = f'<span class="badge danger">{comp["bilanci_presenti"]} su {dov} dovuti</span>'
+            bil_state = f'<p>Esercizi chiusi e depositati: <strong>{comp["esercizi"]}</strong> &rarr; bilanci dovuti = min(2, {comp["esercizi"]}) = <strong>{dov}</strong>. {bil_badge}</p>'
+        else:
+            bil_state = '<p><span class="badge warning">Esercizi chiusi non indicati</span> Indica gli esercizi chiusi e depositati per applicare la regola bilanci.</p>'
+
+        bil_form = ""
+        if not locked:
+            bil_form = (f'<form method="post" action="/pariter/practices/{pid}/completezza" class="inline-form" style="margin-top:8px">'
+                        f'{hidden_ctx(ctx)}<input type="hidden" name="back_fase" value="fase2">'
+                        f'<label>Esercizi chiusi e depositati '
+                        f'<input type="number" min="0" max="50" name="esercizi_chiusi" value="{comp["esercizi"] if comp["esercizi_set"] else ""}" style="width:80px"></label> '
+                        f'<label>Bilanci presenti '
+                        f'<input type="number" min="0" max="2" name="bilanci_presenti" value="{comp["bilanci_presenti"]}" style="width:80px"></label> '
+                        f'<button class="button tiny" type="submit">Salva</button></form>')
+
+        if comp["fascicolo_completo"]:
+            head_badge = '<span class="badge success">Fascicolo completo &mdash; procedibile</span>'
+        else:
+            head_badge = '<span class="badge danger">Fascicolo incompleto</span>'
+
+        integr = ""
+        if comp["integrazione"]:
+            lis = "".join(f"<li>{esc(x)}</li>" for x in comp["integrazione"])
+            integr = (f'<p class="muted">Integrazione (C3) dovuta solo per i <strong>sempre dovuti</strong> mancanti e per i bilanci dovuti:</p>'
+                      f'<ul class="clean-list">{lis}</ul>')
+        else:
+            integr = '<p class="muted">Nessuna integrazione necessaria: i documenti sempre dovuti sono presenti e la regola bilanci e\' soddisfatta. I documenti "se disponibili" assenti non sono bloccanti.</p>'
+
+        return f"""
+<section class="panel">
+  <div class="section-head"><h2>Completezza del fascicolo (Allegato 5_1, sez. 5.1.e)</h2>{head_badge}</div>
+  <p class="muted">Distingue i documenti <strong>sempre dovuti</strong> (la cui assenza richiede integrazione) dai documenti <strong>"se disponibili"</strong> (la cui assenza per indisponibilita' oggettiva non e' bloccante). Una neo costituita priva di bilanci, piano storico e sito risulta comunque completa.</p>
+  <h3>Documenti sempre dovuti</h3>
+  <table class="data-table compact"><thead><tr><th>Documento</th><th>Stato</th></tr></thead><tbody>{sempre_rows}</tbody></table>
+  <h3>Bilanci (regola sugli esercizi chiusi)</h3>
+  {bil_state}
+  {bil_form}
+  <h3>Documenti "se disponibili" (non bloccanti)</h3>
+  <table class="data-table compact"><thead><tr><th>Documento</th><th>Stato</th></tr></thead><tbody>{cond_rows}</tbody></table>
+  {integr}
+</section>"""
+
     def ammissibilita_blockers(self, practice):
         """Motivi che impediscono di validare l'ammissibilita' e passare alla valutazione."""
         pid = practice["id"]
         reasons = []
-        missing = rows(
+        with connect() as conn:
+            comp = fascicolo_completezza(conn, practice)
+        if not comp["esercizi_set"]:
+            reasons.append("indicare il numero di esercizi chiusi e depositati (regola bilanci)")
+        if comp["missing_sempre"]:
+            reasons.append(f"{len(comp['missing_sempre'])} documenti sempre dovuti mancanti")
+        if comp["esercizi_set"] and not comp["bilanci_completi"]:
+            reasons.append(f"bilanci depositati: {comp['bilanci_presenti']} su {comp['bilanci_dovuti']} dovuti")
+        # altri documenti obbligatori di Fase 2 (es. KYC), distinti dai sempre dovuti di Fase 1
+        missing_f2 = rows(
             """SELECT label FROM practice_documents WHERE practice_id = ? AND required = 1
-               AND phase IN ('fase1','fase2') AND (document_id IS NULL OR doc_status IN ('mancante','da_integrare','non_utilizzabile'))""",
+               AND phase = 'fase2' AND (document_id IS NULL OR doc_status IN ('mancante','da_integrare','non_utilizzabile'))""",
             (pid,))
-        if missing:
-            reasons.append(f"{len(missing)} documenti obbligatori da integrare/caricare")
+        if missing_f2:
+            reasons.append(f"{len(missing_f2)} documenti obbligatori di Fase 2 da integrare")
         aml = row("SELECT review_status FROM internal_reviews WHERE practice_id = ? AND review_type = 'aml_art5'", (pid,))
         if not (aml and aml["review_status"] == "validata"):
             reasons.append("relazione art. 5/AML non ancora validata")
@@ -6571,7 +6779,7 @@ document.querySelectorAll('[data-campaign-form]').forEach((form) => {
 </section>"""
         else:
             req_panel = ""
-        return phase_panel + upload + req_panel
+        return self.practice_onorabilita_panel(ctx, practice) + phase_panel + upload + req_panel
 
     def practice_tab_interne(self, ctx, practice):
         existing = {r["review_type"]: r for r in rows(
@@ -7336,6 +7544,137 @@ document.querySelectorAll('[data-campaign-form]').forEach((form) => {
             log_audit(conn, ctx["platform_id"], ctx["user_id"], "practice", practice_id, "Verifica documentale", form.get("doc_status", ""))
             conn.commit()
         self.redirect(f"/pariter/practices/{practice_id}", ctx, "Stato documento aggiornato.", {"tab": "documentale"})
+
+    def post_practice_onorabilita(self, practice_id, form):
+        ctx = self.ctx_from_form(form)
+        practice = self._practice_guard(ctx, practice_id, "documentale")
+        if not practice:
+            return
+        action = form.get("action", "")
+        now = now_iso()
+        with connect() as conn:
+            if action in ("configure", "reset"):
+                conn.execute("DELETE FROM practice_onorabilita WHERE practice_id = ?", (practice_id,))
+                if action == "configure":
+                    coincide = form.get("coincide") == "si"
+                    lr = (form.get("lr_name") or "").strip()
+                    te = (form.get("te_name") or "").strip()
+                    if coincide:
+                        conn.execute(
+                            "INSERT INTO practice_onorabilita(practice_id, role, subject_name, updated_at) VALUES (?, 'both', ?, ?)",
+                            (practice_id, lr or te, now))
+                    else:
+                        conn.execute(
+                            "INSERT INTO practice_onorabilita(practice_id, role, subject_name, updated_at) VALUES (?, 'lr', ?, ?)",
+                            (practice_id, lr, now))
+                        conn.execute(
+                            "INSERT INTO practice_onorabilita(practice_id, role, subject_name, updated_at) VALUES (?, 'te', ?, ?)",
+                            (practice_id, te, now))
+                msg = "Soggetti onorabilita' art. 5 aggiornati."
+            elif action == "toggle":
+                role = form.get("role", "")
+                kind = form.get("kind", "")
+                val = 1 if form.get("val") == "1" else 0
+                if kind in ("autodich", "casellario") and role in ("lr", "te", "both"):
+                    conn.execute(
+                        f"UPDATE practice_onorabilita SET {kind} = ?, updated_at = ? WHERE practice_id = ? AND role = ?",
+                        (val, now, practice_id, role))
+                msg = "Stato onorabilita' aggiornato."
+            else:
+                msg = "Azione non riconosciuta."
+            conn.execute("UPDATE practices SET updated_at = ? WHERE id = ?", (now, practice_id))
+            log_audit(conn, ctx["platform_id"], ctx["user_id"], "practice", practice_id, "Onorabilita art. 5", action)
+            conn.commit()
+        self.redirect(f"/pariter/practices/{practice_id}", ctx, msg, {"tab": "documentale"})
+
+    def post_practice_completezza(self, practice_id, form):
+        ctx = self.ctx_from_form(form)
+        practice = self._practice_guard(ctx, practice_id, "documentale")
+        if not practice:
+            return
+
+        def parse_int(name, lo, hi):
+            raw = (form.get(name) or "").strip()
+            if raw == "":
+                return None
+            try:
+                return max(lo, min(hi, int(raw)))
+            except ValueError:
+                return None
+
+        esercizi = parse_int("esercizi_chiusi", 0, 50)
+        bil = parse_int("bilanci_presenti", 0, 2)
+        with connect() as conn:
+            conn.execute("UPDATE practices SET esercizi_chiusi = ?, bilanci_presenti = ?, updated_at = ? WHERE id = ?",
+                         (esercizi, bil if bil is not None else 0, now_iso(), practice_id))
+            log_audit(conn, ctx["platform_id"], ctx["user_id"], "practice", practice_id,
+                      "Completezza fascicolo", f"esercizi={esercizi} bilanci={bil}")
+            conn.commit()
+        self.redirect(f"/pariter/practices/{practice_id}", ctx, "Completezza fascicolo aggiornata.", {"tab": "documentale"})
+
+    def practice_onorabilita_panel(self, ctx, practice):
+        pid = practice["id"]
+        with connect() as conn:
+            ob = onorabilita_status(conn, pid)
+        js = json.loads(practice["dossier_json"] or "{}")
+        rep = js.get("rep") or {}
+        prefill_lr = rep.get("nome") or ""
+        prefill_te = js.get("titolare_effettivo") or (js.get("societa") or {}).get("titolare_effettivo") or ""
+        proc_badge = ('<span class="badge success">Procedibile</span>' if ob["procedibile"]
+                      else '<span class="badge warning">Non procedibile</span>')
+        pub_badge = ('<span class="badge success">Pubblicabile</span>' if ob["pubblicabile"]
+                     else '<span class="badge danger">Non pubblicabile</span>')
+        if not ob["configured"]:
+            body = f"""
+  <p class="muted">L'onorabilita' ex art. 5 va verificata sul <strong>legale rappresentante</strong> del titolare di progetto e sul <strong>titolare effettivo</strong>. Indica se sono la stessa persona: in caso di coincidenza basta un'autodichiarazione e un casellario, altrimenti ne servono due distinti.</p>
+  <form class="form-grid" method="post" action="/pariter/practices/{pid}/onorabilita">
+    {hidden_ctx(ctx)}<input type="hidden" name="action" value="configure">
+    <label>I due ruoli coincidono?
+      <select name="coincide"><option value="no">No - persone distinte</option><option value="si">Si - stessa persona</option></select>
+    </label>
+    <label>Legale rappresentante<input name="lr_name" value="{esc(prefill_lr)}"></label>
+    <label>Titolare effettivo<input name="te_name" value="{esc(prefill_te)}" placeholder="se coincide, lascia vuoto"></label>
+    <div class="form-actions"><button class="button primary" type="submit">Imposta soggetti</button></div>
+  </form>"""
+        else:
+            rows_html = ""
+            for s in ob["subjects"]:
+                role_lbl = ONORAB_ROLE_LABELS.get(s["role"], s["role"])
+                ad = ('<span class="badge success">acquisita</span>' if s["autodich"]
+                      else '<span class="badge warning">mancante</span>')
+                cas = ('<span class="badge success">acquisito</span>' if s["casellario"]
+                       else '<span class="badge danger">mancante</span>')
+
+                def tog(kind, cur):
+                    return (f'<form method="post" action="/pariter/practices/{pid}/onorabilita" style="display:inline">'
+                            f'{hidden_ctx(ctx)}<input type="hidden" name="action" value="toggle">'
+                            f'<input type="hidden" name="role" value="{s["role"]}"><input type="hidden" name="kind" value="{kind}">'
+                            f'<input type="hidden" name="val" value="{0 if cur else 1}">'
+                            f'<button class="button tiny" type="submit">{"Segna mancante" if cur else "Segna acquisito"}</button></form>')
+                rows_html += (f'<tr><td><strong>{esc(s["subject_name"] or "-")}</strong><br>'
+                              f'<span class="muted">{esc(role_lbl)}</span></td>'
+                              f'<td>{ad} {tog("autodich", s["autodich"])}</td>'
+                              f'<td>{cas} {tog("casellario", s["casellario"])}</td></tr>')
+            if not ob["procedibile"]:
+                note = f'<p class="muted">Mancano le autodichiarazioni per: <strong>{esc(", ".join(ob["missing_autodich"]))}</strong>. Senza, la pratica non e\' procedibile.</p>'
+            elif not ob["pubblicabile"]:
+                note = (f'<p class="muted">Autodichiarazioni acquisite: la pratica <strong>procede</strong> (istruttoria, scoring, Advisory, CdA). '
+                        f'Per <strong>pubblicare</strong> servono i casellari ancora mancanti: <strong>{esc(", ".join(ob["missing_casellario"]))}</strong>.</p>')
+            else:
+                note = '<p class="muted">Tutti i casellari dovuti sono presenti: requisito di onorabilita\' soddisfatto anche per la pubblicazione.</p>'
+            reconf = (f'<form method="post" action="/pariter/practices/{pid}/onorabilita" style="display:inline" '
+                      f'onsubmit="return confirm(\'Riconfigurare i soggetti? Le spunte verranno azzerate.\')">'
+                      f'{hidden_ctx(ctx)}<input type="hidden" name="action" value="reset">'
+                      f'<button class="button tiny secondary" type="submit">Riconfigura soggetti</button></form>')
+            body = f"""
+  {note}
+  <table class="data-table compact"><thead><tr><th>Soggetto</th><th>Autodichiarazione (per procedere)</th><th>Casellario (per pubblicare)</th></tr></thead><tbody>{rows_html}</tbody></table>
+  <div class="form-actions left">{reconf}</div>"""
+        return f"""
+<section class="panel">
+  <div class="section-head"><h2>Onorabilita' art. 5 - legale rappresentante e titolare effettivo</h2><div class="header-badges">{proc_badge}{pub_badge}</div></div>
+  {body}
+</section>"""
 
     def post_practice_phase(self, practice_id, form):
         ctx = self.ctx_from_form(form)
@@ -15712,7 +16051,7 @@ def main():
     init_db()
     port = int(sys.argv[1]) if len(sys.argv) > 1 else 8772
     server = ThreadingHTTPServer(("127.0.0.1", port), App)
-    print(f"CrowdOS running at http://127.0.0.1:{port}")
+    print(f"OmniCrowd running at http://127.0.0.1:{port}")
     try:
         server.serve_forever()
     except KeyboardInterrupt:

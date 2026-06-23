@@ -1,6 +1,8 @@
-# CrowdOS
+# OmniCrowd
 
-**End-to-end Crowdfunding Platform Management.**
+**The all-in-one crowdfunding operating system.**
+
+Dall'onboarding del progetto al lancio della campagna, compliance, governance e vigilanza regolamentare — tutto in un'unica piattaforma.
 
 Software gestionale interno per piattaforme di crowdfunding (ECSP, Reg. (UE) 2020/1503): compliance, governance, istruttoria offerte, investitori, proponenti, documenti e comunicazioni obbligatorie.
 
