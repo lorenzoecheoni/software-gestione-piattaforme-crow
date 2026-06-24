@@ -82,14 +82,16 @@ _ALLEGATO_DESC = {
     "18": "KIIS - scheda con le informazioni chiave sull'investimento",
     "19": "Limiti di investimento e classificazione investitori",
 }
+# Modulistica vigente M1-M14 (rinumerazione giugno 2026). Lo stesso numero puo' indicare
+# un documento diverso rispetto al vecchio assetto: questa e' la numerazione nuova.
 _M_DESC = {
-    1: "Checklist documentale del proponente", 2: "Checklist KYC ex art. 5",
-    3: "Checklist sul limite di 5 milioni", 4: "Modulo di valutazione CVOI (scoring)",
-    5: "Fascicolo di valutazione del progetto", 6: "Parere dell'Advisory Committee",
-    7: "Verbale CdA - delibera sull'offerta", 8: "Checklist di verifica della KIIS",
-    9: "Modulo di classificazione dell'investitore", 10: "Registri conflitti e reclami",
-    11: "Relazione sui controlli art. 5 / AML", 12: "Relazione di insussistenza dei conflitti",
-    13: "Notifica di data breach al Garante", 14: "Segnalazione di incidente ICT (DORA)",
+    1: "Checklist documentale - onboarding proponente", 2: "Checklist KYC - art. 5 ECSP",
+    3: "Checklist - limite EUR 5.000.000", 4: "Relazione controlli art. 5 / AML (attestazione 2a linea)",
+    5: "Checklist - verifica della scheda KIIS", 6: "Modulo di valutazione CVOI - scoring (Allegato 5.1)",
+    7: "Fascicolo di valutazione (8 sezioni)", 8: "Parere dell'Advisory Committee",
+    9: "Relazione di insussistenza dei conflitti", 10: "Verbale CdA - delibera sull'offerta",
+    11: "Modulo classificazione investitore e test (Allegato 19)", 12: "Registri - conflitti di interesse e reclami",
+    13: "Notifica data breach - al Garante (GDPR)", 14: "Segnalazione incidente ICT grave - a CONSOB (DORA)",
 }
 _C_DESC = {
     1: "PEC interna di ricezione della candidatura", 2: "Conferma di caricamento al proponente",
@@ -482,9 +484,9 @@ PRACTICE_DOC_SEED = [
 
 # Relazioni interne Pariter (spec sez. 8).
 INTERNAL_REVIEW_TYPES = [
-    ("aml_art5", "Relazione art. 5 / AML"),
-    ("conflitti", "Relazione conflitti di interesse"),
-    ("coerenza_kiis", "Report coerenza KIIS / offerta / documenti"),
+    ("aml_art5", "Relazione controlli art. 5 / AML (M4)"),
+    ("conflitti", "Relazione di insussistenza dei conflitti (M9)"),
+    ("coerenza_kiis", "Verifica della scheda KIIS (M5)"),
 ]
 INTERNAL_REVIEW_LABELS = dict(INTERNAL_REVIEW_TYPES)
 
@@ -1837,7 +1839,7 @@ def init_db():
         ensure_column(conn, "practices", "m_conflitti_misura", "TEXT NOT NULL DEFAULT ''")
         ensure_column(conn, "practices", "m_kiis_coerenza", "TEXT NOT NULL DEFAULT ''")  # coerente/da_sanare/incoerente
         ensure_column(conn, "practices", "m_advisory_trasmesso", "TEXT NOT NULL DEFAULT ''")
-        # Registri conflitti/reclami secondo modello M10 (Allegati 14 e 16)
+        # Registri conflitti/reclami secondo modello M12 (Allegati 14 e 16)
         for col in ("reg_no", "soggetti", "natura_fonte", "rilevato_da", "valutazione", "misura", "esito", "atti_collegati"):
             ensure_column(conn, "conflicts", col, "TEXT NOT NULL DEFAULT ''")
         ensure_column(conn, "complaints", "protocollo", "TEXT NOT NULL DEFAULT ''")
@@ -4297,7 +4299,7 @@ CONDITION_STATUS_LABELS = {
     "non_applicabile": "Non piu' applicabile",
 }
 
-# Opzioni guidate del registro conflitti (valori suggeriti dal modello M10).
+# Opzioni guidate del registro conflitti (valori suggeriti dal modello M12).
 CONFLICT_TIPO_SOGGETTO = ["Soggetto Rilevante", "Proponente", "Cliente / Investitore", "Socio",
                           "Esponente aziendale", "Advisor / Collaboratore", "Altro"]
 CONFLICT_NATURA = ["rapporto d'affari", "rapporto partecipativo", "parentela o affinita'",
@@ -12924,7 +12926,7 @@ th{{background:#efeae0}}.muted{{color:#6f6a64;font-size:11px}}</style></head><bo
 <p>{esc(intestazione)}</p>
 <table><thead><tr>{head}</tr></thead><tbody>{body}</tbody></table>
 {note_html}
-<p class="muted">Documento generato dalla compliance suite il {esc(now_iso())} - conforme al modello M10 (Allegati 14 e 16).</p>
+<p class="muted">Documento generato dalla compliance suite il {esc(now_iso())} - conforme al modello M12 (Allegati 14 e 16).</p>
 </body></html>"""
         self.send_html(doc)
 
@@ -12962,7 +12964,7 @@ th{{background:#efeae0}}.muted{{color:#6f6a64;font-size:11px}}</style></head><bo
             self._send_csv("Registro_conflitti_interesse.csv", headers, data_rows)
             return
         self._send_register_html(
-            "Registro dei conflitti di interesse", "Pariter Equity S.r.l. - modello M10 conforme all'Allegato 14",
+            "Registro dei conflitti di interesse", "Pariter Equity S.r.l. - modello M12 conforme all'Allegato 14",
             "Responsabile della tenuta: Consigliere Incaricato delle funzioni di controllo (Stefania Monotoni). "
             "Base: Allegato 14 - Reg. del. (UE) 2022/2111 - art. 8 ECSP.",
             headers, data_rows,
@@ -12994,7 +12996,7 @@ th{{background:#efeae0}}.muted{{color:#6f6a64;font-size:11px}}</style></head><bo
             self._send_csv("Registro_reclami.csv", headers, data_rows)
             return
         self._send_register_html(
-            "Registro dei reclami", "Pariter Equity S.r.l. - modello M10 conforme all'Allegato 16",
+            "Registro dei reclami", "Pariter Equity S.r.l. - modello M12 conforme all'Allegato 16",
             "Responsabile: Responsabile Reclami (Fabio Malerba). Base: Allegato 16 - art. 7 §3 ECSP - Reg. del. (UE) 2022/2117. "
             "Tenuto in forma elettronica; annotazione entro il giorno successivo alla ricezione.",
             headers, data_rows,
