@@ -359,7 +359,7 @@ ONBOARDING_STEPS = [
      "attore": "Team di valutazione / Responsabile dei controlli", "tab": "documentale",
      "descrizione": "Verifica completezza documentale (eventuale richiesta di integrazione), KYC art. 5 ECSP su titolare e "
                     "titolare effettivo, rispetto del limite di 5 milioni, relazione art. 5/AML. Se positiva, si avvia la valutazione di merito.",
-     "comms": ["C4"]},
+     "comms": []},
     {"key": "fase3", "fase": "Fase 3", "titolo": "Valutazione di merito (CVOI)",
      "attore": "Comitato Valutazione Opportunita' di Investimento", "tab": "cvoi",
      "descrizione": "Scoring su 3 aree (soglia 19,05), reference call e incontri, accertamento conflitti, verifica coerenza "
@@ -5845,27 +5845,51 @@ document.querySelectorAll('[data-campaign-form]').forEach((form) => {
                     + self.render_intake_panel(ctx, practice)
                     + comms
                     + self.render_docs_block(ctx, practice, ["fase1"], "Documenti allegati (i 9 di candidatura)",
-                                             intro="Documenti inviati dal proponente. I documenti mancanti vengono richiesti e validati nella Fase 2 (ammissibilita').")
-                    + self.render_comms_history(ctx, practice))
+                                             intro="Documenti inviati dal proponente. I documenti mancanti vengono richiesti e validati nella Fase 2 (ammissibilita')."))
         elif fase == "fase2":
-            # 1) verifica documentale (completezza): richiamati da fase1 + KYC/5M di fase2, con condizione bloccante
-            # 2) richiesta integrazione documentale e dichiarazioni (mail C3) sotto i controlli
-            # 3) controlli di ammissibilita' (KYC, casellario, 5M)
-            # 4) relazione art.5/AML con documento e azioni
-            body = (self.render_docs_block(
-                        ctx, practice, ["fase1", "fase2"],
-                        "Istruttoria documentale (completezza e regolarita')",
-                        intro="I 9 documenti di candidatura sono richiamati dalla fase precedente; si aggiungono le dichiarazioni "
-                              "KYC e le evidenze sul limite di 5 milioni. Marca 'verificato' ogni documento; i documenti obbligatori mancanti sono condizione per proseguire.")
-                    + self.render_completezza_panel(ctx, practice)
-                    + self.phase_emails_html(ctx, practice, ["C3"], "fase2",
-                                             title="Richiesta di integrazione documentale (C3)",
-                                             intro="Se mancano documenti o dichiarazioni, invia qui la richiesta al proponente: i documenti mancanti sono gia' elencati nel testo. Il termine resta sospeso fino al riscontro; le integrazioni si caricano sopra, di volta in volta.")
-                    + self.practice_documentale_requests(ctx, practice)
-                    + self.render_ammissibilita_checklist(ctx, practice)
-                    + self.practice_onorabilita_panel(ctx, practice)
-                    + self.render_internal_reviews(ctx, practice, ["aml_art5"])
-                    + self.render_validazione_ammissibilita(ctx, practice))
+            # Fase 2 divisa per funzione (pronta per i permessi):
+            # 2.1 Completezza del fascicolo (Comitato Tecnico) · 2.2 Verifica ammissibilita' (Resp. compliance) ·
+            # 2.3 Validazione ammissibilita' (esito + C4 -> CVOI).
+            subs = [
+                ("completezza", "2.1 Completezza del fascicolo", "Comitato Tecnico (CVOI)"),
+                ("ammissibilita", "2.2 Verifica di ammissibilita'", "Responsabile delle funzioni di controllo"),
+                ("validazione", "2.3 Validazione ammissibilita'", "Esito documentale e passaggio al CVOI"),
+            ]
+            sub = self.get_query_param("sub") or "completezza"
+            if sub not in {s[0] for s in subs}:
+                sub = "completezza"
+            subnav = '<div class="subtabs">' + "".join(
+                f'<a class="subtab {"active" if k == sub else ""}" href="{rel_url("/pariter/practices/" + str(practice["id"]), ctx, {"fase": "fase2", "sub": k})}">{esc(t)}</a>'
+                for k, t, _f in subs) + '</div>'
+            cur = next(s for s in subs if s[0] == sub)
+            sec_head = (f'<section class="panel"><p class="eyebrow">{esc(cur[1])}</p>'
+                        f'<div class="section-head"><h2 style="margin:0">{esc(cur[1].split(" ", 1)[1])}</h2>'
+                        f'<span class="badge neutral">Funzione: {esc(cur[2])}</span></div></section>')
+            # In 2.1 e 2.2 si possono inviare solo C3 (integrazione) o C6 (non ammissibilita');
+            # la verifica documentale positiva (C4) e' possibile solo in 2.3.
+            comms_amm = self.phase_emails_html(
+                ctx, practice, ["C3", "C6"], "fase2",
+                title="Comunicazioni disponibili in questa fase",
+                intro="In ammissibilita' si invia solo la richiesta di integrazione (C3) o la comunicazione di non ammissibilita' (C6). "
+                      "La verifica documentale positiva (C4) si invia solo al punto 2.3.",
+                back_sub=sub)
+            if sub == "completezza":
+                section = (self.render_docs_block(
+                                ctx, practice, ["fase1", "fase2"],
+                                "Istruttoria documentale (completezza e regolarita')",
+                                intro="I 9 documenti di candidatura sono richiamati dalla fase precedente; si aggiungono le dichiarazioni "
+                                      "KYC e le evidenze sul limite di 5 milioni. Marca 'verificato' ogni documento; i documenti obbligatori mancanti sono condizione per proseguire.")
+                           + self.render_completezza_panel(ctx, practice)
+                           + self.practice_documentale_requests(ctx, practice)
+                           + comms_amm)
+            elif sub == "ammissibilita":
+                section = (self.render_ammissibilita_checklist(ctx, practice)
+                           + self.practice_onorabilita_panel(ctx, practice)
+                           + self.render_internal_reviews(ctx, practice, ["aml_art5"])
+                           + comms_amm)
+            else:
+                section = self.render_validazione_ammissibilita(ctx, practice)
+            body = subnav + sec_head + section
         elif fase == "fase3":
             body = (self.render_full_dossier(ctx, practice)
                     + self.practice_tab_cvoi(ctx, practice)
@@ -5904,7 +5928,9 @@ document.querySelectorAll('[data-campaign-form]').forEach((form) => {
             body = ('<section class="panel"><div class="section-head"><h2>Post-offerta e obblighi continuativi</h2></div>'
                     '<p class="muted">Monitoraggio campagna/emittente e comunicazioni continuative a CONSOB (SiCrowd).</p></section>')
         emails = self.phase_emails_html(ctx, practice, step["comms"], fase)
-        return head + body + emails
+        # storico completo di tutte le comunicazioni (sempre in fondo, registro aggiornato)
+        history = self.render_comms_history(ctx, practice)
+        return head + body + emails + history
 
     def practice_email_defaults(self, practice, code):
         t = EMAIL_TEMPLATES[code]
@@ -6611,9 +6637,10 @@ document.querySelectorAll('[data-campaign-form]').forEach((form) => {
     def phase_emails_html(self, ctx, practice, codes, fase="",
                           title="Comunicazioni di questa fase",
                           intro="La mail compare qui, nel momento del processo. Modificala, aprila nel client e registrala come inviata.",
-                          open_codes=()):
+                          open_codes=(), back_sub=""):
         if not codes:
             return ""
+        sub_field = f'<input type="hidden" name="back_sub" value="{esc(back_sub)}">' if back_sub else ""
         pid = practice["id"]
         locked = bool(practice["closed_at"])
         sent = {}
@@ -6646,7 +6673,7 @@ document.querySelectorAll('[data-campaign-form]').forEach((form) => {
       <details class="comm-block"{' open' if is_open else ''}>
         <summary><strong>{esc(d['label'])}</strong> &middot; {badge}</summary>
         <form class="form-grid" method="post" action="/pariter/practices/{pid}/email">
-          {hidden_ctx(ctx)}<input type="hidden" name="code" value="{code}"><input type="hidden" name="step_key" value="{fase}"><input type="hidden" name="back_fase" value="{fase}">
+          {hidden_ctx(ctx)}<input type="hidden" name="code" value="{code}"><input type="hidden" name="step_key" value="{fase}"><input type="hidden" name="back_fase" value="{fase}">{sub_field}
           <label>Destinatario<input name="recipient" value="{to_v}"></label>
           <label class="full-span">Oggetto<input name="subject" value="{su_v}"></label>
           <label class="full-span">Testo<textarea name="body" rows="5">{bo_v}</textarea></label>
@@ -7585,7 +7612,7 @@ document.querySelectorAll('[data-campaign-form]').forEach((form) => {
             conn.execute("UPDATE practices SET updated_at = ? WHERE id = ?", (now, practice_id))
             log_audit(conn, ctx["platform_id"], ctx["user_id"], "practice", practice_id, "Onorabilita art. 5", action)
             conn.commit()
-        self.redirect(f"/pariter/practices/{practice_id}", ctx, msg, {"tab": "documentale"})
+        self.redirect(f"/pariter/practices/{practice_id}", ctx, msg, {"fase": "fase2", "sub": "ammissibilita"})
 
     def post_practice_completezza(self, practice_id, form):
         ctx = self.ctx_from_form(form)
@@ -7729,7 +7756,7 @@ document.querySelectorAll('[data-campaign-form]').forEach((form) => {
         reasons = self.ammissibilita_blockers(practice)
         if reasons:
             self.redirect(f"/pariter/practices/{practice_id}", ctx,
-                          "Non si puo' validare: " + "; ".join(reasons) + ".", {"fase": "fase2"})
+                          "Non si puo' validare: " + "; ".join(reasons) + ".", {"fase": "fase2", "sub": "validazione"})
             return
         d = self.practice_email_defaults(practice, "C4")
         with connect() as conn:
@@ -7848,7 +7875,12 @@ document.querySelectorAll('[data-campaign-form]').forEach((form) => {
             log_audit(conn, ctx["platform_id"], ctx["user_id"], "practice", practice_id, "Processo", f"{step_key}: {status}")
             conn.commit()
         back = form.get("back_fase") or (step_key if step_key in {s["key"] for s in ONBOARDING_STEPS} else "fase2")
-        self.redirect(f"/pariter/practices/{practice_id}", ctx, "Fase aggiornata." if status == "completata" else "Fase riaperta.", {"fase": back})
+        params = {"fase": back}
+        if form.get("back_sub"):
+            params["sub"] = form.get("back_sub")
+        elif step_key.startswith("chk_"):
+            params["sub"] = "ammissibilita"
+        self.redirect(f"/pariter/practices/{practice_id}", ctx, "Fase aggiornata." if status == "completata" else "Fase riaperta.", params)
 
     def post_practice_email(self, practice_id, form):
         ctx = self.ctx_from_form(form)
@@ -7864,7 +7896,10 @@ document.querySelectorAll('[data-campaign-form]').forEach((form) => {
             )
             log_audit(conn, ctx["platform_id"], ctx["user_id"], "practice", practice_id, "Comunicazione inviata", form.get("code", ""))
             conn.commit()
-        self.redirect(f"/pariter/practices/{practice_id}", ctx, f"Comunicazione {form.get('code','')} registrata come inviata.", {"fase": form.get("back_fase") or "riepilogo"})
+        params = {"fase": form.get("back_fase") or "riepilogo"}
+        if form.get("back_sub"):
+            params["sub"] = form.get("back_sub")
+        self.redirect(f"/pariter/practices/{practice_id}", ctx, f"Comunicazione {form.get('code','')} registrata come inviata.", params)
 
     def post_practice_document_upload(self, practice_id, form, files):
         ctx = self.ctx_from_form(form)
@@ -7901,9 +7936,11 @@ document.querySelectorAll('[data-campaign-form]').forEach((form) => {
         rtype = form.get("review_type", "")
         action = form.get("action", "generate")
         # ogni relazione vive nella sua fase: AML->fase2, coerenza KIIS->fase3, conflitti->fase5
-        back_fase = {"aml_art5": "fase2", "coerenza_kiis": "fase3", "conflitti": "fase5"}.get(rtype, "fase2")
+        back = {"aml_art5": {"fase": "fase2", "sub": "ammissibilita"},
+                "coerenza_kiis": {"fase": "fase3"},
+                "conflitti": {"fase": "fase5"}}.get(rtype, {"fase": "fase2"})
         if rtype not in INTERNAL_REVIEW_LABELS:
-            self.redirect(f"/pariter/practices/{practice_id}", ctx, "Tipo relazione non valido.", {"fase": back_fase})
+            self.redirect(f"/pariter/practices/{practice_id}", ctx, "Tipo relazione non valido.", back)
             return
         with connect() as conn:
             existing = conn.execute(
@@ -7931,7 +7968,7 @@ document.querySelectorAll('[data-campaign-form]').forEach((form) => {
             # una relazione validata e' definitiva: per rigenerarla/modificarla va prima rimossa
             if cur_status == "validata" and action in ("generate", "save_body", "sign", "upload"):
                 self.redirect(f"/pariter/practices/{practice_id}", ctx,
-                              "Relazione gia' validata e in istruttoria: rimuovila per rigenerarla.", {"fase": back_fase})
+                              "Relazione gia' validata e in istruttoria: rimuovila per rigenerarla.", back)
                 return
 
             prev_doc = existing["generated_document_id"] if existing else None
@@ -7966,7 +8003,7 @@ document.querySelectorAll('[data-campaign-form]').forEach((form) => {
             elif action == "upload":
                 file_item = files.get("file")
                 if file_item is None or not getattr(file_item, "filename", ""):
-                    self.redirect(f"/pariter/practices/{practice_id}", ctx, "Nessun file relazione.", {"fase": back_fase})
+                    self.redirect(f"/pariter/practices/{practice_id}", ctx, "Nessun file relazione.", back)
                     return
                 _drop_doc(prev_doc)
                 title = INTERNAL_REVIEW_LABELS.get(rtype, rtype)
@@ -7979,7 +8016,7 @@ document.querySelectorAll('[data-campaign-form]').forEach((form) => {
             elif action == "validate":
                 if not (existing and existing["generated_document_id"]):
                     self.redirect(f"/pariter/practices/{practice_id}", ctx,
-                                  "Genera/firma o carica la relazione prima di validarla.", {"fase": back_fase})
+                                  "Genera/firma o carica la relazione prima di validarla.", back)
                     return
                 conn.execute(
                     "UPDATE internal_reviews SET review_status = 'validata', updated_by = ?, updated_at = ? WHERE id = ?",
@@ -7999,7 +8036,7 @@ document.querySelectorAll('[data-campaign-form]').forEach((form) => {
                 if not valid:
                     self.redirect(f"/pariter/practices/{practice_id}", ctx,
                                   f"Firma non disponibile: carica firma e documento d'identita' di {resp_name} in anagrafica team prima di firmare.",
-                                  {"fase": back_fase})
+                                  back)
                     return
                 # rimuove la bozza HTML scaricabile prima di archiviare il PDF definitivo
                 if prev_doc:
@@ -8032,7 +8069,7 @@ document.querySelectorAll('[data-campaign-form]').forEach((form) => {
             conn.execute("UPDATE practices SET updated_at = ? WHERE id = ?", (now_iso(), practice_id))
             log_audit(conn, ctx["platform_id"], ctx["user_id"], "practice", practice_id, f"Relazione {rtype}", action)
             conn.commit()
-        self.redirect(f"/pariter/practices/{practice_id}", ctx, msg, {"fase": back_fase})
+        self.redirect(f"/pariter/practices/{practice_id}", ctx, msg, back)
 
     def post_practice_cda_convoca(self, practice_id, form):
         ctx = self.ctx_from_form(form)
