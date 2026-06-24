@@ -414,6 +414,12 @@ EMAIL_TEMPLATES = {
            "subject": "{pratica} - candidatura presa in carico",
            "body": "Gentile {proponente},\nconfermiamo che la documentazione e' stata presa in carico. "
                    "Numero pratica: {pratica}.\nL'istruttoria si concludera' indicativamente entro 30 giorni.\nPariter Equity"},
+    "C3K": {"label": "C3K - Segnalazione/correzione KIIS (al proponente)", "to": "proponente",
+            "subject": "Scheda KIIS - completamento/correzione - pratica {pratica}",
+            "body": "Gentile {proponente},\nla scheda informativa (KIIS) del progetto {progetto} e' redatta e validata da Voi quali titolari del "
+                    "progetto (art. 23 Reg. (UE) 2020/1503). Dalla nostra verifica risultano da completare/correggere:\n"
+                    "- [campi mancanti]\nVi invitiamo a completare/correggere la scheda. In assenza di riscontro tempestivo l'offerta "
+                    "potra' essere sospesa (fino a 30 giorni) e quindi cancellata. Non e' un esito dell'istruttoria.\nPariter Equity"},
     "C3": {"label": "C3 - Richiesta di integrazione", "to": "proponente",
            "subject": "Richiesta di integrazione documentale - pratica {pratica}",
            "body": "Gentile {proponente},\nper proseguire l'istruttoria del progetto {progetto} occorre integrare/chiarire:\n"
@@ -1825,6 +1831,12 @@ def init_db():
         ensure_column(conn, "board_meetings", "practice_id", "INTEGER REFERENCES practices(id) ON DELETE SET NULL")
         # Bozza KIIS collegata alla pratica (generata da template o caricata)
         ensure_column(conn, "practices", "kiis_document_id", "INTEGER REFERENCES documents(id) ON DELETE SET NULL")
+        # Fase 3 (CVOI) - stati di merito: bozza KIIS, conflitti, coerenza KIIS, trasmissione Advisory
+        ensure_column(conn, "practices", "m_kiis_stato", "TEXT NOT NULL DEFAULT 'incompleta'")  # incompleta/completa
+        ensure_column(conn, "practices", "m_conflitti", "TEXT NOT NULL DEFAULT ''")  # nessuno/gestibile/non_gestibile
+        ensure_column(conn, "practices", "m_conflitti_misura", "TEXT NOT NULL DEFAULT ''")
+        ensure_column(conn, "practices", "m_kiis_coerenza", "TEXT NOT NULL DEFAULT ''")  # coerente/da_sanare/incoerente
+        ensure_column(conn, "practices", "m_advisory_trasmesso", "TEXT NOT NULL DEFAULT ''")
         # Registri conflitti/reclami secondo modello M10 (Allegati 14 e 16)
         for col in ("reg_no", "soggetti", "natura_fonte", "rilevato_da", "valutazione", "misura", "esito", "atti_collegati"):
             ensure_column(conn, "conflicts", col, "TEXT NOT NULL DEFAULT ''")
@@ -3671,6 +3683,19 @@ def build_cvoi_html(practice, report_fields, criteria_scores):
 <h2>{n}) {esc(label)}</h2>
 <table><tr><th>Criterio di valutazione</th><th>Punteggio</th></tr>{rows_html}</table>
 <p class="muted">Punteggio minimo richiesto: {int(thr)} su {int(mx)}. Peso {int(w*100)}% sul giudizio finale.</p>"""
+    # Sezioni 7 e 8 del fascicolo (Allegato 5_1), obbligatorie: esiti da 3.1
+    cf = _practice_val(practice, "m_conflitti")
+    cf_mis = _practice_val(practice, "m_conflitti_misura")
+    kc = _practice_val(practice, "m_kiis_coerenza")
+    cf_txt = CONFLITTI_MERITO_LABELS.get(cf, "non valutato")
+    if cf == "gestibile" and cf_mis:
+        cf_txt += f" &mdash; misura: {esc(cf_mis)}"
+    kc_txt = KIIS_COERENZA_LABELS.get(kc, "non verificata")
+    fascicolo_78 = f"""
+<h2>7) Esito conflitti di interesse</h2>
+<p>Accertamento del team (Allegato 14): <strong>{cf_txt}</strong>.</p>
+<h2>8) Esito verifica KIIS</h2>
+<p>Coerenza/correttezza/completezza della scheda KIIS rispetto al patrimonio informativo: <strong>{esc(kc_txt)}</strong>. La bozza di KIIS e' allegata al fascicolo.</p>"""
     notes = report_fields.get("notes_qualitative") or ""
     closing = report_fields.get("closing_note") or (
         "La presente valutazione puo' essere inoltrata al CdA per l'approvazione del progetto, salvo che non "
@@ -3700,6 +3725,7 @@ effettivo, assenza precedenti penali).</p>
 </table>
 <p><strong>Esito first screening: {esc(CVOI_OUTCOME_LABELS.get(outcome, outcome))}</strong> (soglia {CVOI_OVERALL_THRESHOLD:g}).</p>
 {crit_sections}
+{fascicolo_78}
 <h2>Note di valutazione</h2>
 <p>{esc(notes or 'Nessuna nota.').replace(chr(10), '<br>')}</p>
 <p>***</p>
@@ -3832,6 +3858,58 @@ DOCS_SE_DISPONIBILI = [
     "Piano finanziario storico + proiezioni a 3 anni",
     "Sito web",
 ]
+
+
+def _practice_val(practice, key, default=""):
+    try:
+        return practice[key] if key in practice.keys() else default
+    except (IndexError, KeyError):
+        return default
+
+
+def kiis_missing_fields(practice):
+    """Campi della bozza KIIS non ancora valorizzati dal patrimonio informativo."""
+    try:
+        js = json.loads(practice["dossier_json"] or "{}")
+    except (ValueError, TypeError):
+        js = {}
+    off = (js.get("dati_struttura") or {}).get("offertaFase1") or {}
+    checks = [
+        ("Importo obiettivo (target)", off.get("importoTarget")),
+        ("Importo massimo", off.get("importoMax")),
+        ("Valutazione pre-money", off.get("preMoney")),
+        ("Quota offerta (equity)", off.get("equity")),
+        ("Strumento finanziario", off.get("strumento")),
+        ("Diritti dei soci / clausole", off.get("diritti")),
+        ("Utilizzo dei proventi", off.get("useOfProceeds")),
+    ]
+    return [label for label, val in checks if not (val and str(val).strip())]
+
+
+CONFLITTI_MERITO_LABELS = {"nessuno": "Nessun conflitto", "gestibile": "Gestibile (con misura)",
+                          "non_gestibile": "Non gestibile (stop)"}
+# Verifica del fornitore sulla KIIS (art. 23 Reg. UE 2020/1503)
+KIIS_COERENZA_LABELS = {"coerente": "Coerente, corretta e completa",
+                        "da_correggere": "Da correggere (segnalazione al proponente, art. 23 par. 12)",
+                        "incoerente": "Incoerente/incompleta - bloccante"}
+
+
+def fase3_gate(practice):
+    """Gate di merito 3.1 -> 3.2 (art. 23): KIIS verificata COERENTE AND conflitti in {nessuno, gestibile}."""
+    reasons = []
+    cf = _practice_val(practice, "m_conflitti")
+    if cf == "non_gestibile":
+        reasons.append("conflitti NON gestibili: stop (non ammissione)")
+    elif cf not in ("nessuno", "gestibile"):
+        reasons.append("conflitti di merito non ancora valutati")
+    kc = _practice_val(practice, "m_kiis_coerenza")
+    if kc == "incoerente":
+        reasons.append("KIIS incoerente/incompleta: bloccante")
+    elif kc == "da_correggere":
+        reasons.append("KIIS da correggere: segnalazione al proponente, in attesa di correzione")
+    elif kc != "coerente":
+        reasons.append("verifica KIIS del fornitore non ancora effettuata")
+    return (not reasons), reasons
 
 
 def fascicolo_completezza(conn, practice):
@@ -4593,6 +4671,10 @@ class App(BaseHTTPRequestHandler):
                 self.post_practice_cda_verbale(int(path.split("/")[3]), form, files)
             elif re.fullmatch(r"/pariter/practices/\d+/kiis", path):
                 self.post_practice_kiis(int(path.split("/")[3]), form, files)
+            elif re.fullmatch(r"/pariter/practices/\d+/merito", path):
+                self.post_practice_merito(int(path.split("/")[3]), form)
+            elif re.fullmatch(r"/pariter/practices/\d+/trasmetti-advisory", path):
+                self.post_practice_trasmetti_advisory(int(path.split("/")[3]), form)
             elif re.fullmatch(r"/pariter/practices/\d+/validate-ammissibilita", path):
                 self.post_practice_validate_ammissibilita(int(path.split("/")[3]), form)
             elif re.fullmatch(r"/pariter/practices/\d+/anagrafica", path):
@@ -5915,11 +5997,29 @@ document.querySelectorAll('[data-campaign-form]').forEach((form) => {
                 f'<a class="subtab {"active" if k == sub else ""}" href="{rel_url("/pariter/practices/" + str(practice["id"]), ctx, {"fase": "fase3", "sub": k})}">{esc(t)}</a>'
                 for k, t in subs3) + '</div>'
             if sub == "kiis":
+                # 3.1: (a) genera bozza KIIS -> (b) richiesta informazioni (loop) -> (c) verifiche di merito + gate
                 section = (self.render_kiis_panel(ctx, practice)
-                           + self.render_internal_reviews(ctx, practice, ["coerenza_kiis"]))
+                           + self.render_kiis_stato_panel(ctx, practice)
+                           + self.phase_emails_html(ctx, practice, ["C3K"], "fase3",
+                                                    title="Segnalazione al proponente - completa/correggi la KIIS (art. 23 par. 12)",
+                                                    intro="Unica comunicazione verso il proponente in Fase 3: segnalazione per completare/correggere la KIIS (non e' un esito). In assenza di riscontro: sospensione (max 30 gg) e poi cancellazione.",
+                                                    back_sub="kiis")
+                           + self.render_internal_reviews(ctx, practice, ["coerenza_kiis"])
+                           + self.render_verifiche_merito_panel(ctx, practice))
             else:
-                section = (self.render_full_dossier(ctx, practice)
-                           + self.practice_tab_cvoi(ctx, practice))
+                # 3.2: scoring + fascicolo 8 sezioni -> 3.3 trasmissione Advisory. Accessibile solo se gate 3.1 superato.
+                passed, reasons = fase3_gate(practice)
+                if not passed:
+                    lis = "".join(f"<li>{esc(r)}</li>" for r in reasons)
+                    section = (f'<section class="panel"><div class="section-head"><h2>Verbale CVOI &mdash; scoring</h2>'
+                               f'<span class="badge warning">Bloccato dal gate 3.1</span></div>'
+                               f'<p class="muted">Per accedere allo scoring serve superare il gate di merito (3.1): KIIS COMPLETA, '
+                               f'conflitti gestibili, KIIS coerente. Mancano:</p><ul class="clean-list">{lis}</ul>'
+                               f'<a class="button tiny" href="{rel_url("/pariter/practices/" + str(practice["id"]), ctx, {"fase": "fase3", "sub": "kiis"})}">Vai a 3.1</a></section>')
+                else:
+                    section = (self.render_full_dossier(ctx, practice)
+                               + self.practice_tab_cvoi(ctx, practice)
+                               + self.render_trasmissione_advisory(ctx, practice))
             body = subnav + section
         elif fase == "fase4":
             # Sessione dedicata Advisory Committee: esamina CVOI + bozza KIIS e rende il parere non vincolante.
@@ -5992,6 +6092,10 @@ document.querySelectorAll('[data-campaign-form]').forEach((form) => {
                         items.append(f"Casellario giudiziale - {role}: {name} (da acquisire prima della pubblicazione)")
             elenco = "\n".join(f"- {x}" for x in items) or "- (nessun documento mancante rilevato)"
             body = body.replace("- [specificare i documenti mancanti]", elenco)
+        if code == "C3K":
+            campi = kiis_missing_fields(practice)
+            elenco = "\n".join(f"- {x}" for x in campi) or "- (nessun campo mancante rilevato)"
+            body = body.replace("- [campi mancanti]", elenco)
         return {"label": t["label"], "recipient": to_map.get(t["to"], ""),
                 "subject": fill(t["subject"]), "body": body}
 
@@ -7098,22 +7202,162 @@ document.querySelectorAll('[data-campaign-form]').forEach((form) => {
                 upload = (f'<form class="inline-form" method="post" action="{url}" enctype="multipart/form-data" style="margin-top:8px">'
                           f'{hidden_ctx(ctx)}<input type="hidden" name="action" value="upload"><input type="file" name="file" required>'
                           f'<button class="button tiny" type="submit">Sostituisci con file caricato</button></form>')
-            inner = f'<p class="muted">La bozza KIIS e\' allegata al fascicolo e portata al CdA. Verra\' finalizzata e pubblicata in Fase 5.</p><div class="form-actions">{actions}</div>{upload}'
+            inner = f'<p class="muted">La KIIS e\' redatta e validata dal proponente (art. 23 Reg. UE 2020/1503); Pariter precompila come assistenza e verifica. La bozza e\' allegata al fascicolo. Verra\' finalizzata e pubblicata in Fase 5.</p><div class="form-actions">{actions}</div>{upload}'
         else:
-            badge = '<span class="badge neutral">Da generare</span>'
+            badge = '<span class="badge neutral">Da acquisire</span>'
             if not can_edit:
                 inner = '<p class="muted">Bozza KIIS non ancora disponibile.</p>'
             else:
                 inner = f"""
-  <p class="muted">Genera la bozza KIIS dal template (precompilata con i dati di offerta) oppure caricala a mano.</p>
+  <p class="muted">La <strong>KIIS e' redatta dal proponente</strong> (titolare del progetto, art. 23): e' lui responsabile del contenuto. Pariter mette a disposizione il template (Allegato 18) e puo' <strong>precompilare i campi come assistenza</strong>, ma la titolarita' resta del proponente che valida la bozza.</p>
   <form method="post" action="{url}" style="display:inline">{hidden_ctx(ctx)}<input type="hidden" name="action" value="generate">
-    <button class="button primary" type="submit">Genera bozza KIIS</button></form>
+    <button class="button secondary" type="submit">Precompila bozza dal template (assistenza)</button></form>
   <form class="inline-form" method="post" action="{url}" enctype="multipart/form-data" style="margin-top:8px">
     {hidden_ctx(ctx)}<input type="hidden" name="action" value="upload"><input type="file" name="file" required>
-    <button class="button tiny" type="submit">Carica KIIS a mano</button></form>"""
+    <button class="button primary" type="submit">Carica la KIIS del proponente</button></form>"""
         return f"""
 <section class="panel">
-  <div class="section-head"><h2>Bozza KIIS</h2>{badge}</div>
+  <div class="section-head"><h2>KIIS provvisoria (redatta dal proponente)</h2>{badge}</div>
+  {inner}
+</section>"""
+
+    def render_kiis_stato_panel(self, ctx, practice):
+        """(a) Validazione della bozza KIIS da parte del proponente + campi mancanti."""
+        pid = practice["id"]
+        locked = bool(practice["closed_at"])
+        can = user_can(ctx["user"], "manage_practice") and not locked
+        missing = kiis_missing_fields(practice)
+        stato = _practice_val(practice, "m_kiis_stato", "incompleta")
+        if stato == "completa":
+            badge = '<span class="badge success">Validata dal proponente</span>'
+        else:
+            badge = '<span class="badge warning">In compilazione</span>'
+        if missing:
+            lis = "".join(f"<li>{esc(x)}</li>" for x in missing)
+            miss_html = f'<p class="muted">Campi mancanti o incompleti della bozza KIIS:</p><ul class="clean-list">{lis}</ul>'
+        else:
+            miss_html = '<p><span class="badge success">Tutti i campi previsti sono valorizzati.</span></p>'
+        actions = ""
+        if can:
+            if stato != "completa":
+                actions = (f'<form method="post" action="/pariter/practices/{pid}/merito" style="display:inline">'
+                           f'{hidden_ctx(ctx)}<input type="hidden" name="action" value="kiis_stato"><input type="hidden" name="val" value="completa">'
+                           f'<button class="button primary" type="submit"{" disabled" if missing else ""}>Bozza validata dal proponente</button></form>')
+                if missing:
+                    actions += ' <span class="muted">(il proponente deve completare i campi mancanti)</span>'
+            else:
+                actions = (f'<form method="post" action="/pariter/practices/{pid}/merito" style="display:inline">'
+                           f'{hidden_ctx(ctx)}<input type="hidden" name="action" value="kiis_stato"><input type="hidden" name="val" value="incompleta">'
+                           f'<button class="button tiny" type="submit">Riapri (in compilazione)</button></form>')
+        return f"""
+<section class="panel">
+  <div class="section-head"><h2>Validazione bozza KIIS (proponente)</h2>{badge}</div>
+  <p class="muted">Il contenuto della KIIS e' responsabilita' del proponente (art. 23 par. 10). Una volta che il proponente ha compilato/validato la bozza, il fornitore puo' svolgere la verifica.</p>
+  {miss_html}
+  <div class="form-actions">{actions}</div>
+</section>"""
+
+    def render_verifiche_merito_panel(self, ctx, practice):
+        """(c) Verifiche di merito: conflitti (Allegato 14) + coerenza KIIS, con gate verso 3.2."""
+        pid = practice["id"]
+        locked = bool(practice["closed_at"])
+        can = user_can(ctx["user"], "manage_practice") and not locked
+        kiis_completa = _practice_val(practice, "m_kiis_stato", "incompleta") == "completa"
+        cf = _practice_val(practice, "m_conflitti")
+        cf_mis = _practice_val(practice, "m_conflitti_misura")
+        kc = _practice_val(practice, "m_kiis_coerenza")
+
+        def sel(name, options, current):
+            opts = "".join(f'<option value="{k}"{" selected" if k == current else ""}>{esc(v)}</option>'
+                           for k, v in options)
+            return f'<select name="{name}">{opts}</select>'
+
+        segnalazione = ""
+        if kc == "da_correggere":
+            segnalazione = ('<p class="muted"><span class="badge warning">In attesa di correzione del proponente</span> '
+                            'Inviata segnalazione (art. 23 par. 12). Se il proponente non corregge tempestivamente, '
+                            "l'offerta puo' essere sospesa (max 30 giorni) e poi cancellata. La segnalazione si invia dal blocco C3K qui sopra.</p>")
+        elif kc == "incoerente":
+            segnalazione = ('<p class="muted"><span class="badge danger">Bloccante</span> KIIS incoerente/incompleta non sanabile: la pratica non prosegue.</p>')
+        if not kiis_completa:
+            inner = ('<p class="muted">La verifica del fornitore si svolge <strong>dopo che il proponente ha validato la bozza KIIS</strong> '
+                     '(non si verifica una scheda non ancora redatta). Attendi la validazione qui sopra.</p>')
+        elif not can:
+            cf_lbl = CONFLITTI_MERITO_LABELS.get(cf, "non valutato")
+            kc_lbl = KIIS_COERENZA_LABELS.get(kc, "non verificata")
+            inner = f'<p>Conflitti: <strong>{esc(cf_lbl)}</strong>. Verifica KIIS: <strong>{esc(kc_lbl)}</strong>.</p>{segnalazione}'
+        else:
+            cf_options = [("", "- seleziona -"), ("nessuno", "Nessun conflitto"),
+                          ("gestibile", "Gestibile (registra misura)"), ("non_gestibile", "Non gestibile (stop)")]
+            kc_options = [("", "- seleziona -"), ("coerente", "Coerente, corretta e completa"),
+                          ("da_correggere", "Da correggere (segnala al proponente, art. 23 par. 12)"),
+                          ("incoerente", "Incoerente/incompleta (bloccante)")]
+            inner = f"""
+  <h3>A) Conflitti di interesse (Allegato 14) &mdash; accertamento del team</h3>
+  <form class="form-grid" method="post" action="/pariter/practices/{pid}/merito">
+    {hidden_ctx(ctx)}<input type="hidden" name="action" value="conflitti">
+    <label>Esito{sel("val", cf_options, cf)}</label>
+    <label class="span2">Misura di gestione (se gestibile)<input name="misura" value="{esc(cf_mis)}"></label>
+    <div class="form-actions"><button class="button secondary" type="submit">Salva esito conflitti</button></div>
+  </form>
+  <h3>B) Verifica del fornitore sulla KIIS (art. 23): chiarezza, correttezza, completezza</h3>
+  <form class="form-grid" method="post" action="/pariter/practices/{pid}/merito">
+    {hidden_ctx(ctx)}<input type="hidden" name="action" value="coerenza">
+    <label>Esito{sel("val", kc_options, kc)}</label>
+    <div class="form-actions"><button class="button secondary" type="submit">Salva esito verifica KIIS</button></div>
+  </form>
+  {segnalazione}"""
+        passed, reasons = fase3_gate(practice)
+        if passed:
+            gate = '<p><span class="badge success">Gate superato</span> Si puo\' passare a 3.2 (scoring + fascicolo).</p>'
+        else:
+            lis = "".join(f"<li>{esc(r)}</li>" for r in reasons)
+            gate = f'<p><span class="badge warning">Gate non superato</span></p><ul class="clean-list">{lis}</ul>'
+        return f"""
+<section class="panel">
+  <div class="section-head"><h2>Verifiche di merito (gate 3.1 &rarr; 3.2)</h2></div>
+  {inner}
+  <hr style="border:none;border-top:1px solid var(--line);margin:12px 0">
+  {gate}
+</section>"""
+
+    def render_trasmissione_advisory(self, ctx, practice):
+        """3.3: trasmissione del fascicolo (CVOI + tabella + bozza KIIS) all'Advisory Committee."""
+        pid = practice["id"]
+        locked = bool(practice["closed_at"])
+        can = user_can(ctx["user"], "manage_practice") and not locked
+        with connect() as conn:
+            cvoi = cvoi_summary_for(conn, pid)
+        esito_pos = bool(cvoi and cvoi.get("outcome") in ("superato", "superato_condizioni"))
+        # sez. 7 e 8 del fascicolo obbligatorie: esiti conflitti e KIIS dalla 3.1
+        sez7 = _practice_val(practice, "m_conflitti") in ("nessuno", "gestibile")
+        sez8 = _practice_val(practice, "m_kiis_coerenza") == "coerente"
+        gia = _practice_val(practice, "m_advisory_trasmesso")
+        reasons = []
+        if not esito_pos:
+            reasons.append("scoring CVOI senza esito positivo (sotto soglia o non redatto)")
+        if not sez7:
+            reasons.append("sez. 7 fascicolo: esito conflitti mancante")
+        if not sez8:
+            reasons.append("sez. 8 fascicolo: esito verifica KIIS mancante")
+        if gia:
+            inner = (f'<p><span class="badge success">Trasmesso il {esc(gia[:16])}</span> Il fascicolo e\' stato inviato '
+                     f'all\'Advisory Committee (Fase 4). Nessuna comunicazione di esito al proponente in Fase 3.</p>'
+                     f'<a class="button tiny" href="{rel_url("/pariter/practices/" + str(pid), ctx, {"fase": "fase4"})}">Vai all\'Advisory (Fase 4)</a>')
+        elif reasons:
+            lis = "".join(f"<li>{esc(r)}</li>" for r in reasons)
+            inner = (f'<p class="muted">Il fascicolo (CVOI + tabella punteggi + bozza KIIS) si trasmette all\'Advisory solo se '
+                     f'completo e con esito positivo. Mancano:</p><ul class="clean-list">{lis}</ul>'
+                     f'<div class="form-actions"><button class="button primary" type="submit" disabled>Trasmetti all\'Advisory</button></div>')
+        else:
+            btn = (f'<form method="post" action="/pariter/practices/{pid}/trasmetti-advisory">{hidden_ctx(ctx)}'
+                   f'<div class="form-actions"><button class="button primary" type="submit">Trasmetti il fascicolo all\'Advisory Committee</button></div></form>'
+                   if can else "")
+            inner = (f'<p>Fascicolo completo (incl. sez. 7 conflitti e sez. 8 KIIS) ed esito positivo: trasmissibile all\'Advisory. '
+                     f'<strong>Nessuna comunicazione di esito al proponente in questa fase</strong> (l\'esito parte post-delibera CdA, C5/C6).</p>{btn}')
+        return f"""
+<section class="panel">
+  <div class="section-head"><h2>3.3 Trasmissione all'Advisory Committee</h2></div>
   {inner}
 </section>"""
 
@@ -7167,6 +7411,71 @@ document.querySelectorAll('[data-campaign-form]').forEach((form) => {
             log_audit(conn, ctx["platform_id"], ctx["user_id"], "practice", practice_id, "Bozza KIIS", action)
             conn.commit()
         self.redirect(f"/pariter/practices/{practice_id}", ctx, msg, {"fase": "fase3", "sub": "kiis"})
+
+    def post_practice_merito(self, practice_id, form):
+        ctx = self.ctx_from_form(form)
+        practice = self._practice_guard(ctx, practice_id, "fase3")
+        if not practice:
+            return
+        action = form.get("action", "")
+        val = (form.get("val", "") or "").strip()
+        with connect() as conn:
+            if action == "kiis_stato":
+                stato = "completa" if val == "completa" else "incompleta"
+                conn.execute("UPDATE practices SET m_kiis_stato = ?, updated_at = ? WHERE id = ?",
+                             (stato, now_iso(), practice_id))
+                msg = f"Bozza KIIS segnata {stato.upper()}."
+            elif action == "conflitti":
+                if val not in ("", "nessuno", "gestibile", "non_gestibile"):
+                    val = ""
+                misura = (form.get("misura", "") or "").strip()
+                conn.execute("UPDATE practices SET m_conflitti = ?, m_conflitti_misura = ?, updated_at = ? WHERE id = ?",
+                             (val, misura, now_iso(), practice_id))
+                msg = "Esito conflitti di merito salvato."
+            elif action == "coerenza":
+                if val not in ("", "coerente", "da_correggere", "incoerente"):
+                    val = ""
+                conn.execute("UPDATE practices SET m_kiis_coerenza = ?, updated_at = ? WHERE id = ?",
+                             (val, now_iso(), practice_id))
+                msg = "Esito verifica KIIS salvato."
+            else:
+                msg = "Azione non riconosciuta."
+            log_audit(conn, ctx["platform_id"], ctx["user_id"], "practice", practice_id, "Verifiche di merito", f"{action}={val}")
+            conn.commit()
+        self.redirect(f"/pariter/practices/{practice_id}", ctx, msg, {"fase": "fase3", "sub": "kiis"})
+
+    def post_practice_trasmetti_advisory(self, practice_id, form):
+        ctx = self.ctx_from_form(form)
+        practice = self._practice_guard(ctx, practice_id, "fase3", perm="manage_practice")
+        if not practice:
+            return
+        passed, reasons = fase3_gate(practice)
+        with connect() as conn:
+            cvoi = cvoi_summary_for(conn, practice_id)
+        esito_pos = bool(cvoi and cvoi.get("outcome") in ("superato", "superato_condizioni"))
+        if not passed:
+            self.redirect(f"/pariter/practices/{practice_id}", ctx,
+                          "Non trasmissibile: " + "; ".join(reasons) + ".", {"fase": "fase3", "sub": "scoring"})
+            return
+        if not esito_pos:
+            self.redirect(f"/pariter/practices/{practice_id}", ctx,
+                          "Non trasmissibile: il fascicolo CVOI non ha esito positivo (scoring sotto soglia o incompleto).",
+                          {"fase": "fase3", "sub": "scoring"})
+            return
+        with connect() as conn:
+            conn.execute("UPDATE practices SET m_advisory_trasmesso = ?, updated_at = ? WHERE id = ?",
+                         (now_iso(), now_iso(), practice_id))
+            block = can_transition_practice(conn, practice, "in_advisory")
+            if not block:
+                conn.execute("UPDATE practices SET status = 'in_advisory' WHERE id = ?", (practice_id,))
+                conn.execute(
+                    """INSERT INTO practice_status_history(practice_id, from_status, to_status, actor_id, notes, created_at)
+                       VALUES (?, ?, 'in_advisory', ?, 'Fascicolo CVOI trasmesso all''Advisory Committee', ?)""",
+                    (practice_id, practice["status"], ctx["user_id"], now_iso()))
+            log_audit(conn, ctx["platform_id"], ctx["user_id"], "practice", practice_id, "Trasmissione Advisory", "fascicolo CVOI")
+            conn.commit()
+        self.redirect(f"/pariter/practices/{practice_id}", ctx,
+                      "Fascicolo trasmesso all'Advisory Committee (Fase 4).", {"fase": "fase4"})
 
     def practice_tab_decision(self, ctx, practice, round_no):
         pid = practice["id"]
