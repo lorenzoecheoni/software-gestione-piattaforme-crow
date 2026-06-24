@@ -374,8 +374,9 @@ ONBOARDING_STEPS = [
      "comms": []},
     {"key": "fase5", "fase": "Fase 5", "titolo": "Relazione conflitti e delibera CdA",
      "attore": "Responsabile dei controlli / CdA", "tab": "cda",
-     "descrizione": "Valutazione formale finale dei conflitti di interesse (relazione), convocazione del CdA, delibera "
-                    "(approva o respinge) e verbale. Comunicazione dell'esito al proponente.",
+     "descrizione": "5.1 Sessione dedicata: redazione, validazione e firma della relazione di insussistenza dei conflitti "
+                    "(M9) da parte del Responsabile dei controlli. 5.2 Solo a M9 validata, l'intero fascicolo passa al CdA: "
+                    "convocazione, delibera (approva o respinge), verbale e comunicazione dell'esito al proponente.",
      "comms": ["C5", "C6"]},
     {"key": "fase6", "fase": "Fase 6", "titolo": "Strutturazione e pubblicazione",
      "attore": "Team / Sistema", "tab": "validazione",
@@ -1805,6 +1806,8 @@ def init_db():
         # regola bilanci) e numero di bilanci presenti. esercizi_chiusi NULL = non indicato.
         ensure_column(conn, "practices", "esercizi_chiusi", "INTEGER")
         ensure_column(conn, "practices", "bilanci_presenti", "INTEGER NOT NULL DEFAULT 0")
+        # Parere Advisory (M8): bozza salvabile senza generare il documento ufficiale.
+        ensure_column(conn, "advisory_opinions", "draft_body", "TEXT NOT NULL DEFAULT ''")
         # I documenti "se disponibili" non sono piu' obbligatori generici (regola Allegato 5_1).
         conn.execute("UPDATE practice_documents SET required = 0 WHERE phase = 'fase1' AND label IN "
                      "('Piano finanziario storico + proiezioni a 3 anni', 'Ultimi due bilanci depositati')")
@@ -3406,43 +3409,34 @@ def compose_internal_review_draft(practice, review_type):
     prop = practice["proponent_name"] or societa.get("denominazione") or "-"
     if review_type == "fascicolo":
         offerta = ds.get("offertaFase1") or {}
-        cf = _practice_val(practice, "m_conflitti")
-        cf_lbl = CONFLITTI_MERITO_LABELS.get(cf, "non valutato")
-        cf_mis = _practice_val(practice, "m_conflitti_misura")
-        if cf == "gestibile" and cf_mis:
-            cf_lbl += f" - misura: {cf_mis}"
-        kc_lbl = KIIS_COERENZA_LABELS.get(_practice_val(practice, "m_kiis_coerenza"), "non verificata")
-        return f"""Fascicolo di valutazione del progetto (M7) - {prop}
-
-Sintesi dell'istruttoria del Comitato Valutazione Opportunita' di Investimento (CVOI). La parte
-descrittiva e' precompilata come assistenza: integrare/correggere prima della firma.
-
-1. Team / Management
-[Descrivere esperienza, completezza e affidabilita' del team. Dati: key manager ed esperienze.]
+        # Solo la parte narrativa (sez. 1-6 + note): conflitti/KIIS/scoring sono auto-compilati
+        # dal template M7 (sez. 7/8/9) sulla base dei dati reali della pratica.
+        return f"""1. Team
+Esperienza e competenza del proponente e dei key manager; track record; completezza del team e strategia di integrazione delle figure mancanti; congruita' della compagine.
+[Fac-simile - adattare al caso] Il proponente presenta un team con esperienza diretta nel settore e un track record documentato; le figure chiave coprono le competenze tecniche, commerciali e gestionali; le lacune sono presidiate da assunzioni/partnership. Compagine e quote congrue rispetto all'operazione.
 
 2. Tecnologia
-[Descrivere la soluzione tecnologica, maturita' e difendibilita'.]
+Tecnologia alla base del prodotto/servizio; stadio di maturita'; roadmap tecnologica; competitor sul mercato.
+[Fac-simile - adattare al caso] La soluzione si fonda su [tecnologia], a uno stadio di maturita' pari a [prototipo/MVP/prodotto]. Vantaggio differenziale: [...], difendibile nel medio-lungo periodo.
 
-3. Proprieta' intellettuale
-[Brevetti, marchi, know-how e relativa titolarita'.]
+3. Proprieta' Intellettuale
+Brevetti, marchi, asset intangibili; accordi di sfruttamento; analisi di liberta' ad operare/anteriorita'; strategia di protezione.
+[Fac-simile - adattare al caso] Il proponente dispone di [brevetti/marchi/know-how], con titolarita' o licenza in capo alla societa'. Analisi di anteriorita' senza privative ostative. Strategia di protezione: [...].
 
 4. Mercato
-[Dimensione, segmenti, concorrenza, posizionamento.]
+Attrattivita' del mercato; trend; cliente tipo; concorrenza; pre-accordi commerciali (PoC, MOU/LOI).
+[Fac-simile - adattare al caso] Mercato stimato in [dimensione] con crescita [CAGR]. Cliente tipo: [...]. Pre-accordi con [...] a sostegno della domanda.
 
 5. Business Model
-[Modello di ricavo, struttura costi, scalabilita'. Strumento: {offerta.get('strumento') or '-'}; pre-money: {offerta.get('preMoney') or '-'}; equity: {offerta.get('equity') or '-'}.]
+Sostenibilita' economico-finanziaria; scalabilita'; margini difendibili; coerenza delle proiezioni.
+[Fac-simile - adattare al caso] Modello di ricavi su [...], margini difendibili. Scalabile grazie a [...]. Proiezioni su ipotesi quantitative verificabili. Strumento: {offerta.get('strumento') or '-'}; pre-money: {offerta.get('preMoney') or '-'}; equity: {offerta.get('equity') or '-'}.
 
 6. Roadmap
-[Tappe, milestone e impieghi della raccolta (target {offerta.get('importoTarget') or '-'}, max {offerta.get('importoMax') or '-'}).]
+Tappe di sviluppo; impiego dei fondi raccolti; milestone e orizzonte temporale.
+[Fac-simile - adattare al caso] Fondi destinati a [sviluppo/go-to-market/team], milestone su [...] mesi. Fabbisogno coerente con il target ({offerta.get('importoTarget') or '-'}, max {offerta.get('importoMax') or '-'}).
 
-7. Esito conflitti di interesse (da 3.1)
-{cf_lbl}
-
-8. Esito verifica KIIS (da 3.1)
-{kc_lbl}
-
-Allegati: scheda di scoring (M6) e bozza KIIS. La presente valutazione, una volta firmata dai
-membri del CVOI, e' trasmessa all'Advisory Committee per il parere."""
+10. Note di valutazione
+[Osservazioni di sintesi, rilievi e raccomandazioni del team al CdA e all'Advisory.]"""
     if review_type == "aml_art5":
         text = f"""1. Oggetto
 Controlli ex art. 5 Reg. (UE) 2020/1503 sul titolare del progetto e sul titolare effettivo, ai fini dell'ammissione dell'offerta sulla piattaforma Pariter Equity.
@@ -3595,7 +3589,11 @@ def store_review_draft(conn, practice, review_type, body, actor_id, prev_doc_id=
                 pass
             conn.execute("DELETE FROM documents WHERE id = ?", (prev_doc_id,))
     title = INTERNAL_REVIEW_LABELS.get(review_type, review_type)
-    html_doc = practice_doc_shell(title, practice, review_text_to_html(body), ai_generated=True)
+    # Il fascicolo M7 usa il template ufficiale (modulo M7), gli altri lo shell standard.
+    if review_type == "fascicolo":
+        html_doc = build_m7_html(practice, body, conn)
+    else:
+        html_doc = practice_doc_shell(title, practice, review_text_to_html(body), ai_generated=True)
     doc_id = generated_document(
         conn, practice["platform_id"], None, practice["proponent_id"],
         "Verifiche interne", "relazione (bozza)", f"{title} - {practice['project_title']}",
@@ -3800,6 +3798,159 @@ def save_cvoi_collegial(conn, practice, actor_id):
             conn.execute("INSERT INTO cvoi_criteria_scores(cvoi_report_id, area_key, idx, raw_score) VALUES (?, ?, ?, ?)",
                          (rid, key, i, media))
     return rid, c
+
+
+def _m7_check_table(options):
+    """Tabella a spunta in stile modulo (etichetta | casella), casella piena se selezionata."""
+    trs = "".join(
+        f'<tr><td class="m7-opt">{esc(lbl)}</td>'
+        f'<td class="m7-box">{"&#9745;" if chk else "&#9744;"}</td></tr>'
+        for lbl, chk in options)
+    return f'<table class="m7-check">{trs}</table>'
+
+
+def build_m7_html(practice, body, conn):
+    """Modulo M7 - Fascicolo di valutazione CVOI, fedele al template ufficiale (stile modulo).
+
+    Sezioni 1-6 (narrativa, dal testo editabile) + 7 conflitti, 8 KIIS e 9 scoring auto-compilate
+    dai dati reali della pratica; 11 allegati e 12 firme dei membri del Comitato Tecnico (CVOI).
+    """
+    js = {}
+    try:
+        js = json.loads(practice["dossier_json"] or "{}")
+    except (ValueError, TypeError):
+        js = {}
+    ds = js.get("dati_struttura") or js
+    societa = ds.get("societa") or {}
+    offerta = ds.get("offertaFase1") or {}
+    pid = practice["id"]
+    nr = practice["pratica_no"] if ("pratica_no" in practice.keys() and practice["pratica_no"]) else f"PRA-{pid:04d}"
+    prop = esc(practice["proponent_name"] or societa.get("denominazione") or "-")
+    progetto = esc(practice["project_title"] or "-")
+    capitale = esc(str(offerta.get("importoTarget") or offerta.get("importoMax") or "__________"))
+
+    # Sez. 7 - conflitti / Sez. 8 - KIIS (dai dati reali)
+    cf = _practice_val(practice, "m_conflitti")
+    cf_mis = _practice_val(practice, "m_conflitti_misura") or "______________________________"
+    sez7 = _m7_check_table([
+        ("NESSUNO - nessun conflitto rilevato", cf == "nessuno"),
+        ("GESTIBILE - conflitto gestibile con misura (registro conflitti, M12)", cf == "gestibile"),
+        ("NON GESTIBILE - non ammissione dell'offerta", cf == "non_gestibile"),
+    ])
+    kc = _practice_val(practice, "m_kiis_coerenza")
+    sez8 = _m7_check_table([
+        ("COERENTE - informazioni chiare, corrette e complete", kc == "coerente"),
+        ("DA CORREGGERE - errori segnalati al proponente (art. 23 par. 12)", kc == "da_correggere"),
+        ("INCOERENTE BLOCCANTE - sospensione offerta (max 30 gg)", kc == "incoerente"),
+    ])
+
+    # Sez. 9 - scoring (aree reali, soglia minima per area, media ponderata)
+    cvoi = cvoi_summary_for(conn, pid)
+    area_rows = ""
+    raw_total = 0
+    weighted = 0
+    if cvoi:
+        for (label, raw, mx, w, wm), (_k, _l, _w, _mx, thr) in zip(cvoi["areas"], CVOI_AREAS):
+            raw_total += raw
+            min_pond = round(thr * w, 2)
+            area_rows += (f'<tr><td>{esc(label)}</td><td>{raw:g} / {int(mx)}</td>'
+                          f'<td>{int(thr)}/{int(mx)}</td><td>&ge; {min_pond:g}</td></tr>')
+        weighted = cvoi["weighted"] or 0
+    else:
+        area_rows = '<tr><td colspan="4" class="muted">Scoring (M6) non ancora disponibile.</td></tr>'
+    total_max = int(sum(a[3] for a in CVOI_AREAS))
+    scoring_pos = bool(cvoi and weighted >= CVOI_OVERALL_THRESHOLD)
+    sez9_tab = f"""<table class="m7-score">
+  <tr><th>Area</th><th>Ottenuto</th><th>Minimo</th><th>Media pond.</th></tr>
+  {area_rows}
+  <tr class="tot"><td>COMPLESSIVO</td><td>{raw_total:g} / {total_max}</td><td>57/95</td><td>&ge; {CVOI_OVERALL_THRESHOLD:g}</td></tr>
+</table>"""
+    sez9_esito = _m7_check_table([
+        ("ESITO SCORING POSITIVO (soglia E minimo per area)", scoring_pos),
+        ("ESITO SCORING NEGATIVO", bool(cvoi) and not scoring_pos),
+    ])
+
+    # Sez. 12 - firme dei membri del Comitato Tecnico (CVOI)
+    members = cvoi_committee_members(conn)
+    sigs = {r["member_id"]: r["signed_at"] for r in
+            conn.execute("SELECT member_id, signed_at FROM m7_signatures WHERE practice_id = ?", (pid,)).fetchall()}
+    firma_rows = ""
+    for m in members:
+        s = sigs.get(m["id"])
+        firma_rows += (f'<tr><td>{esc(m["name"])}</td>'
+                       f'<td>{("Firmato il " + esc(s[:16])) if s else "_____________________"}</td></tr>')
+    if not firma_rows:
+        firma_rows = '<tr><td colspan="2" class="muted">Nessun membro del Comitato Tecnico.</td></tr>'
+
+    narrativa = review_text_to_html(body or "")
+    today = now_iso()[:10]
+    sections = f"""
+<table class="m7-meta">
+  <tr><td class="k">Codice modulo</td><td>M7 (integra M5 &rarr; sez. 8 e M6 &rarr; sez. 9)</td></tr>
+  <tr><td class="k">Fase del processo</td><td>Fase 3 - Valutazione di merito (CVOI), step 3.2 &rarr; 3.3</td></tr>
+  <tr><td class="k">Riferimenti</td><td>Allegato 5_1 &sect;5.1.e (fascicolo a 8 sezioni); Allegato 14 (conflitti); art. 23 par. 10-12 ECSP</td></tr>
+  <tr><td class="k">Destinatario</td><td>Advisory Committee (unico documento trasmesso) &rarr; Resp. funzioni di controllo &rarr; CdA</td></tr>
+</table>
+
+<h2>A. Identificazione della pratica</h2>
+<table class="m7-meta">
+  <tr><td class="k">Numero di pratica</td><td>{esc(nr)}</td></tr>
+  <tr><td class="k">Proponente / progetto</td><td>{prop} &middot; {progetto}</td></tr>
+  <tr><td class="k">Capitale obiettivo</td><td>&euro; {capitale}</td></tr>
+  <tr><td class="k">Data</td><td>{esc(today)}</td></tr>
+</table>
+
+<h2>Valutazione qualitativa del team (sezioni 1-6) e note (sez. 10)</h2>
+<div class="m7-narr">{narrativa}</div>
+
+<h2>7. Esito verifiche conflitti di interesse</h2>
+<p class="m7-desc">Verifica di rapporti commerciali, di consulenza o d'affari tra il Proponente e Pariter Equity / Pariter Partners (Allegato 14). Sezione sempre obbligatoria.</p>
+{sez7}
+<p class="m7-desc">Misura adottata (se GESTIBILE): {esc(cf_mis)}</p>
+
+<h2>8. Esito verifica KIIS</h2>
+<p class="m7-desc">La KIIS &egrave; redatta dal proponente (art. 23 par. 10); Pariter ne garantisce chiarezza, correttezza e completezza e segnala gli errori (par. 12). Integra la checklist M5. Sezione sempre obbligatoria.</p>
+{sez8}
+
+<h2>9. Esito scoring</h2>
+<p class="m7-desc">Sintesi dei punteggi (dettaglio analitico nel modulo M6, allegato).</p>
+{sez9_tab}
+{sez9_esito}
+
+<h2>11. Allegati conservati agli atti</h2>
+<p class="m7-desc">M5 - Checklist verifica KIIS &middot; M6 - Modulo di scoring (tabella punteggi) &middot; Bozza KIIS provvisoria del proponente.</p>
+
+<h2>12. Trasmissione e firme</h2>
+<p class="m7-desc">Il presente fascicolo &egrave; trasmesso all'Advisory Committee quale unico documento di valutazione (M5 e M6 allegati, conservati agli atti). Nessuna comunicazione di esito al proponente in questa fase.</p>
+<table class="m7-meta"><tr><th>Membro del Comitato di Valutazione (CVOI)</th><th>Firma</th></tr>{firma_rows}</table>
+"""
+    return f"""<!doctype html>
+<html lang="it"><head><meta charset="utf-8"><title>Modulo M7 - Fascicolo di valutazione CVOI - {progetto}</title>
+<style>
+  body{{font-family:'Helvetica Neue',Arial,sans-serif;color:#1d2b3a;max-width:840px;margin:0 auto;padding:32px 36px;line-height:1.5;}}
+  .m7-band{{font-size:11px;color:#5a6b7b;letter-spacing:.3px;border-bottom:2px solid #15b5a6;padding-bottom:8px;margin-bottom:14px;text-transform:uppercase;}}
+  .m7-mod{{display:inline-block;background:#15b5a6;color:#fff;font-weight:700;font-size:12px;letter-spacing:1px;padding:4px 10px;border-radius:4px;}}
+  h1{{font-size:23px;margin:10px 0 2px;color:#16263a;}}
+  .m7-sub{{color:#5a6b7b;font-size:13px;margin:0 0 14px;}}
+  h2{{font-size:15px;color:#16263a;margin:22px 0 8px;border-bottom:1px solid #dce4ec;padding-bottom:4px;}}
+  table{{width:100%;border-collapse:collapse;font-size:13px;margin:8px 0;}}
+  td,th{{border:1px solid #dce4ec;padding:7px 10px;text-align:left;vertical-align:top;}}
+  th{{background:#f3f7fa;color:#16263a;font-weight:700;}}
+  .m7-meta td.k{{background:#f3f7fa;font-weight:600;width:32%;color:#374b5e;}}
+  .m7-check td.m7-opt{{width:90%;}} .m7-check td.m7-box{{text-align:center;font-size:17px;width:10%;}}
+  .m7-score th,.m7-score td{{text-align:center;}} .m7-score td:first-child,.m7-score th:first-child{{text-align:left;}}
+  .m7-score tr.tot td{{background:#16263a;color:#fff;font-weight:700;}}
+  .m7-desc{{color:#5a6b7b;font-size:12px;margin:4px 0;}}
+  .m7-narr{{font-size:13px;}} .m7-narr h2{{font-size:14px;border:none;margin:14px 0 4px;}}
+  .muted{{color:#8693a0;}}
+  @media print{{body{{padding:0;}}}}
+</style></head><body>
+  <div class="m7-band">Pariter Equity S.r.l. &middot; Fornitore di servizi di crowdfunding (ECSP) &middot; autorizz. CONSOB del. 23141/2024</div>
+  <span class="m7-mod">MODULO M7</span>
+  <h1>Fascicolo di valutazione CVOI</h1>
+  <p class="m7-sub">Documento unico trasmesso all'Advisory Committee &middot; integra gli esiti di verifica KIIS (M5, sez. 8) e scoring (M6, sez. 9), pi&ugrave; l'esito conflitti (sez. 7). Le sezioni 7 e 8 sono sempre obbligatorie.</p>
+  {sections}
+</body></html>"""
 
 
 def build_cvoi_html(practice, report_fields, criteria_scores):
@@ -4314,8 +4465,24 @@ def compose_decision_draft(practice, round_no, fields, cvoi, votes, extra_lines=
     return "\n".join(parts)
 
 
-def compose_advisory_draft(practice, fields, cvoi):
-    """Bozza editabile del parere Advisory, precompilata e fedele al template."""
+ADVISORY_MEMBER_VOTE_LABELS = {
+    "approvato": "Favorevole", "contrario": "Contrario",
+    "modifica_richiesta": "Modifica richiesta", "in_attesa": "Non ancora espresso",
+}
+
+
+def compose_advisory_draft(practice, fields, cvoi, member_votes=None):
+    """Bozza editabile del parere Advisory, precompilata e fedele al template.
+    member_votes: lista (nome, status, motivazione) riportata nella sezione 6-bis."""
+    votes_block = []
+    if member_votes:
+        votes_block = ["", "6-bis. Espressione dei singoli membri dell'Advisory Committee"]
+        for name, status, motiv in member_votes:
+            lbl = ADVISORY_MEMBER_VOTE_LABELS.get(status, status)
+            line = f"- {name}: {lbl}"
+            if motiv:
+                line += f" - motivazione: {motiv}"
+            votes_block.append(line)
     parts = [
         "ADVISORY COMMITTEE - PARERE NON VINCOLANTE AL CONSIGLIO DI AMMINISTRAZIONE",
         f"Progetto: {practice['project_title']}",
@@ -4345,6 +4512,7 @@ def compose_advisory_draft(practice, fields, cvoi):
          "Si raccomanda di condizionare l'eventuale pubblicazione all'acquisizione integrale della documentazione richiesta "
          "e, in particolare, all'invio del casellario giudiziale di tutti i membri dell'organo amministrativo del Proponente."),
         (fields.get("conditions") or ""),
+        *votes_block,
         "",
         "7. Conclusione",
         ("Il presente parere e' reso in forma non vincolante e viene trasmesso al CdA unitamente al fascicolo di valutazione "
@@ -5949,7 +6117,7 @@ document.querySelectorAll('[data-campaign-form]').forEach((form) => {
     def get_practice(self, practice_id):
         return row("SELECT * FROM practices WHERE id = ?", (practice_id,))
 
-    def recall_documents_html(self, ctx, practice, origins, title="Documenti richiamati per la valutazione"):
+    def recall_documents_html(self, ctx, practice, origins, title="Documenti richiamati per la valutazione", accordion=False):
         placeholders = ",".join("?" for _ in origins)
         docs = rows(
             f"SELECT * FROM documents WHERE practice_id = ? AND origin IN ({placeholders}) ORDER BY id",
@@ -5964,6 +6132,10 @@ document.querySelectorAll('[data-campaign-form]').forEach((form) => {
                 for d in docs
             )
             body = f'<ul class="clean-list">{items}</ul>'
+        if accordion:
+            # Tendina espandibile: fascicolo + documenti richiamati tutti insieme, senza occupare spazio.
+            return (f'<section class="panel"><details class="accordion-doc">'
+                    f'<summary>{esc(title)} ({len(docs)})</summary>{body}</details></section>')
         return f'<section class="panel"><div class="section-head"><h2>{esc(title)}</h2></div>{body}</section>'
 
     def render_practice_shell(self, ctx, practice, active_fase, inner):
@@ -6197,20 +6369,50 @@ document.querySelectorAll('[data-campaign-form]').forEach((form) => {
                     section = gate_block("Fascicolo di valutazione (M7)", "scoring",
                                          ["la scheda di scoring (M6) non e' completa: tutti i valutatori devono validare (salvo astensioni), min. 2"])
                 else:
-                    section = (self.recall_documents_html(
-                                   ctx, practice, ["CVOI", "KIIS", "Verifiche interne"],
-                                   "Documenti richiamati (3.1 verifiche M5 e 3.2 scoring M6)")
-                               + self.render_fascicolo_m7(ctx, practice))
+                    # I documenti richiamati (a tendina) sono dentro render_fascicolo_m7, niente duplicati.
+                    section = self.render_fascicolo_m7(ctx, practice)
             body = subnav + section
         elif fase == "fase4":
             # Sessione dedicata Advisory Committee: esamina CVOI + bozza KIIS e rende il parere non vincolante.
-            body = (self.recall_documents_html(ctx, practice, ["CVOI", "KIIS", "Verifiche interne"],
-                                               "Fascicolo per l'Advisory Committee (CVOI, bozza KIIS, verifiche)")
-                    + self.practice_tab_advisory(ctx, practice))
+            # Il fascicolo/documenti richiamati sono dentro practice_tab_advisory (a tendina), niente duplicati.
+            body = self.practice_tab_advisory(ctx, practice)
         elif fase == "fase5":
-            # Relazione conflitti d'interesse (ultimo presidio) -> convocazione/delibera/verbale CdA.
-            body = (self.render_internal_reviews(ctx, practice, ["conflitti"])
-                    + self.practice_tab_decision(ctx, practice, 1))
+            # Fase 5 divisa: 5.1 sessione dedicata alla relazione di insussistenza conflitti (M9),
+            # redatta/validata/firmata dal Responsabile dei controlli; 5.2 convocazione e delibera
+            # CdA, sbloccata SOLO a M9 validata (l'intero fascicolo passa al CdA per la convocazione).
+            subs5 = [
+                ("conflitti", "5.1 Relazione insussistenza conflitti (M9)"),
+                ("cda", "5.2 Convocazione e delibera CdA"),
+            ]
+            sub = self.get_query_param("sub") or "conflitti"
+            if sub not in {s[0] for s in subs5}:
+                sub = "conflitti"
+            subnav = '<div class="subtabs">' + "".join(
+                f'<a class="subtab {"active" if k == sub else ""}" href="{rel_url("/pariter/practices/" + str(practice["id"]), ctx, {"fase": "fase5", "sub": k})}">{esc(t)}</a>'
+                for k, t in subs5) + '</div>'
+            m9 = row("SELECT review_status FROM internal_reviews WHERE practice_id = ? AND review_type = 'conflitti'", (practice["id"],))
+            m9_ok = bool(m9 and m9["review_status"] == "validata")
+            cda_url = rel_url("/pariter/practices/" + str(practice["id"]), ctx, {"fase": "fase5", "sub": "cda"})
+            m9_url = rel_url("/pariter/practices/" + str(practice["id"]), ctx, {"fase": "fase5", "sub": "conflitti"})
+            if sub == "conflitti":
+                intro = ('<section class="panel"><p class="eyebrow">5.1 Relazione insussistenza conflitti (M9)</p>'
+                         '<p class="muted">Il Responsabile delle funzioni di controllo redige, firma e valida la relazione '
+                         'di insussistenza dei conflitti (M9). Solo a relazione <strong>validata e firmata</strong> si sblocca '
+                         'la convocazione del CdA (5.2), a cui passa l\'intero fascicolo.</p></section>')
+                section = intro + self.render_internal_reviews(ctx, practice, ["conflitti"])
+                if m9_ok:
+                    section += (f'<section class="panel"><p><span class="badge success">&check; M9 validata e firmata</span> '
+                                f'Il fascicolo puo\' passare al CdA. <a class="button tiny primary" href="{cda_url}">Vai alla convocazione del CdA (5.2)</a></p></section>')
+            else:  # 5.2 CdA
+                if not m9_ok:
+                    section = (f'<section class="panel"><div class="section-head"><h2>Convocazione e delibera CdA</h2>'
+                               f'<span class="badge warning">Bloccato</span></div>'
+                               f'<p class="muted">Per convocare il CdA serve prima la <strong>relazione di insussistenza '
+                               f'conflitti (M9) validata e firmata</strong> (sessione 5.1).</p>'
+                               f'<a class="button tiny" href="{m9_url}">Vai a 5.1 - Relazione conflitti (M9)</a></section>')
+                else:
+                    section = self.practice_tab_decision(ctx, practice, 1)
+            body = subnav + section
         elif fase == "fase6":
             nr = practice["pratica_no"] if "pratica_no" in practice.keys() else ""
             ident = offer_identifier(practice)
@@ -7344,13 +7546,30 @@ document.querySelectorAll('[data-campaign-form]').forEach((form) => {
         dl = (f'<a class="button tiny" href="{rel_url("/documents/" + str(report["generated_document_id"]) + "/download", ctx)}">Apri scheda M6</a>'
               if report and report["generated_document_id"] else "")
         if c["all_done"]:
-            genera = ""
-            if not locked:
-                genera = (f'<form method="post" action="/pariter/practices/{pid}/cvoi" style="display:inline">'
-                          f'{hidden_ctx(ctx)}<input type="hidden" name="action" value="genera">'
-                          f'<button class="button primary" type="submit">Metti agli atti (genera scheda M6)</button></form>')
+            already_atti = bool(report and report["generated_document_id"])
             avanti = f'<a class="button tiny" href="{rel_url("/pariter/practices/" + str(pid), ctx, {"fase": "fase3", "sub": "fascicolo"})}">Vai a 3.3 - Fascicolo (M7)</a>'
-            completa = f"""
+            if already_atti:
+                # La scheda M6 e' gia' agli atti: non si rigenera, si segnala lo stato e si puo'
+                # rimuoverla dagli atti per modificare i punteggi e poi rigenerarla.
+                rimuovi = ""
+                if not locked:
+                    rimuovi = (f'<form method="post" action="/pariter/practices/{pid}/cvoi" style="display:inline" '
+                               f'onsubmit="return confirm(\'Rimuovere la scheda M6 dagli atti per poterla modificare? Il documento generato verra\\\' eliminato e potrai rigenerarlo.\')">'
+                               f'{hidden_ctx(ctx)}<input type="hidden" name="action" value="rimuovi_atti">'
+                               f'<button class="button secondary" type="submit">Rimuovi dagli atti (per modificare)</button></form>')
+                completa = f"""
+<section class="panel">
+  <div class="section-head"><h2>Scheda di valutazione completa</h2><span class="badge success">&check; Gia' agli atti</span></div>
+  <p>La scheda di scoring (M6) e' <strong>gia' agli atti</strong>. Puoi aprirla; per modificare i punteggi rimuovila prima dagli atti, poi potrai rigenerarla.</p>
+  <div class="form-actions">{dl} {rimuovi} {avanti}</div>
+</section>"""
+            else:
+                genera = ""
+                if not locked:
+                    genera = (f'<form method="post" action="/pariter/practices/{pid}/cvoi" style="display:inline">'
+                              f'{hidden_ctx(ctx)}<input type="hidden" name="action" value="genera">'
+                              f'<button class="button primary" type="submit">Metti agli atti (genera scheda M6)</button></form>')
+                completa = f"""
 <section class="panel">
   <div class="section-head"><h2>Scheda di valutazione completa</h2><span class="badge success">fatto &times;{c["n_confirmed"]}</span></div>
   <p>Tutti i valutatori hanno validato (salvo astensioni). La scheda M6 e' completa: mettila agli atti e prosegui alla redazione del fascicolo (M7), che sara' firmato e trasmesso all'Advisory.</p>
@@ -7616,6 +7835,21 @@ document.querySelectorAll('[data-campaign-form]').forEach((form) => {
   {gate}
 </section>"""
 
+    def verdict_box(self, ok, big_text, sub=""):
+        """Riquadro grafico di verdetto: verde con spunta se ok, rosso con croce se bocciato."""
+        cls = "ok" if ok else "ko"
+        mark = "&#10003;" if ok else "&#10007;"
+        sub_html = f'<span class="verdict-sub">{esc(sub)}</span>' if sub else ""
+        return (f'<div class="verdict-box {cls}"><span class="verdict-mark">{mark}</span>'
+                f'<span class="verdict-text">{esc(big_text)}</span>{sub_html}</div>')
+
+    def dash_metric(self, label, value, ok, extra=""):
+        """Metrica con pallino di stato (verde/rosso) per le dashboard di sintesi."""
+        dot = "ok" if ok else "ko"
+        extra_html = f' &middot; <span class="muted">{esc(extra)}</span>' if extra else ""
+        return (f'<span class="muted">{esc(label)}</span><br>'
+                f'<span class="dash-dot {dot}"></span><strong>{esc(str(value))}</strong>{extra_html}')
+
     def render_fascicolo_m7(self, ctx, practice):
         """3.3: dashboard di recap + fascicolo M7 (genera/modifica/salva) + firma per ogni membro +
         invio all'Advisory (solo se idoneo) oppure comunicazione di non accoglimento (C6)."""
@@ -7625,6 +7859,7 @@ document.querySelectorAll('[data-campaign-form]').forEach((form) => {
         url = f"/pariter/practices/{pid}/internal-review"
         with connect() as conn:
             c = compute_cvoi_collegial(conn, practice)
+            cvoi_sum = cvoi_summary_for(conn, pid)
             fasc = conn.execute("SELECT * FROM internal_reviews WHERE practice_id = ? AND review_type = 'fascicolo'", (pid,)).fetchone()
             evals = cvoi_committee_members(conn)
             sigs = {r["member_id"]: r["signed_at"] for r in
@@ -7636,18 +7871,53 @@ document.querySelectorAll('[data-campaign-form]').forEach((form) => {
         kc_lbl = KIIS_COERENZA_LABELS.get(_practice_val(practice, "m_kiis_coerenza"), "non verificata")
         cf_lbl = CONFLITTI_MERITO_LABELS.get(_practice_val(practice, "m_conflitti"), "non valutato")
 
-        # --- Dashboard recap ---
+        # --- Recap (stile "aree valutate": barre 0-5 per area + soglia + durata) ---
+        area_cards = ""
+        raw_total = 0
+        for (label, raw, mx, w, wm), (k, _l, _w, _mx, thr) in zip((cvoi_sum["areas"] if cvoi_sum else []), CVOI_AREAS):
+            raw_total += raw
+            ncrit = len(CVOI_CRITERIA.get(k, [])) or 1
+            avg5 = raw / ncrit  # media dei criteri (0-5), come le barre dell'immagine
+            on = int(round(avg5))
+            area_min_ok = raw >= thr
+            segs = "".join(f'<span class="seg{" on" if i < on else ""}"></span>' for i in range(5))
+            area_cards += f"""
+    <div class="area-card">
+      <div class="area-name">{esc(label)}</div>
+      <div class="score-bar">{segs}</div>
+      <div class="area-foot"><span class="dash-dot {"ok" if area_min_ok else "ko"}"></span>{raw:g}/{int(mx)} &middot; min {int(thr)} &middot; punteggio 0-5</div>
+    </div>"""
+        if not area_cards:
+            area_cards = '<p class="muted">Scoring (M6) non ancora disponibile.</p>'
+        verdict = self.verdict_box(esito_pos, "IDONEO" if esito_pos else "NON IDONEO", esito_lbl)
+        total_max = int(sum(a[3] for a in CVOI_AREAS))
         dash = f"""
 <section class="panel">
-  <div class="section-head"><h2>3.3 Fascicolo di valutazione (M7) - recap</h2>
-    <span class="badge {badge_class(esito_lbl)}">{esc(esito_lbl)}</span></div>
-  <div class="meta-grid">
-    <div><span class="muted">Scoring CVOI (M6)</span><br><strong>{c['weighted']:g}</strong>/{CVOI_OVERALL_THRESHOLD:g} &middot; {c['n_confirmed']} validati</div>
-    <div><span class="muted">Verifica KIIS (M5)</span><br>{esc(kc_lbl)}</div>
-    <div><span class="muted">Conflitti</span><br>{esc(cf_lbl)}</div>
-    <div><span class="muted">Documenti richiamati</span><br>{ndocs}</div>
+  <div class="section-head"><h2>3.3 Fascicolo di valutazione (M7) - recap</h2>{verdict}</div>
+  <p class="eyebrow">Le aree valutate</p>
+  <div class="areas-grid">{area_cards}</div>
+  <div class="recap-cards">
+    <div class="soglia-card">
+      <span class="rc-label">Soglia di superamento</span>
+      <span class="rc-big">&ge; {CVOI_OVERALL_THRESHOLD:g}</span>
+      <span class="rc-sub">media ponderata attuale <strong>{c['weighted']:g}</strong> &middot; grezzo {raw_total:g}/{total_max} (soglia 57/95), con il <strong>minimo richiesto in ciascuna area</strong>.</span>
+    </div>
+    <div class="durata-card">
+      <span class="rc-label">Durata complessiva</span>
+      <span class="rc-big dark">30 giorni</span>
+      <span class="rc-sub">dalla ricezione della documentazione completa.</span>
+    </div>
+    <div class="durata-card">
+      <span class="rc-label">Verifiche di merito</span>
+      <span class="rc-sub" style="margin-top:8px">{self.dash_metric("Verifica KIIS (M5)", kc_lbl, _practice_val(practice, "m_kiis_coerenza") == "coerente")}</span>
+      <span class="rc-sub" style="margin-top:6px">{self.dash_metric("Conflitti", cf_lbl, _practice_val(practice, "m_conflitti") in ("nessuno", "gestibile"))}</span>
+    </div>
   </div>
 </section>"""
+        # Documenti richiamati: tendina espandibile (fascicolo M5/M6 + verifiche), niente duplicati.
+        recall = self.recall_documents_html(
+            ctx, practice, ["CVOI", "KIIS", "Verifiche interne"],
+            "Documenti richiamati (3.1 verifiche M5, 3.2 scoring M6, bozza KIIS)", accordion=True)
 
         # --- Documento M7: genera (IA) / modifica / salva / scarica ---
         has_doc = bool(fasc and (fasc["body"] or fasc["generated_document_id"]))
@@ -7659,20 +7929,21 @@ document.querySelectorAll('[data-campaign-form]').forEach((form) => {
         elif not has_doc:
             docpanel = f"""
 <section class="panel">
-  <div class="section-head"><h2>Documento M7</h2><span class="badge neutral">Da generare</span></div>
-  <p class="muted">Genera la bozza descrittiva (IA) a 8 sezioni dai dati di 3.1 e 3.2, poi modificala e falla firmare ai membri.</p>
+  <div class="section-head"><h2>Documento M7 (modello ufficiale)</h2><span class="badge neutral">Da generare</span></div>
+  <p class="muted">Genera il fascicolo M7 nel modello ufficiale (PDF stampabile): intestazione, identificazione, sezioni narrative 1-6, esiti conflitti (7), KIIS (8) e scoring (9) auto-compilati dai dati, allegati e firme. Poi modifica la parte narrativa e fai firmare i membri.</p>
   <form method="post" action="{url}" style="display:inline">{hidden_ctx(ctx)}<input type="hidden" name="review_type" value="fascicolo"><input type="hidden" name="action" value="generate">
-    <button class="button primary" type="submit">Genera bozza M7 (IA)</button></form>
+    <button class="button primary" type="submit">Genera fascicolo M7 (modello ufficiale)</button></form>
 </section>"""
         else:
             body_val = esc(fasc["body"] or compose_internal_review_draft(practice, "fascicolo"))
             docpanel = f"""
 <section class="panel">
-  <div class="section-head"><h2>Documento M7</h2><span class="badge warning">Bozza modificabile</span></div>
+  <div class="section-head"><h2>Documento M7 (modello ufficiale)</h2><span class="badge warning">Bozza modificabile</span></div>
+  <p class="muted">Modifica le sezioni narrative (1-6 e note); esiti conflitti/KIIS/scoring (7-9) e firme sono inseriti automaticamente dal modello. <strong>Salva</strong> per rigenerare il PDF M7 aggiornato (incluse le firme gia' apposte). <strong>Scarica</strong> apre il modello ufficiale.</p>
   <form class="form-grid" method="post" action="{url}">
     {hidden_ctx(ctx)}<input type="hidden" name="review_type" value="fascicolo"><input type="hidden" name="action" value="save_body">
-    <label class="full-span">Testo del fascicolo (modificabile)<textarea name="body" rows="14" class="doc-draft">{body_val}</textarea></label>
-    <div class="form-actions left"><button class="button secondary" type="submit">Salva</button>{dl}</div>
+    <label class="full-span">Sezioni narrative del fascicolo (modificabili)<textarea name="body" rows="16" class="doc-draft">{body_val}</textarea></label>
+    <div class="form-actions left"><button class="button primary" type="submit">Salva e rigenera M7 (PDF)</button>{dl}</div>
   </form>
 </section>"""
 
@@ -7735,7 +8006,8 @@ document.querySelectorAll('[data-campaign-form]').forEach((form) => {
   <p class="muted">Lo scoring e' sotto soglia: non si trasmette all'Advisory.</p>
   <div class="form-actions"><button class="button primary" disabled>Invia all'Advisory Committee</button></div>
 </section>{c6}"""
-        return dash + docpanel + sigpanel + trasmpanel
+        # Ordine richiesto: recap -> documenti richiamati (tendina) -> firme -> generazione M7 -> trasmissione.
+        return dash + recall + sigpanel + docpanel + trasmpanel
 
     def render_trasmissione_advisory(self, ctx, practice):
         """3.3: trasmissione del fascicolo (CVOI + tabella + bozza KIIS) all'Advisory Committee."""
@@ -8053,8 +8325,34 @@ document.querySelectorAll('[data-campaign-form]').forEach((form) => {
             locked = not cvoi_is_validated(conn, pid)
             advisory = conn.execute("SELECT * FROM advisory_opinions WHERE practice_id = ? ORDER BY id DESC LIMIT 1", (pid,)).fetchone()
             cvoi = cvoi_summary_for(conn, pid)
-        recall = self.recall_documents_html(ctx, practice, ["CVOI", "Verifiche interne"],
-                                            "Documenti richiamati per il parere")
+        # Fascicolo CVOI + bozza KIIS + verifiche in un'unica tendina espandibile (niente duplicati sotto).
+        recall = self.recall_documents_html(ctx, practice, ["CVOI", "KIIS", "Verifiche interne"],
+                                            "Fascicolo e documenti richiamati per il parere", accordion=True)
+        # Dashboard di sintesi a colpo d'occhio (esito CVOI + scoring/KIIS/conflitti + parere reso).
+        if cvoi:
+            esito = cvoi["outcome"]
+            pos = esito in ("superato", "superato_condizioni")
+            sopra = (cvoi["weighted"] or 0) >= CVOI_OVERALL_THRESHOLD
+            kc_ok = _practice_val(practice, "m_kiis_coerenza") == "coerente"
+            cf_ok = _practice_val(practice, "m_conflitti") in ("nessuno", "gestibile")
+            adv_lbl = ADVISORY_OUTCOME_LABELS.get(advisory["outcome"], advisory["outcome"]) if advisory else "non ancora reso"
+            verdict = self.verdict_box(pos, "IDONEO" if pos else "NON IDONEO", CVOI_OUTCOME_LABELS.get(esito, esito))
+            dash = f"""
+<section class="panel">
+  <div class="section-head"><h2>Sintesi per l'Advisory Committee</h2></div>
+  <div class="dash-verdict">
+    {verdict}
+    <div class="meta-grid" style="flex:1">
+      <div>{self.dash_metric("Scoring CVOI (M6)", f"{cvoi['weighted']:g}/{CVOI_OVERALL_THRESHOLD:g}", sopra)}</div>
+      <div>{self.dash_metric("Verifica KIIS (M5)", KIIS_COERENZA_LABELS.get(_practice_val(practice, 'm_kiis_coerenza'), 'non verificata'), kc_ok)}</div>
+      <div>{self.dash_metric("Conflitti", CONFLITTI_MERITO_LABELS.get(_practice_val(practice, 'm_conflitti'), 'non valutato'), cf_ok)}</div>
+      <div><span class="muted">Parere Advisory</span><br><strong>{esc(adv_lbl)}</strong></div>
+    </div>
+  </div>
+</section>"""
+        else:
+            dash = '<section class="panel"><div class="section-head"><h2>Sintesi per l\'Advisory Committee</h2></div><p class="muted">Sintesi CVOI non ancora disponibile.</p></section>'
+        recall = dash + recall
         if locked and not advisory:
             return recall + '<section class="panel"><div class="section-head"><h2>Advisory Committee</h2></div><p class="muted">L\'Advisory Committee interviene dopo la valutazione CVOI (versione unanime) e prima dell\'unica delibera del CdA.</p></section>'
         summary_panel = ""
@@ -8083,17 +8381,44 @@ document.querySelectorAll('[data-campaign-form]').forEach((form) => {
                 "conditions": advisory["conditions"] if advisory else "",
                 "outcome": advisory["outcome"] if advisory else "favorevole",
             }
-            parere_draft = compose_advisory_draft(practice, df, cvoi)
+            # Voti e motivazioni dei membri (riportati nel parere): solo se gia' espressi.
+            member_votes = []
+            if advisory:
+                member_votes = [
+                    (r["member_name"], r["status"], (r["comment"] if "comment" in r.keys() else "") or "")
+                    for r in rows("SELECT member_name, status, comment FROM advisory_member_reviews WHERE advisory_opinion_id = ? ORDER BY id", (advisory["id"],))
+                ]
+            # Prefill: bozza salvata se presente, altrimenti modello precompilato (con voti membri).
+            saved_draft = (advisory["draft_body"] if (advisory and "draft_body" in advisory.keys()) else "") or ""
+            parere_draft = saved_draft or compose_advisory_draft(practice, df, cvoi, member_votes)
+            # Documento ufficiale generato: resta con icona + descrizione, pronto da aprire, con rimozione.
+            gen_panel = ""
+            if advisory and advisory["generated_document_id"]:
+                gen_panel = f"""
+  <div class="generated-file">
+    <span class="file-ico">&#128196;</span>
+    <span class="file-desc"><strong>Parere Advisory Committee (M8)</strong><br>
+      <span class="muted">Documento ufficiale generato come da modello, pronto per la firma dei membri.</span></span>
+    <a class="button tiny" href="{rel_url("/documents/" + str(advisory["generated_document_id"]) + "/download", ctx)}">Apri</a>
+    <form method="post" action="/pariter/practices/{pid}/advisory" style="display:inline" onsubmit="return confirm('Rimuovere il documento generato? La bozza resta modificabile e potrai rigenerarla.')">
+      {hidden_ctx(ctx)}<input type="hidden" name="action" value="remove_doc">
+      <button class="button tiny" type="submit">Rimuovi generazione</button></form>
+  </div>"""
+            gen_label = "Rigenera parere ufficiale (M8)" if (advisory and advisory["generated_document_id"]) else "Genera parere ufficiale (M8)"
             draft_form = f"""
 <section class="panel">
   <div class="section-head"><h2>Redazione parere (non vincolante)</h2></div>
+  {gen_panel}
   <form class="form-grid" method="post" action="/pariter/practices/{pid}/advisory">
-    {hidden_ctx(ctx)}<input type="hidden" name="action" value="save">
+    {hidden_ctx(ctx)}
     <label>Data seduta<input name="meeting_date" type="date" value="{esc(advisory['meeting_date']) if advisory else ''}"></label>
     <label>Componenti<input name="attendees" value="{esc(advisory['attendees']) if advisory else ''}"></label>
     <label>Esito<select name="outcome">{outcome_opts}</select></label>
-    <label class="span2">Bozza parere (precompilata, modificabile prima di generare)<textarea name="parere_text" rows="18" class="doc-draft">{esc(parere_draft)}</textarea></label>
-    <div class="form-actions"><button class="button primary" type="submit">{'Rigenera parere' if advisory else 'Genera parere ufficiale'}</button></div>
+    <label class="span2">Bozza parere (modificabile; si puo' salvare senza generare)<textarea name="parere_text" rows="18" class="doc-draft">{esc(parere_draft)}</textarea></label>
+    <div class="form-actions left">
+      <button class="button secondary" type="submit" name="action" value="save_draft">Salva bozza</button>
+      <button class="button primary" type="submit" name="action" value="save">{gen_label}</button>
+    </div>
   </form>
 </section>"""
         members_panel = self.advisory_members_panel(ctx, practice, advisory) if advisory else ""
@@ -8110,16 +8435,20 @@ document.querySelectorAll('[data-campaign-form]').forEach((form) => {
             rv = reviews.get(m["id"])
             status = rv["status"] if rv else "in_attesa"
             signed = rv["signed_at"] if rv else ""
+            motiv = (rv["comment"] if (rv and "comment" in rv.keys()) else "") or ""
             can_act = (m["id"] == ctx["user_id"]) or is_admin
             badge = {"approvato": "success", "contrario": "danger", "modifica_richiesta": "warning"}.get(status, "neutral")
-            actions = ""
+            # Un'unica form per membro: motivazione (facoltativa) + i tre pulsanti di voto.
             if can_act and (not unanime or is_admin):
-                actions = "".join(
-                    f'''<form method="post" action="/pariter/practices/{pid}/advisory-member" class="inline-form" style="display:inline">
-                      {hidden_ctx(ctx)}<input type="hidden" name="member_id" value="{m['id']}"><input type="hidden" name="action" value="{ak}">
-                      <button class="button tiny" type="submit">{al}</button></form>'''
+                actions = f'''<form method="post" action="/pariter/practices/{pid}/advisory-member" class="member-vote-form">
+                  {hidden_ctx(ctx)}<input type="hidden" name="member_id" value="{m['id']}">
+                  <input type="text" name="comment" value="{esc(motiv)}" placeholder="Motivazione (facoltativa)">
+                  <div class="form-actions left" style="margin-top:4px">''' + "".join(
+                    f'<button class="button tiny{" primary" if ak == "sign" else ""}" type="submit" name="action" value="{ak}">{al}</button>'
                     for ak, al in (("sign", "Favorevole"), ("contrario", "Contrario"), ("request_change", "Modifica"))
-                )
+                ) + '</div></form>'
+            else:
+                actions = f'<span class="muted">{esc(motiv)}</span>' if motiv else ""
             rows_html += f"""<tr><td>{esc(m['name'])}</td><td><span class="badge {badge}">{esc(status.replace('_',' '))}</span></td><td class="muted">{esc((signed or '')[:16]) or '-'}</td><td>{actions}</td></tr>"""
         force = ""
         if is_admin and not unanime:
@@ -8130,9 +8459,9 @@ document.querySelectorAll('[data-campaign-form]').forEach((form) => {
         return f"""
 <section class="panel">
   <div class="section-head"><h2>Advisory Committee - approvazioni e firme</h2>{head_badge}</div>
-  <table class="data-table compact"><thead><tr><th>Membro</th><th>Stato</th><th>Firmato il</th><th></th></tr></thead><tbody>{rows_html}</tbody></table>
+  <table class="data-table compact"><thead><tr><th>Membro</th><th>Stato</th><th>Firmato il</th><th>Motivazione e voto</th></tr></thead><tbody>{rows_html}</tbody></table>
   <div class="form-actions">{force}</div>
-  <p class="muted">Come il CVOI: un membro redige, gli altri firmano o chiedono modifica; con tutte le firme il parere e' unanime e abilita la delibera del CdA. Ogni modifica azzera le firme.</p>
+  <p class="muted">Ogni membro vota Favorevole/Contrario/Modifica e puo' aggiungere una motivazione (facoltativa): voto e motivazione vengono riportati nella redazione del parere. Con tutte le firme il parere e' unanime e abilita la delibera del CdA. Ogni modifica azzera le firme.</p>
 </section>"""
 
     def practice_tab_condizioni(self, ctx, practice):
@@ -9129,6 +9458,14 @@ document.querySelectorAll('[data-campaign-form]').forEach((form) => {
                 conn.execute("UPDATE cvoi_reports SET generated_document_id = ?, updated_at = ? WHERE id = ?",
                              (document_id, now, rid))
                 msg = "Scheda di scoring (M6) generata (non firmata)."
+            elif action == "rimuovi_atti":
+                rid, c = save_cvoi_collegial(conn, practice, ctx["user_id"])
+                rep = conn.execute("SELECT generated_document_id FROM cvoi_reports WHERE id = ?", (rid,)).fetchone()
+                doc_id = rep["generated_document_id"] if rep and rep["generated_document_id"] else None
+                conn.execute("UPDATE cvoi_reports SET generated_document_id = NULL, updated_at = ? WHERE id = ?", (now, rid))
+                if doc_id:
+                    conn.execute("DELETE FROM documents WHERE id = ?", (doc_id,))
+                msg = "Scheda M6 rimossa dagli atti: ora puoi modificare i punteggi e rigenerarla."
             else:
                 self.redirect(f"/pariter/practices/{practice_id}", ctx, "Azione non riconosciuta.", back); return
             conn.execute("UPDATE practices SET updated_at = ? WHERE id = ?", (now, practice_id))
@@ -9371,49 +9708,75 @@ document.querySelectorAll('[data-campaign-form]').forEach((form) => {
         practice = self._practice_guard(ctx, practice_id, "advisory", perm="advisory_opinion")
         if not practice:
             return
+        action = form.get("action", "save")
         outcome = form.get("outcome", "favorevole")
         fields = {k: form.get(k, "") for k in ("meeting_date", "attendees", "summary", "conditions")}
         fields["outcome"] = outcome
+        parere_text = (form.get("parere_text", "") or "").strip()
         now = now_iso()
         with connect() as conn:
             if not cvoi_is_validated(conn, practice_id):
                 self.redirect(f"/pariter/practices/{practice_id}", ctx, "Serve un Report CVOI in versione unanime prima del parere Advisory.", {"tab": "advisory"})
                 return
-            cvoi = cvoi_summary_for(conn, practice_id)
-            parere_text = form.get("parere_text", "").strip()
-            if parere_text:
-                html_doc = wrap_practice_doc("Advisory Committee - parere non vincolante", practice, parere_text)
-                fields["summary"] = "Parere redatto (vedi documento)."
-            else:
-                html_doc = build_advisory_html(practice, fields, cvoi)
-            document_id = generated_document(
-                conn, ctx["platform_id"], None, practice["proponent_id"],
-                "Advisory Committee", "parere", f"Parere Advisory Committee - {practice['project_title']}",
-                "parere_advisory.html", html_doc, ctx["user_id"],
-            )
-            link_document_practice(conn, document_id, practice_id)
-            existing = conn.execute("SELECT id FROM advisory_opinions WHERE practice_id = ? ORDER BY id DESC LIMIT 1", (practice_id,)).fetchone()
-            if existing:
-                conn.execute(
-                    """UPDATE advisory_opinions SET meeting_date = ?, attendees = ?, summary = ?, outcome = ?, conditions = ?,
-                       generated_document_id = ?, workflow_status = 'in_revisione', drafter_user_id = ? WHERE id = ?""",
-                    (fields["meeting_date"], fields["attendees"], fields["summary"], outcome, fields["conditions"],
-                     document_id, ctx["user_id"], existing["id"]),
-                )
-                conn.execute("DELETE FROM advisory_member_reviews WHERE advisory_opinion_id = ?", (existing["id"],))
-            else:
-                conn.execute(
-                    """INSERT INTO advisory_opinions(practice_id, meeting_date, attendees, agenda, summary, outcome, conditions, generated_document_id, workflow_status, drafter_user_id, created_by, created_at)
-                       VALUES (?, ?, ?, '', ?, ?, ?, ?, 'in_revisione', ?, ?, ?)""",
+            existing = conn.execute("SELECT * FROM advisory_opinions WHERE practice_id = ? ORDER BY id DESC LIMIT 1", (practice_id,)).fetchone()
+
+            def ensure_row():
+                """Crea/ritorna la riga advisory, senza generare il documento."""
+                if existing:
+                    return existing["id"]
+                cur = conn.execute(
+                    """INSERT INTO advisory_opinions(practice_id, meeting_date, attendees, agenda, summary, outcome, conditions, draft_body, workflow_status, drafter_user_id, created_by, created_at)
+                       VALUES (?, ?, ?, '', ?, ?, ?, ?, 'bozza', ?, ?, ?)""",
                     (practice_id, fields["meeting_date"], fields["attendees"], fields["summary"], outcome,
-                     fields["conditions"], document_id, ctx["user_id"], ctx["user_id"], now),
-                )
+                     fields["conditions"], parere_text, ctx["user_id"], ctx["user_id"], now))
+                return cur.lastrowid
+
+            if action == "remove_doc":
+                # Rimuove solo il documento ufficiale generato, conserva la bozza (draft_body).
+                if existing and existing["generated_document_id"]:
+                    conn.execute("DELETE FROM documents WHERE id = ?", (existing["generated_document_id"],))
+                    conn.execute("UPDATE advisory_opinions SET generated_document_id = NULL, workflow_status = 'bozza' WHERE id = ?", (existing["id"],))
+                    conn.execute("DELETE FROM advisory_member_reviews WHERE advisory_opinion_id = ?", (existing["id"],))
+                msg = "Generazione del parere rimossa: la bozza resta modificabile, potrai rigenerarla."
+            elif action == "save_draft":
+                # Salva la bozza senza generare il documento ufficiale.
+                aid = ensure_row()
+                conn.execute(
+                    "UPDATE advisory_opinions SET meeting_date = ?, attendees = ?, outcome = ?, conditions = ?, draft_body = ? WHERE id = ?",
+                    (fields["meeting_date"], fields["attendees"], outcome, fields["conditions"], parere_text, aid))
+                msg = "Bozza del parere salvata (non ancora generata)."
+            else:  # save -> genera il parere ufficiale (M8) come da modello
+                cvoi = cvoi_summary_for(conn, practice_id)
+                if parere_text:
+                    html_doc = wrap_practice_doc("Advisory Committee - parere non vincolante", practice, parere_text)
+                    fields["summary"] = "Parere redatto (vedi documento)."
+                else:
+                    html_doc = build_advisory_html(practice, fields, cvoi)
+                document_id = generated_document(
+                    conn, ctx["platform_id"], None, practice["proponent_id"],
+                    "Advisory Committee", "parere", f"Parere Advisory Committee - {practice['project_title']}",
+                    "parere_advisory.html", html_doc, ctx["user_id"])
+                link_document_practice(conn, document_id, practice_id)
+                if existing:
+                    conn.execute(
+                        """UPDATE advisory_opinions SET meeting_date = ?, attendees = ?, summary = ?, outcome = ?, conditions = ?,
+                           draft_body = ?, generated_document_id = ?, workflow_status = 'in_revisione', drafter_user_id = ? WHERE id = ?""",
+                        (fields["meeting_date"], fields["attendees"], fields["summary"], outcome, fields["conditions"],
+                         parere_text, document_id, ctx["user_id"], existing["id"]))
+                    conn.execute("DELETE FROM advisory_member_reviews WHERE advisory_opinion_id = ?", (existing["id"],))
+                else:
+                    conn.execute(
+                        """INSERT INTO advisory_opinions(practice_id, meeting_date, attendees, agenda, summary, outcome, conditions, draft_body, generated_document_id, workflow_status, drafter_user_id, created_by, created_at)
+                           VALUES (?, ?, ?, '', ?, ?, ?, ?, ?, 'in_revisione', ?, ?, ?)""",
+                        (practice_id, fields["meeting_date"], fields["attendees"], fields["summary"], outcome,
+                         fields["conditions"], parere_text, document_id, ctx["user_id"], ctx["user_id"], now))
+                msg = "Parere Advisory generato (M8). Ora i membri votano/firmano per l'unanimita'."
             if PRACTICE_STATUS_INDEX.get(practice["status"], 0) < PRACTICE_STATUS_INDEX["in_advisory"]:
                 set_practice_status(conn, practice, "in_advisory", ctx["user_id"], "Parere Advisory in redazione")
             else:
                 conn.execute("UPDATE practices SET updated_at = ? WHERE id = ?", (now, practice_id))
             conn.commit()
-        self.redirect(f"/pariter/practices/{practice_id}", ctx, "Parere Advisory redatto. Ora i membri firmano per l'unanimita'.", {"tab": "advisory"})
+        self.redirect(f"/pariter/practices/{practice_id}", ctx, msg, {"tab": "advisory"})
 
     def post_practice_advisory_member(self, practice_id, form):
         ctx = self.ctx_from_form(form)
@@ -9437,15 +9800,21 @@ document.querySelectorAll('[data-campaign-form]').forEach((form) => {
                 return
             aid = advisory["id"]
 
-            def upsert(member_id, member_name, status, signed):
-                updated = conn.execute(
-                    "UPDATE advisory_member_reviews SET status = ?, signed_at = ?, member_name = ?, updated_at = ? WHERE advisory_opinion_id = ? AND user_id = ?",
-                    (status, signed, member_name, now, aid, member_id),
-                ).rowcount
+            def upsert(member_id, member_name, status, signed, comment=None):
+                if comment is None:
+                    updated = conn.execute(
+                        "UPDATE advisory_member_reviews SET status = ?, signed_at = ?, member_name = ?, updated_at = ? WHERE advisory_opinion_id = ? AND user_id = ?",
+                        (status, signed, member_name, now, aid, member_id),
+                    ).rowcount
+                else:
+                    updated = conn.execute(
+                        "UPDATE advisory_member_reviews SET status = ?, signed_at = ?, member_name = ?, comment = ?, updated_at = ? WHERE advisory_opinion_id = ? AND user_id = ?",
+                        (status, signed, member_name, comment, now, aid, member_id),
+                    ).rowcount
                 if not updated:
                     conn.execute(
-                        "INSERT INTO advisory_member_reviews(advisory_opinion_id, user_id, member_name, status, signed_at, updated_at) VALUES (?, ?, ?, ?, ?, ?)",
-                        (aid, member_id, member_name, status, signed, now),
+                        "INSERT INTO advisory_member_reviews(advisory_opinion_id, user_id, member_name, status, comment, signed_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                        (aid, member_id, member_name, status, comment or "", signed, now),
                     )
 
             if action == "force_unanime":
@@ -9463,7 +9832,8 @@ document.querySelectorAll('[data-campaign-form]').forEach((form) => {
                     return
                 m = conn.execute("SELECT name FROM users WHERE id = ?", (member_id,)).fetchone()
                 new_status = {"sign": "approvato", "contrario": "contrario"}.get(action, "modifica_richiesta")
-                upsert(member_id, m["name"] if m else "", new_status, now if action == "sign" else "")
+                comment = (form.get("comment") or "").strip()
+                upsert(member_id, m["name"] if m else "", new_status, now if action == "sign" else "", comment)
                 became_unanime = recompute_advisory_unanime(conn, aid)
             if became_unanime and PRACTICE_STATUS_INDEX.get(practice["status"], 0) < PRACTICE_STATUS_INDEX["advisory_ricevuto"]:
                 set_practice_status(conn, practice, "advisory_ricevuto", ctx["user_id"], "Parere Advisory unanime: delibera CdA sbloccata")
