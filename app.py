@@ -3868,7 +3868,9 @@ def fascicolo_completezza(conn, practice):
     fascicolo_completo = (not missing_sempre) and bilanci_completi
     integrazione = list(missing_sempre)
     if bil_dovuti is not None and bil_pres < bil_dovuti:
-        integrazione.append(f"Bilanci depositati: {bil_pres} su {bil_dovuti} dovuti")
+        manca = bil_dovuti - bil_pres
+        integrazione.append(
+            f"Ultimi {bil_dovuti} bilanci depositati (manca{'no' if manca != 1 else ''} {manca} di {bil_dovuti})")
     return {
         "sempre": sempre, "missing_sempre": missing_sempre, "condizionati": cond,
         "esercizi": esercizi, "esercizi_set": esercizi is not None,
@@ -5498,11 +5500,11 @@ document.querySelectorAll('[data-campaign-form]').forEach((form) => {
         if practices:
             body_rows = "".join(
                 f"""<tr>
-                  <td><a href="{rel_url('/pariter/practices/' + str(pr['id']), ctx, {'tab': 'cvoi'})}"><strong>{esc(pr['project_title'])}</strong></a></td>
+                  <td><a href="{rel_url('/pariter/practices/' + str(pr['id']), ctx, {'fase': 'fase3', 'sub': 'scoring'})}"><strong>{esc(pr['project_title'])}</strong></a></td>
                   <td>{esc(pr['proponent_name'] or '-')}</td>
                   <td><span class="badge {badge_class(practice_status_label(pr['status']))}">{esc(practice_status_label(pr['status']))}</span></td>
                   <td>{esc((pr['cvoi_status'] or 'da redigere'))}{(' &middot; ' + format(pr['cvoi_score'], 'g')) if pr['cvoi_score'] else ''}</td>
-                  <td><a class="button tiny" href="{rel_url('/pariter/practices/' + str(pr['id']), ctx, {'tab': 'cvoi'})}">Apri CVOI</a>
+                  <td><a class="button tiny" href="{rel_url('/pariter/practices/' + str(pr['id']), ctx, {'fase': 'fase3', 'sub': 'scoring'})}">Apri CVOI</a>
                       <a class="button tiny" href="{rel_url('/pariter/practices/' + str(pr['id']), ctx, {'tab': 'documentale'})}">Dossier</a></td>
                 </tr>"""
                 for pr in practices
@@ -5874,7 +5876,8 @@ document.querySelectorAll('[data-campaign-form]').forEach((form) => {
                       "La verifica documentale positiva (C4) si invia solo al punto 2.3.",
                 back_sub=sub)
             if sub == "completezza":
-                section = (self.render_docs_block(
+                section = (self.render_onorabilita_config(ctx, practice)
+                           + self.render_docs_block(
                                 ctx, practice, ["fase1", "fase2"],
                                 "Istruttoria documentale (completezza e regolarita')",
                                 intro="I 9 documenti di candidatura sono richiamati dalla fase precedente; si aggiungono le dichiarazioni "
@@ -5887,14 +5890,37 @@ document.querySelectorAll('[data-campaign-form]').forEach((form) => {
                            + self.practice_onorabilita_panel(ctx, practice)
                            + self.render_internal_reviews(ctx, practice, ["aml_art5"])
                            + comms_amm)
-            else:
-                section = self.render_validazione_ammissibilita(ctx, practice)
+            else:  # 2.3 validazione: recap documentale + esito positivo (C4) o negativo (C6)
+                section = (self.render_docs_block(
+                                ctx, practice, ["fase1", "fase2"],
+                                "Recap documentale acquisito",
+                                intro="Riepilogo di tutta la documentazione del fascicolo con lo stato/flag di verifica. "
+                                      "Da qui si invia l'esito: positivo (C4, avvia il CVOI) oppure non ammissibilita' (C6).")
+                           + self.render_validazione_ammissibilita(ctx, practice)
+                           + self.phase_emails_html(ctx, practice, ["C6"], "fase2",
+                                                    title="Esito negativo - non ammissibilita' (C6)",
+                                                    intro="Se l'ammissibilita' non e' superata (es. limite 5M non riducibile, requisiti art. 5 non soddisfatti), invia qui la comunicazione di non ammissibilita'.",
+                                                    back_sub="validazione"))
             body = subnav + sec_head + section
         elif fase == "fase3":
-            body = (self.render_full_dossier(ctx, practice)
-                    + self.practice_tab_cvoi(ctx, practice)
-                    + self.render_internal_reviews(ctx, practice, ["coerenza_kiis"])
-                    + self.render_kiis_panel(ctx, practice))
+            # CVOI in due parti: 3.1 KIIS (produzione e verifica) · 3.2 Verbale CVOI (scoring per criterio).
+            subs3 = [
+                ("kiis", "3.1 KIIS - produzione e verifica"),
+                ("scoring", "3.2 Verbale CVOI - scoring per criterio"),
+            ]
+            sub = self.get_query_param("sub") or "kiis"
+            if sub not in {s[0] for s in subs3}:
+                sub = "kiis"
+            subnav = '<div class="subtabs">' + "".join(
+                f'<a class="subtab {"active" if k == sub else ""}" href="{rel_url("/pariter/practices/" + str(practice["id"]), ctx, {"fase": "fase3", "sub": k})}">{esc(t)}</a>'
+                for k, t in subs3) + '</div>'
+            if sub == "kiis":
+                section = (self.render_kiis_panel(ctx, practice)
+                           + self.render_internal_reviews(ctx, practice, ["coerenza_kiis"]))
+            else:
+                section = (self.render_full_dossier(ctx, practice)
+                           + self.practice_tab_cvoi(ctx, practice))
+            body = subnav + section
         elif fase == "fase4":
             # Sessione dedicata Advisory Committee: esamina CVOI + bozza KIIS e rende il parere non vincolante.
             body = (self.recall_documents_html(ctx, practice, ["CVOI", "KIIS", "Verifiche interne"],
@@ -5949,13 +5975,22 @@ document.querySelectorAll('[data-campaign-form]').forEach((form) => {
                   "investitore": "", "consob": ""}
         body = fill(t["body"])
         if code == "C3":
-            # elenca automaticamente i documenti obbligatori mancanti / da integrare
-            missing = rows(
-                """SELECT label FROM practice_documents WHERE practice_id = ? AND required = 1
-                   AND phase IN ('fase1','fase2')
-                   AND (document_id IS NULL OR doc_status IN ('mancante','da_integrare','non_utilizzabile'))
-                   ORDER BY phase, id""", (practice["id"],))
-            elenco = "\n".join(f"- {m['label']}" for m in missing) or "- (nessun documento mancante rilevato)"
+            # precompila l'elenco con la completezza del fascicolo (sempre dovuti + regola bilanci)
+            # piu' i documenti di onorabilita' (autodichiarazioni/casellari) ancora mancanti.
+            items = []
+            with connect() as conn:
+                comp = fascicolo_completezza(conn, practice)
+                items.extend(comp["integrazione"])  # sempre dovuti mancanti + "Bilanci depositati: X su Y dovuti"
+                ob = onorabilita_status(conn, practice["id"])
+            if ob["configured"]:
+                for s in ob["subjects"]:
+                    role = ONORAB_ROLE_LABELS.get(s["role"], s["role"])
+                    name = s["subject_name"] or "-"
+                    if not s["autodich"]:
+                        items.append(f"Autodichiarazione di onorabilita' - {role}: {name}")
+                    if not s["casellario"]:
+                        items.append(f"Casellario giudiziale - {role}: {name} (da acquisire prima della pubblicazione)")
+            elenco = "\n".join(f"- {x}" for x in items) or "- (nessun documento mancante rilevato)"
             body = body.replace("- [specificare i documenti mancanti]", elenco)
         return {"label": t["label"], "recipient": to_map.get(t["to"], ""),
                 "subject": fill(t["subject"]), "body": body}
@@ -6373,18 +6408,29 @@ document.querySelectorAll('[data-campaign-form]').forEach((form) => {
             line(c["label"], c["present"], absent_txt="Non disponibile", absent_cls="neutral")
             for c in comp["condizionati"])
 
-        # blocco bilanci con regola min(2, esercizi_chiusi)
+        # blocco bilanci: si chiedono gli ultimi due bilanci, ma solo per gli esercizi gia' chiusi e depositati
         if comp["esercizi_set"]:
             dov = comp["bilanci_dovuti"]
+            pres = comp["bilanci_presenti"]
             if dov == 0:
-                bil_badge = '<span class="badge success">Nessun bilancio dovuto (neo costituita)</span>'
-            elif comp["bilanci_completi"]:
-                bil_badge = f'<span class="badge success">{comp["bilanci_presenti"]} su {dov} dovuti</span>'
+                bil_badge = '<span class="badge success">Nessun bilancio richiesto</span>'
+                bil_state = ('<p><strong>Bilanci richiesti: 0.</strong> La societa\' non ha ancora esercizi chiusi e depositati '
+                             '(neo costituita): nessun bilancio dovuto.</p>')
             else:
-                bil_badge = f'<span class="badge danger">{comp["bilanci_presenti"]} su {dov} dovuti</span>'
-            bil_state = f'<p>Esercizi chiusi e depositati: <strong>{comp["esercizi"]}</strong> &rarr; bilanci dovuti = min(2, {comp["esercizi"]}) = <strong>{dov}</strong>. {bil_badge}</p>'
+                manca = max(0, dov - pres)
+                if comp["bilanci_completi"]:
+                    bil_badge = '<span class="badge success">Completo</span>'
+                    stato_txt = "tutti presenti."
+                else:
+                    bil_badge = f'<span class="badge danger">Manca{"no" if manca != 1 else ""} {manca}</span>'
+                    stato_txt = f"ne manca{'no' if manca != 1 else ''} {manca}."
+                quanti = f"ultimi {dov} esercizi chiusi e depositati" if dov > 1 else "ultimo esercizio chiuso e depositato"
+                bil_state = (f'<p><strong>Bilanci richiesti: {dov}</strong> ({quanti}, su {comp["esercizi"]} totali). '
+                             f'Presenti: <strong>{pres}</strong> &mdash; {stato_txt} {bil_badge}</p>')
         else:
-            bil_state = '<p><span class="badge warning">Esercizi chiusi non indicati</span> Indica gli esercizi chiusi e depositati per applicare la regola bilanci.</p>'
+            bil_badge = ""
+            bil_state = ('<p><span class="badge warning">Da indicare</span> Inserisci quanti esercizi sono gia\' chiusi e depositati '
+                         'e quanti bilanci sono stati prodotti: si richiedono gli ultimi due bilanci (meno se la societa\' e\' piu\' giovane).</p>')
 
         bil_form = ""
         if not locked:
@@ -7120,7 +7166,7 @@ document.querySelectorAll('[data-campaign-form]').forEach((form) => {
                 msg = "Bozza KIIS generata dal template."
             log_audit(conn, ctx["platform_id"], ctx["user_id"], "practice", practice_id, "Bozza KIIS", action)
             conn.commit()
-        self.redirect(f"/pariter/practices/{practice_id}", ctx, msg, {"fase": "fase3"})
+        self.redirect(f"/pariter/practices/{practice_id}", ctx, msg, {"fase": "fase3", "sub": "kiis"})
 
     def practice_tab_decision(self, ctx, practice, round_no):
         pid = practice["id"]
@@ -7612,7 +7658,8 @@ document.querySelectorAll('[data-campaign-form]').forEach((form) => {
             conn.execute("UPDATE practices SET updated_at = ? WHERE id = ?", (now, practice_id))
             log_audit(conn, ctx["platform_id"], ctx["user_id"], "practice", practice_id, "Onorabilita art. 5", action)
             conn.commit()
-        self.redirect(f"/pariter/practices/{practice_id}", ctx, msg, {"fase": "fase2", "sub": "ammissibilita"})
+        self.redirect(f"/pariter/practices/{practice_id}", ctx, msg,
+                      {"fase": "fase2", "sub": form.get("back_sub") or "ammissibilita"})
 
     def post_practice_completezza(self, practice_id, form):
         ctx = self.ctx_from_form(form)
@@ -7639,6 +7686,58 @@ document.querySelectorAll('[data-campaign-form]').forEach((form) => {
             conn.commit()
         self.redirect(f"/pariter/practices/{practice_id}", ctx, "Completezza fascicolo aggiornata.", {"tab": "documentale"})
 
+    def render_onorabilita_config(self, ctx, practice):
+        """Prerequisito (in 2.1, prima della raccolta documenti): titolare effettivo e legale
+        rappresentante coincidono? Determina quante autodichiarazioni/casellari servono."""
+        pid = practice["id"]
+        locked = bool(practice["closed_at"])
+        can = user_can(ctx["user"], "manage_practice") and not locked
+        with connect() as conn:
+            ob = onorabilita_status(conn, pid)
+        js = {}
+        try:
+            js = json.loads(practice["dossier_json"] or "{}")
+        except (ValueError, TypeError):
+            js = {}
+        ds = js.get("dati_struttura") or {}
+        prefill_lr = (ds.get("legaleRappresentante") or {}).get("nome") or (js.get("rep") or {}).get("nome") or ""
+        if not ob["configured"]:
+            if not can:
+                inner = '<p class="muted">Soggetti del controllo onorabilita\' non ancora impostati.</p>'
+            else:
+                inner = f"""
+  <p class="muted">Prima di raccogliere la documentazione: il <strong>titolare effettivo</strong> coincide con il <strong>legale rappresentante</strong>? Se coincidono basta <strong>una</strong> autodichiarazione e <strong>un</strong> casellario; se sono persone distinte ne servono <strong>due</strong> per ciascuno.</p>
+  <form class="form-grid" method="post" action="/pariter/practices/{pid}/onorabilita">
+    {hidden_ctx(ctx)}<input type="hidden" name="action" value="configure"><input type="hidden" name="back_sub" value="completezza">
+    <label>Titolare effettivo e legale rappresentante coincidono?
+      <select name="coincide"><option value="si">Si - stessa persona</option><option value="no">No - persone distinte</option></select>
+    </label>
+    <label>Legale rappresentante<input name="lr_name" value="{esc(prefill_lr)}"></label>
+    <label>Titolare effettivo<input name="te_name" placeholder="compila solo se diverso dal legale rappresentante"></label>
+    <div class="form-actions"><button class="button primary" type="submit">Imposta soggetti</button></div>
+  </form>"""
+            badge = '<span class="badge warning">Da impostare</span>'
+        else:
+            coincide = ob["coincide"]
+            n = 1 if coincide else 2
+            names = ", ".join(esc(s["subject_name"] or "-") for s in ob["subjects"])
+            badge = '<span class="badge success">Impostati</span>'
+            reconf = ""
+            if can:
+                reconf = (f'<form method="post" action="/pariter/practices/{pid}/onorabilita" style="display:inline" '
+                          f'onsubmit="return confirm(\'Riconfigurare i soggetti? Le spunte verranno azzerate.\')">'
+                          f'{hidden_ctx(ctx)}<input type="hidden" name="action" value="reset"><input type="hidden" name="back_sub" value="completezza">'
+                          f'<button class="button tiny secondary" type="submit">Riconfigura</button></form>')
+            inner = (f'<p>Esito: <strong>{"coincidono" if coincide else "persone distinte"}</strong> &mdash; soggetti: {names}.</p>'
+                     f'<p class="muted">Documenti di onorabilita\' dovuti: <strong>{n}</strong> autodichiarazione/i (per procedere) e '
+                     f'<strong>{n}</strong> casellario/i (per pubblicare). La verifica si completa al punto 2.2.</p>'
+                     f'<div class="form-actions left">{reconf}</div>')
+        return f"""
+<section class="panel">
+  <div class="section-head"><h2>Soggetti del controllo onorabilita' (art. 5)</h2>{badge}</div>
+  {inner}
+</section>"""
+
     def practice_onorabilita_panel(self, ctx, practice):
         pid = practice["id"]
         with connect() as conn:
@@ -7652,36 +7751,35 @@ document.querySelectorAll('[data-campaign-form]').forEach((form) => {
         pub_badge = ('<span class="badge success">Pubblicabile</span>' if ob["pubblicabile"]
                      else '<span class="badge danger">Non pubblicabile</span>')
         if not ob["configured"]:
-            body = f"""
-  <p class="muted">L'onorabilita' ex art. 5 va verificata sul <strong>legale rappresentante</strong> del titolare di progetto e sul <strong>titolare effettivo</strong>. Indica se sono la stessa persona: in caso di coincidenza basta un'autodichiarazione e un casellario, altrimenti ne servono due distinti.</p>
-  <form class="form-grid" method="post" action="/pariter/practices/{pid}/onorabilita">
-    {hidden_ctx(ctx)}<input type="hidden" name="action" value="configure">
-    <label>I due ruoli coincidono?
-      <select name="coincide"><option value="no">No - persone distinte</option><option value="si">Si - stessa persona</option></select>
-    </label>
-    <label>Legale rappresentante<input name="lr_name" value="{esc(prefill_lr)}"></label>
-    <label>Titolare effettivo<input name="te_name" value="{esc(prefill_te)}" placeholder="se coincide, lascia vuoto"></label>
-    <div class="form-actions"><button class="button primary" type="submit">Imposta soggetti</button></div>
-  </form>"""
+            body = ('<p class="muted">Imposta prima i <strong>soggetti del controllo onorabilita\'</strong> '
+                    'nel punto <strong>2.1 Completezza del fascicolo</strong> (titolare effettivo / legale rappresentante): '
+                    'da li si determina se serve una o due autodichiarazioni/casellari.</p>')
         else:
+            locked = bool(practice["closed_at"])
+            # una riga per ogni documento: per ciascun soggetto, autodichiarazione + casellario.
+            # Se i soggetti sono distinti compaiono righe separate per legale rappresentante e titolare effettivo.
+            doc_kinds = [
+                ("autodich", "Documento di onorabilita' (autodichiarazione)", "Per procedere"),
+                ("casellario", "Casellario giudiziale", "Per pubblicare"),
+            ]
             rows_html = ""
             for s in ob["subjects"]:
                 role_lbl = ONORAB_ROLE_LABELS.get(s["role"], s["role"])
-                ad = ('<span class="badge success">acquisita</span>' if s["autodich"]
-                      else '<span class="badge warning">mancante</span>')
-                cas = ('<span class="badge success">acquisito</span>' if s["casellario"]
-                       else '<span class="badge danger">mancante</span>')
-
-                def tog(kind, cur):
-                    return (f'<form method="post" action="/pariter/practices/{pid}/onorabilita" style="display:inline">'
-                            f'{hidden_ctx(ctx)}<input type="hidden" name="action" value="toggle">'
-                            f'<input type="hidden" name="role" value="{s["role"]}"><input type="hidden" name="kind" value="{kind}">'
-                            f'<input type="hidden" name="val" value="{0 if cur else 1}">'
-                            f'<button class="button tiny" type="submit">{"Segna mancante" if cur else "Segna acquisito"}</button></form>')
-                rows_html += (f'<tr><td><strong>{esc(s["subject_name"] or "-")}</strong><br>'
-                              f'<span class="muted">{esc(role_lbl)}</span></td>'
-                              f'<td>{ad} {tog("autodich", s["autodich"])}</td>'
-                              f'<td>{cas} {tog("casellario", s["casellario"])}</td></tr>')
+                who = (esc(s["subject_name"] or "-") + " &mdash; " + esc(role_lbl))
+                for kind, kind_lbl, scope in doc_kinds:
+                    cur = s[kind]
+                    badge = ('<span class="badge success">Acquisito</span>' if cur
+                             else f'<span class="badge {"warning" if kind == "autodich" else "danger"}">Mancante</span>')
+                    tog = ""
+                    if not locked:
+                        tog = (f'<form method="post" action="/pariter/practices/{pid}/onorabilita" style="display:inline">'
+                               f'{hidden_ctx(ctx)}<input type="hidden" name="action" value="toggle">'
+                               f'<input type="hidden" name="role" value="{s["role"]}"><input type="hidden" name="kind" value="{kind}">'
+                               f'<input type="hidden" name="val" value="{0 if cur else 1}">'
+                               f'<button class="button tiny" type="submit">{"Segna mancante" if cur else "Segna acquisito"}</button></form>')
+                    rows_html += (f'<tr><td><strong>{kind_lbl}</strong><br><span class="muted">{who}</span></td>'
+                                  f'<td><span class="muted">{scope}</span></td>'
+                                  f'<td>{badge}</td><td>{tog}</td></tr>')
             if not ob["procedibile"]:
                 note = f'<p class="muted">Mancano le autodichiarazioni per: <strong>{esc(", ".join(ob["missing_autodich"]))}</strong>. Senza, la pratica non e\' procedibile.</p>'
             elif not ob["pubblicabile"]:
@@ -7695,7 +7793,7 @@ document.querySelectorAll('[data-campaign-form]').forEach((form) => {
                       f'<button class="button tiny secondary" type="submit">Riconfigura soggetti</button></form>')
             body = f"""
   {note}
-  <table class="data-table compact"><thead><tr><th>Soggetto</th><th>Autodichiarazione (per procedere)</th><th>Casellario (per pubblicare)</th></tr></thead><tbody>{rows_html}</tbody></table>
+  <table class="data-table compact"><thead><tr><th>Documento di onorabilita'</th><th>A cosa serve</th><th>Stato</th><th></th></tr></thead><tbody>{rows_html}</tbody></table>
   <div class="form-actions left">{reconf}</div>"""
         return f"""
 <section class="panel">
@@ -7937,7 +8035,7 @@ document.querySelectorAll('[data-campaign-form]').forEach((form) => {
         action = form.get("action", "generate")
         # ogni relazione vive nella sua fase: AML->fase2, coerenza KIIS->fase3, conflitti->fase5
         back = {"aml_art5": {"fase": "fase2", "sub": "ammissibilita"},
-                "coerenza_kiis": {"fase": "fase3"},
+                "coerenza_kiis": {"fase": "fase3", "sub": "kiis"},
                 "conflitti": {"fase": "fase5"}}.get(rtype, {"fase": "fase2"})
         if rtype not in INTERNAL_REVIEW_LABELS:
             self.redirect(f"/pariter/practices/{practice_id}", ctx, "Tipo relazione non valido.", back)
@@ -8245,7 +8343,7 @@ document.querySelectorAll('[data-campaign-form]').forEach((form) => {
             conn.execute("UPDATE practices SET updated_at = ? WHERE id = ?", (now_iso(), practice_id))
             log_audit(conn, ctx["platform_id"], ctx["user_id"], "practice", practice_id, "CVOI", action)
             conn.commit()
-        self.redirect(f"/pariter/practices/{practice_id}", ctx, msg, {"tab": "cvoi"})
+        self.redirect(f"/pariter/practices/{practice_id}", ctx, msg, {"fase": "fase3", "sub": "scoring"})
 
     def post_practice_close(self, practice_id, form):
         ctx = self.ctx_from_form(form)
@@ -8281,10 +8379,10 @@ document.querySelectorAll('[data-campaign-form]').forEach((form) => {
             self.not_found()
             return
         if practice["closed_at"]:
-            self.redirect(f"/pariter/practices/{practice_id}", ctx, "Pratica chiusa: sola lettura.", {"tab": "cvoi"})
+            self.redirect(f"/pariter/practices/{practice_id}", ctx, "Pratica chiusa: sola lettura.", {"fase": "fase3", "sub": "scoring"})
             return
         if not user_can(ctx["user"], "cvoi_sign"):
-            self.redirect(f"/pariter/practices/{practice_id}", ctx, "Azione riservata ai membri del Comitato Tecnico.", {"tab": "cvoi"})
+            self.redirect(f"/pariter/practices/{practice_id}", ctx, "Azione riservata ai membri del Comitato Tecnico.", {"fase": "fase3", "sub": "scoring"})
             return
         is_admin = ctx["user"]["role"] == "admin"
         action = form.get("action", "")
@@ -8292,7 +8390,7 @@ document.querySelectorAll('[data-campaign-form]').forEach((form) => {
         with connect() as conn:
             report = conn.execute("SELECT * FROM cvoi_reports WHERE practice_id = ? ORDER BY id DESC LIMIT 1", (practice_id,)).fetchone()
             if not report:
-                self.redirect(f"/pariter/practices/{practice_id}", ctx, "Genera prima il verbale CVOI.", {"tab": "cvoi"})
+                self.redirect(f"/pariter/practices/{practice_id}", ctx, "Genera prima il verbale CVOI.", {"fase": "fase3", "sub": "scoring"})
                 return
             rid = report["id"]
 
@@ -8309,7 +8407,7 @@ document.querySelectorAll('[data-campaign-form]').forEach((form) => {
 
             if action == "force_unanime":
                 if not is_admin:
-                    self.redirect(f"/pariter/practices/{practice_id}", ctx, "Solo l'amministratore puo' forzare l'unanimita'.", {"tab": "cvoi"})
+                    self.redirect(f"/pariter/practices/{practice_id}", ctx, "Solo l'amministratore puo' forzare l'unanimita'.", {"fase": "fase3", "sub": "scoring"})
                     return
                 for m in cvoi_committee_members(conn):
                     upsert(m["id"], m["name"], "approvato", now)
@@ -8322,7 +8420,7 @@ document.querySelectorAll('[data-campaign-form]').forEach((form) => {
             else:
                 member_id = int(form.get("member_id") or ctx["user_id"])
                 if not is_admin and member_id != ctx["user_id"]:
-                    self.redirect(f"/pariter/practices/{practice_id}", ctx, "Puoi firmare solo per te stesso.", {"tab": "cvoi"})
+                    self.redirect(f"/pariter/practices/{practice_id}", ctx, "Puoi firmare solo per te stesso.", {"fase": "fase3", "sub": "scoring"})
                     return
                 m = conn.execute("SELECT name FROM users WHERE id = ?", (member_id,)).fetchone()
                 member_name = m["name"] if m else ""
@@ -8347,7 +8445,7 @@ document.querySelectorAll('[data-campaign-form]').forEach((form) => {
             conn.execute("UPDATE practices SET updated_at = ? WHERE id = ?", (now, practice_id))
             log_audit(conn, ctx["platform_id"], ctx["user_id"], "practice", practice_id, "CVOI - approvazione membro", action)
             conn.commit()
-        self.redirect(f"/pariter/practices/{practice_id}", ctx, msg, {"tab": "cvoi"})
+        self.redirect(f"/pariter/practices/{practice_id}", ctx, msg, {"fase": "fase3", "sub": "scoring"})
 
     def post_practice_board_decision(self, practice_id, form):
         ctx = self.ctx_from_form(form)
