@@ -2,7 +2,7 @@
 
 Documento di contesto per chi riprende il lavoro da un altro PC. Riassume **come funziona oggi
 il recupero/gestione dei documenti** lungo l'istruttoria e le variazioni più recenti. Il software
-si chiama **OmniCrowd** ("The all-in-one crowdfunding operating system"; ex CrowdOS / "ECSP
+si chiama **OmniCrowd** ("The all-in-one crowdfunding operating system"; in passato "ECSP
 Compliance Suite"). Stack: Python stdlib + SQLite, `app.py`, avvio `python3 app.py 8772`.
 
 > Regola di lavoro multi-PC: si lavora su un PC alla volta. Prima di cambiare postazione fare
