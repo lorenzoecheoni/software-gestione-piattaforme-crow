@@ -1,6 +1,10 @@
-# ECSP Compliance Suite - Context for Claude
+# OmniCrowd - Context for Claude
 
 This file is the working context for continuing the project in Claude or Claude Code after exporting the repository to GitHub.
+
+The product is named **OmniCrowd** ("The all-in-one crowdfunding operating system"; formerly
+"ECSP Compliance Suite" / "CrowdOS"). A complementary cross-PC handoff with the most recent
+flow details lives in `docs/CONTESTO_VARIAZIONI.md` — keep both in sync.
 
 ## Project Goal
 
@@ -35,10 +39,9 @@ This is a local Python prototype:
 
 The app uses Python standard-library HTTP handling with SQLite. There is no framework yet.
 
-Run locally:
+Run locally (from the repo root, system Python 3):
 
 ```bash
-cd outputs/ecsp-compliance-suite
 python3 app.py 8772
 ```
 
@@ -48,11 +51,8 @@ Then open:
 http://127.0.0.1:8772
 ```
 
-In the current local Codex environment the Python runtime used was:
-
-```bash
-/Users/lorenzo/.cache/codex-runtimes/codex-primary-runtime/dependencies/python/bin/python3 app.py 8772
-```
+Useful URL params: `?platform=1&user=10` (platform 1 = Pariter, 2 = ISI; user 10 = admin).
+The real document archive resolves via `ECSP_ARCHIVE_DIR` (see "Archivio documentale").
 
 Before finishing changes, always run:
 
@@ -64,33 +64,32 @@ If the local server is running, restart it after Python changes.
 
 ## GitHub Export Notes
 
-Recommended files/directories to commit:
+Files/directories committed:
 
 - `app.py`
 - `README.md`
 - `CLAUDE.md`
-- `CONTESTO_PROGETTO_ECSP.md`
-- `docs/`
+- `docs/` (incl. `docs/CONTESTO_VARIAZIONI.md`, the cross-PC handoff)
 - `static/`
 - `templates/`
+- **`data/ecsp_suite.db`** and **`uploads/`** — versioned ON PURPOSE so every PC opens the
+  same scenario. This is the cross-PC sync mechanism: "aggiorna git" = add + commit + push;
+  on another PC `git pull` brings code + DB + generated/uploaded files together.
 
-Usually do not commit:
+NOT committed (~148 MB binary archive): the real Pariter document archive stays on Google
+Drive (master) outside the repo — only the `documents` metadata rows travel via the DB. See
+the "Archivio documentale" section below.
 
-- `__pycache__/`
-- `data/ecsp_suite.db` unless a demo database snapshot is intentionally wanted;
-- `uploads/` unless demo generated documents are intentionally wanted;
-- old root-level `ecsp_suite.sqlite3` if present, because the active DB is `data/ecsp_suite.db`.
-
-Suggested `.gitignore` if missing:
+Suggested `.gitignore` (note: DB and uploads are intentionally NOT ignored):
 
 ```gitignore
 __pycache__/
 *.pyc
 .DS_Store
-data/*.db
-uploads/
 ecsp_suite.sqlite3
 ```
+
+Multi-PC rule: work on one PC at a time; "aggiorna git" before switching stations.
 
 ## Current Navigation Order
 
@@ -391,16 +390,23 @@ Deals are the core workflow.
 
 ### Onboarding flow (authoritative — `05_PROCESSO_ONBOARDING_passo_passo`)
 
-Per Allegato 5.1, the order is a **single CdA delibera AFTER the Advisory Committee**:
+Per Allegato 5.1, the order is a **single CdA delibera AFTER the Advisory Committee**.
+Module numbers below use the **vigente M1–M14 numbering** (see the table further down and
+`docs/CONTESTO_VARIAZIONI.md` §2); the old numbering is no longer valid.
 
-1. Candidatura (9 docs) → comms C1 (PEC), C2 (proponente)
-2. Ammissibilità: KYC art.5 [M2], limite 5M [M3], relazione art.5/AML [M11] → C3/C4
-3. Valutazione CVOI: scoring [M4], fascicolo [M5], conflitti [M10], KIIS [M8]
-4. **Pareri e delibera**: Advisory Committee parere non vincolante [M6] → relazione
-   insussistenza conflitti del Resp. controllo [M12] → **UNICA delibera CdA** [M7] → C5/C6
+1. Candidatura (9 docs, checklist [M1]) → comms C1 (PEC), C2 (proponente, numero pratica)
+2. Ammissibilità (divisa per funzione 2.1/2.2/2.3): completezza documentale [M1] + onorabilità
+   art.5, KYC art.5 [M2], limite 5M [M3], relazione controlli art.5/AML [M4] → C3 (integrazione)
+   / C4 (esito positivo → CVOI) / C6 (non ammissibilità)
+3. Valutazione CVOI (3.1/3.2): KIIS redatta dal proponente (art. 23), verifica scheda KIIS [M5]
+   → scoring [M6] → fascicolo a 8 sezioni [M7]; conflitti di merito (Allegato 14). Ordine CHIUSO
+   **verifica KIIS [M5] → scoring [M6]**, non invertire. In Fase 3 l'unica uscita al proponente è C3K.
+4. **Pareri e delibera**: Advisory Committee parere non vincolante [M8] → relazione
+   insussistenza conflitti del Resp. controllo [M9] → **UNICA delibera CdA** [M10] → C5/C6
 5. Pubblicazione: KIIS finale, C7, eventuale C9 (CONSOB SiCrowd)
-6. Raccolta investitori: classificazione [M9], C8
-7. Post-offerta: comunicazioni CONSOB continuative [C9], registri [M10]
+6. Raccolta investitori: classificazione e test [M11], C8
+7. Post-offerta: comunicazioni CONSOB continuative [C9], registri conflitti/reclami [M12];
+   data breach al Garante [M13], incidente ICT grave a CONSOB/DORA [M14]
 
 IMPORTANT: the earlier two-delibera model (`cda1` before Advisory + `cda2` after) was
 WRONG and has been removed. There is now ONE delibera. Practice state machine
@@ -408,6 +414,31 @@ WRONG and has been removed. There is now ONE delibera. Practice state machine
 advisory_ricevuto → attesa_cda → cda_positiva|cda_negativa → in_pre_golive`. The board
 decision uses a single round (`decision_round = 1`), gated on a unanime Advisory opinion.
 Migration `ensure_practice_flow_v2()` remaps any legacy `cda1_*`/`cda2_*` rows.
+
+The deal bar shows **8 phases** (not 7): the Advisory Committee is a dedicated session split
+out from the official 7-phase Pariter procedure.
+
+### Modulistica M1–M14 (vigente, giugno 2026)
+
+The same number may denote a DIFFERENT document than the old assetto. Current catalog
+(`_M_DESC` in `app.py`); old numbering (`05_PROCESSO_ONBOARDING` Google Doc) must be remapped:
+
+| #   | Modulo                                                   | Linea |
+|-----|----------------------------------------------------------|-------|
+| M1  | Checklist documentale — onboarding proponente            | 1ª    |
+| M2  | Checklist KYC — art. 5 ECSP                               | 1ª    |
+| M3  | Checklist — limite € 5.000.000                            | 1ª    |
+| M4  | Relazione controlli art. 5 / AML (attestazione 2ª linea) | 2ª    |
+| M5  | Checklist — verifica della scheda KIIS                    | 1ª    |
+| M6  | Modulo valutazione CVOI — scoring (Allegato 5.1)          | 1ª    |
+| M7  | Fascicolo di valutazione (8 sezioni)                     | 1ª    |
+| M8  | Parere dell'Advisory Committee                           | —     |
+| M9  | Relazione di insussistenza dei conflitti                 | 2ª    |
+| M10 | Verbale CdA — delibera sull'offerta                      | CdA   |
+| M11 | Modulo classificazione investitore e test (Allegato 19)  | —     |
+| M12 | Registri — conflitti di interesse e reclami              | 2ª    |
+| M13 | Notifica data breach — al Garante (GDPR)                 | —     |
+| M14 | Segnalazione incidente ICT grave — a CONSOB (DORA)       | —     |
 
 For future work, link deal progress to Finance campaign metrics and investor CRM.
 
