@@ -489,6 +489,8 @@ INTERNAL_REVIEW_TYPES = [
     ("coerenza_kiis", "Verifica della scheda KIIS (M5)"),
 ]
 INTERNAL_REVIEW_LABELS = dict(INTERNAL_REVIEW_TYPES)
+# Fascicolo di valutazione (M7): documento a se, NON nel conteggio del gate ammissibilita'.
+INTERNAL_REVIEW_LABELS["fascicolo"] = "Fascicolo di valutazione del progetto (M7)"
 
 DOC_STATUS_LABELS = {
     "presente": "Presente",
@@ -1839,6 +1841,25 @@ def init_db():
         ensure_column(conn, "practices", "m_conflitti_misura", "TEXT NOT NULL DEFAULT ''")
         ensure_column(conn, "practices", "m_kiis_coerenza", "TEXT NOT NULL DEFAULT ''")  # coerente/da_sanare/incoerente
         ensure_column(conn, "practices", "m_advisory_trasmesso", "TEXT NOT NULL DEFAULT ''")
+        # CVOI collegiale: punteggi individuali per valutatore + astensioni motivate (per progetto)
+        conn.execute("""CREATE TABLE IF NOT EXISTS cvoi_eval_scores (
+            id INTEGER PRIMARY KEY,
+            practice_id INTEGER NOT NULL REFERENCES practices(id) ON DELETE CASCADE,
+            evaluator_id INTEGER NOT NULL,
+            area_key TEXT NOT NULL, idx INTEGER NOT NULL, score REAL NOT NULL DEFAULT 0)""")
+        conn.execute("""CREATE TABLE IF NOT EXISTS cvoi_eval_status (
+            id INTEGER PRIMARY KEY,
+            practice_id INTEGER NOT NULL REFERENCES practices(id) ON DELETE CASCADE,
+            evaluator_id INTEGER NOT NULL,
+            abstained INTEGER NOT NULL DEFAULT 0, reason TEXT NOT NULL DEFAULT '',
+            notes TEXT NOT NULL DEFAULT '', confirmed INTEGER NOT NULL DEFAULT 0,
+            updated_at TEXT NOT NULL DEFAULT '')""")
+        ensure_column(conn, "cvoi_eval_status", "confirmed", "INTEGER NOT NULL DEFAULT 0")
+        # Firme del fascicolo M7 (una per membro del Comitato Tecnico)
+        conn.execute("""CREATE TABLE IF NOT EXISTS m7_signatures (
+            id INTEGER PRIMARY KEY,
+            practice_id INTEGER NOT NULL REFERENCES practices(id) ON DELETE CASCADE,
+            member_id INTEGER NOT NULL, signed_at TEXT NOT NULL DEFAULT '')""")
         # Registri conflitti/reclami secondo modello M12 (Allegati 14 e 16)
         for col in ("reg_no", "soggetti", "natura_fonte", "rilevato_da", "valutazione", "misura", "esito", "atti_collegati"):
             ensure_column(conn, "conflicts", col, "TEXT NOT NULL DEFAULT ''")
@@ -3383,6 +3404,45 @@ def compose_internal_review_draft(practice, review_type):
     rep = ds.get("legaleRappresentante") or {}
     kd = js.get("kiis_dati") or {}
     prop = practice["proponent_name"] or societa.get("denominazione") or "-"
+    if review_type == "fascicolo":
+        offerta = ds.get("offertaFase1") or {}
+        cf = _practice_val(practice, "m_conflitti")
+        cf_lbl = CONFLITTI_MERITO_LABELS.get(cf, "non valutato")
+        cf_mis = _practice_val(practice, "m_conflitti_misura")
+        if cf == "gestibile" and cf_mis:
+            cf_lbl += f" - misura: {cf_mis}"
+        kc_lbl = KIIS_COERENZA_LABELS.get(_practice_val(practice, "m_kiis_coerenza"), "non verificata")
+        return f"""Fascicolo di valutazione del progetto (M7) - {prop}
+
+Sintesi dell'istruttoria del Comitato Valutazione Opportunita' di Investimento (CVOI). La parte
+descrittiva e' precompilata come assistenza: integrare/correggere prima della firma.
+
+1. Team / Management
+[Descrivere esperienza, completezza e affidabilita' del team. Dati: key manager ed esperienze.]
+
+2. Tecnologia
+[Descrivere la soluzione tecnologica, maturita' e difendibilita'.]
+
+3. Proprieta' intellettuale
+[Brevetti, marchi, know-how e relativa titolarita'.]
+
+4. Mercato
+[Dimensione, segmenti, concorrenza, posizionamento.]
+
+5. Business Model
+[Modello di ricavo, struttura costi, scalabilita'. Strumento: {offerta.get('strumento') or '-'}; pre-money: {offerta.get('preMoney') or '-'}; equity: {offerta.get('equity') or '-'}.]
+
+6. Roadmap
+[Tappe, milestone e impieghi della raccolta (target {offerta.get('importoTarget') or '-'}, max {offerta.get('importoMax') or '-'}).]
+
+7. Esito conflitti di interesse (da 3.1)
+{cf_lbl}
+
+8. Esito verifica KIIS (da 3.1)
+{kc_lbl}
+
+Allegati: scheda di scoring (M6) e bozza KIIS. La presente valutazione, una volta firmata dai
+membri del CVOI, e' trasmessa all'Advisory Committee per il parere."""
     if review_type == "aml_art5":
         text = f"""1. Oggetto
 Controlli ex art. 5 Reg. (UE) 2020/1503 sul titolare del progetto e sul titolare effettivo, ai fini dell'ammissione dell'offerta sulla piattaforma Pariter Equity.
@@ -3663,6 +3723,85 @@ def compute_cvoi_from_criteria(criteria_scores):
     return area_totals, weighted, outcome, round(total_raw, 2), total_max
 
 
+# Minimi PONDERATI per area (Allegato 5.1): thr x peso. Coincidono con i minimi raw 18/21/18.
+CVOI_AREA_MIN_WEIGHTED = {"area1": round(18 * 0.35, 2), "area2": round(21 * 0.35, 2), "area3": round(18 * 0.30, 2)}
+
+
+def compute_cvoi_collegial(conn, practice):
+    """Valutazione collegiale: media dei punteggi dei valutatori, criterio per criterio,
+    esclusi gli astenuti. Serve un minimo di 2 valutatori non astenuti."""
+    pid = practice["id"]
+    evaluators = cvoi_committee_members(conn)
+    status = {r["evaluator_id"]: r for r in
+              conn.execute("SELECT * FROM cvoi_eval_status WHERE practice_id = ?", (pid,)).fetchall()}
+    abstained = {eid for eid, s in status.items() if s["abstained"]}
+    scores = {}
+    for r in conn.execute("SELECT evaluator_id, area_key, idx, score FROM cvoi_eval_scores WHERE practice_id = ?", (pid,)):
+        scores[(r["evaluator_id"], r["area_key"], r["idx"])] = r["score"]
+
+    def has_any(eid):
+        return any((eid, k, i) in scores for k, _l, _w, _m, _t in CVOI_AREAS for i in range(len(CVOI_CRITERIA[k])))
+
+    active = [e for e in evaluators if e["id"] not in abstained and has_any(e["id"])]
+    criteria_scores = {}
+    detail = {}
+    for key, _l, _w, _m, _t in CVOI_AREAS:
+        medias = []
+        for i in range(len(CVOI_CRITERIA[key])):
+            vals = [scores[(e["id"], key, i)] for e in active if (e["id"], key, i) in scores]
+            media = round(sum(vals) / len(vals), 2) if vals else 0.0
+            medias.append(media)
+            detail[(key, i)] = {"per": {e["id"]: scores.get((e["id"], key, i)) for e in evaluators},
+                                "media": media, "n": len(vals)}
+        criteria_scores[key] = medias
+    area_totals, weighted, outcome, total_raw, total_max = compute_cvoi_from_criteria(criteria_scores)
+    n_val = len(active)
+    valid = n_val >= 2
+
+    def ev_state(eid):
+        if eid in abstained:
+            return "astenuto"
+        if not has_any(eid):
+            return "da_compilare"
+        st = status.get(eid)
+        return "validato" if (st and st["confirmed"]) else "salvato"
+
+    ev_status = {e["id"]: ev_state(e["id"]) for e in evaluators}
+    n_confirmed = sum(1 for e in evaluators if ev_status[e["id"]] == "validato")
+    # scheda completa: almeno 2 validati e nessuno lasciato 'da compilare'/'salvato'
+    all_done = (n_confirmed >= 2) and all(ev_status[e["id"]] in ("validato", "astenuto") for e in evaluators)
+    return {"evaluators": evaluators, "abstained": abstained, "status": status, "scores": scores,
+            "active": active, "n_val": n_val, "valid": valid, "criteria_scores": criteria_scores,
+            "area_totals": area_totals, "weighted": weighted,
+            "outcome": outcome if valid else "da_integrare", "detail": detail,
+            "total_raw": total_raw, "total_max": total_max,
+            "ev_status": ev_status, "n_confirmed": n_confirmed, "all_done": all_done}
+
+
+def save_cvoi_collegial(conn, practice, actor_id):
+    """Ricalcola dai punteggi individuali e aggiorna cvoi_reports + cvoi_criteria_scores (le medie),
+    cosi' fascicolo M7 e cvoi_summary_for restano coerenti."""
+    c = compute_cvoi_collegial(conn, practice)
+    pid = practice["id"]
+    now = now_iso()
+    rep = conn.execute("SELECT id FROM cvoi_reports WHERE practice_id = ? ORDER BY id DESC LIMIT 1", (pid,)).fetchone()
+    if rep:
+        rid = rep["id"]
+        conn.execute("UPDATE cvoi_reports SET weighted_score = ?, outcome = ?, updated_at = ? WHERE id = ?",
+                     (c["weighted"], c["outcome"], now, rid))
+    else:
+        cur = conn.execute(
+            "INSERT INTO cvoi_reports(practice_id, weighted_score, outcome, review_status, created_by, created_at, updated_at) "
+            "VALUES (?, ?, ?, 'bozza', ?, ?, ?)", (pid, c["weighted"], c["outcome"], actor_id, now, now))
+        rid = cur.lastrowid
+    conn.execute("DELETE FROM cvoi_criteria_scores WHERE cvoi_report_id = ?", (rid,))
+    for key, _l, _w, _m, _t in CVOI_AREAS:
+        for i, media in enumerate(c["criteria_scores"][key]):
+            conn.execute("INSERT INTO cvoi_criteria_scores(cvoi_report_id, area_key, idx, raw_score) VALUES (?, ?, ?, ?)",
+                         (rid, key, i, media))
+    return rid, c
+
+
 def build_cvoi_html(practice, report_fields, criteria_scores):
     """Verbale di valutazione del progetto (CVOI), fedele al template reale."""
     area_totals, weighted, outcome, total_raw, total_max = compute_cvoi_from_criteria(criteria_scores)
@@ -3775,8 +3914,15 @@ def set_practice_status(conn, practice, to_status, actor_id, notes="", condition
 
 
 def cvoi_is_validated(conn, practice_id):
-    """CVOI utilizzabile per l'invio all'Advisory Committee: versione unanime del
-    Comitato Tecnico oppure validazione/forzatura (admin)."""
+    """CVOI utilizzabile per l'Advisory Committee: nel modello collegiale il segnale
+    e' la trasmissione del fascicolo M7 (3.3, m_advisory_trasmesso); resta valido anche
+    il vecchio flusso (versione unanime / validazione admin)."""
+    trasm = conn.execute(
+        "SELECT 1 FROM practices WHERE id = ? AND m_advisory_trasmesso IS NOT NULL AND m_advisory_trasmesso != '' LIMIT 1",
+        (practice_id,),
+    ).fetchone()
+    if trasm:
+        return True
     return conn.execute(
         "SELECT 1 FROM cvoi_reports WHERE practice_id = ? AND (workflow_status = 'unanime' OR review_status = 'validato') LIMIT 1",
         (practice_id,),
@@ -4677,6 +4823,8 @@ class App(BaseHTTPRequestHandler):
                 self.post_practice_merito(int(path.split("/")[3]), form)
             elif re.fullmatch(r"/pariter/practices/\d+/trasmetti-advisory", path):
                 self.post_practice_trasmetti_advisory(int(path.split("/")[3]), form)
+            elif re.fullmatch(r"/pariter/practices/\d+/fascicolo-firma", path):
+                self.post_practice_fascicolo_firma(int(path.split("/")[3]), form)
             elif re.fullmatch(r"/pariter/practices/\d+/validate-ammissibilita", path):
                 self.post_practice_validate_ammissibilita(int(path.split("/")[3]), form)
             elif re.fullmatch(r"/pariter/practices/\d+/anagrafica", path):
@@ -4861,7 +5009,15 @@ class App(BaseHTTPRequestHandler):
             f'<a class="platform-tab {"active" if p["id"] == ctx["platform_id"] else ""}" href="{rel_url(ctx["path"], ctx, {"platform": p["id"]})}">{esc(p["name"])}</a>'
             for p in ctx["platforms"]
         )
-        user_opts = option_rows(ctx["users"], ctx["user_id"])
+        # Amministratore in cima; etichetta con il ruolo per orientarsi sulle viste
+        u_sorted = sorted(ctx["users"], key=lambda u: (0 if u["role"] == "admin" else 1, u["id"]))
+
+        def _ulabel(u):
+            rl = ROLE_LABELS.get(u["role"], u["role"])
+            return u["name"] if u["name"] == rl else f"{u['name']} ({rl})"
+        user_opts = "".join(
+            f'<option value="{u["id"]}"{" selected" if u["id"] == ctx["user_id"] else ""}>{esc(_ulabel(u))}</option>'
+            for u in u_sorted)
         notice = f'<div class="notice">{esc(ctx["notice"])}</div>' if ctx["notice"] else ""
         html_doc = f"""<!doctype html>
 <html lang="it">
@@ -5987,41 +6143,64 @@ document.querySelectorAll('[data-campaign-form]').forEach((form) => {
                                                     back_sub="validazione"))
             body = subnav + sec_head + section
         elif fase == "fase3":
-            # CVOI in due parti: 3.1 KIIS (produzione e verifica) · 3.2 Verbale CVOI (scoring per criterio).
+            # CVOI in tre parti: 3.1 Verifiche (M5) · 3.2 Scoring (M6) · 3.3 Fascicolo (M7) + trasmissione.
             subs3 = [
-                ("kiis", "3.1 KIIS - produzione e verifica"),
-                ("scoring", "3.2 Verbale CVOI - scoring per criterio"),
+                ("verifiche", "3.1 Verifiche - KIIS (M5) e conflitti"),
+                ("scoring", "3.2 Scoring CVOI (M6)"),
+                ("fascicolo", "3.3 Fascicolo di valutazione (M7)"),
             ]
-            sub = self.get_query_param("sub") or "kiis"
+            sub = self.get_query_param("sub") or "verifiche"
             if sub not in {s[0] for s in subs3}:
-                sub = "kiis"
+                sub = "verifiche"
             subnav = '<div class="subtabs">' + "".join(
                 f'<a class="subtab {"active" if k == sub else ""}" href="{rel_url("/pariter/practices/" + str(practice["id"]), ctx, {"fase": "fase3", "sub": k})}">{esc(t)}</a>'
                 for k, t in subs3) + '</div>'
-            if sub == "kiis":
-                # 3.1: (a) genera bozza KIIS -> (b) richiesta informazioni (loop) -> (c) verifiche di merito + gate
+
+            def gate_block(target_label, target_sub, reasons):
+                lis = "".join(f"<li>{esc(r)}</li>" for r in reasons)
+                return (f'<section class="panel"><div class="section-head"><h2>{esc(target_label)}</h2>'
+                        f'<span class="badge warning">Bloccato</span></div>'
+                        f'<p class="muted">Per procedere mancano:</p><ul class="clean-list">{lis}</ul>'
+                        f'<a class="button tiny" href="{rel_url("/pariter/practices/" + str(practice["id"]), ctx, {"fase": "fase3", "sub": target_sub})}">Torna indietro</a></section>')
+
+            passed, reasons = fase3_gate(practice)
+            with connect() as conn:
+                _cc = compute_cvoi_collegial(conn, practice)
+            scoring_done = _cc["all_done"]
+
+            if sub == "verifiche":
+                # 3.1: KIIS (redatta dal proponente) -> verifica del fornitore (M5) + conflitti -> gate
                 section = (self.render_kiis_panel(ctx, practice)
                            + self.render_kiis_stato_panel(ctx, practice)
                            + self.phase_emails_html(ctx, practice, ["C3K"], "fase3",
                                                     title="Segnalazione al proponente - completa/correggi la KIIS (art. 23 par. 12)",
                                                     intro="Unica comunicazione verso il proponente in Fase 3: segnalazione per completare/correggere la KIIS (non e' un esito). In assenza di riscontro: sospensione (max 30 gg) e poi cancellazione.",
-                                                    back_sub="kiis")
+                                                    back_sub="verifiche")
                            + self.render_internal_reviews(ctx, practice, ["coerenza_kiis"])
                            + self.render_verifiche_merito_panel(ctx, practice))
-            else:
-                # 3.2: scoring + fascicolo 8 sezioni -> 3.3 trasmissione Advisory. Accessibile solo se gate 3.1 superato.
-                passed, reasons = fase3_gate(practice)
+            elif sub == "scoring":
+                # 3.2: scoring CVOI (M6), valutazione collegiale. Sempre compilabile; il gate 3.1
+                # serve solo a mettere agli atti / proseguire, non a impedire la compilazione.
+                warn = ""
                 if not passed:
                     lis = "".join(f"<li>{esc(r)}</li>" for r in reasons)
-                    section = (f'<section class="panel"><div class="section-head"><h2>Verbale CVOI &mdash; scoring</h2>'
-                               f'<span class="badge warning">Bloccato dal gate 3.1</span></div>'
-                               f'<p class="muted">Per accedere allo scoring serve superare il gate di merito (3.1): KIIS COMPLETA, '
-                               f'conflitti gestibili, KIIS coerente. Mancano:</p><ul class="clean-list">{lis}</ul>'
-                               f'<a class="button tiny" href="{rel_url("/pariter/practices/" + str(practice["id"]), ctx, {"fase": "fase3", "sub": "kiis"})}">Vai a 3.1</a></section>')
+                    warn = (f'<section class="panel"><div class="section-head"><h2>Scoring CVOI (M6)</h2>'
+                            f'<span class="badge warning">Verifiche 3.1 da completare</span></div>'
+                            f'<p class="muted">Si puo\' gia\' compilare lo scoring; per <strong>mettere agli atti</strong> e procedere serve completare la 3.1:</p>'
+                            f'<ul class="clean-list">{lis}</ul></section>')
+                section = warn + self.practice_tab_cvoi(ctx, practice)
+            else:  # fascicolo (3.3)
+                # 3.3: fascicolo M7 con richiamo doc 3.1/3.2, bozza descrittiva (IA) + firma -> trasmissione Advisory
+                if not passed:
+                    section = gate_block("Fascicolo di valutazione (M7)", "verifiche", reasons)
+                elif not scoring_done:
+                    section = gate_block("Fascicolo di valutazione (M7)", "scoring",
+                                         ["la scheda di scoring (M6) non e' completa: tutti i valutatori devono validare (salvo astensioni), min. 2"])
                 else:
-                    section = (self.render_full_dossier(ctx, practice)
-                               + self.practice_tab_cvoi(ctx, practice)
-                               + self.render_trasmissione_advisory(ctx, practice))
+                    section = (self.recall_documents_html(
+                                   ctx, practice, ["CVOI", "KIIS", "Verifiche interne"],
+                                   "Documenti richiamati (3.1 verifiche M5 e 3.2 scoring M6)")
+                               + self.render_fascicolo_m7(ctx, practice))
             body = subnav + section
         elif fase == "fase4":
             # Sessione dedicata Advisory Committee: esamina CVOI + bozza KIIS e rende il parere non vincolante.
@@ -7014,72 +7193,186 @@ document.querySelectorAll('[data-campaign-form]').forEach((form) => {
 
     def practice_tab_cvoi(self, ctx, practice):
         pid = practice["id"]
-        report = row("SELECT * FROM cvoi_reports WHERE practice_id = ? ORDER BY id DESC LIMIT 1", (pid,))
-        saved = {}
-        if report:
-            for s in rows("SELECT area_key, idx, raw_score FROM cvoi_criteria_scores WHERE cvoi_report_id = ?", (report["id"],)):
-                saved[(s["area_key"], s["idx"])] = s["raw_score"]
-        area_fields = ""
-        for n, (key, label, w, mx, thr) in enumerate(CVOI_AREAS, start=1):
-            crit_rows = ""
-            for i, crit in enumerate(CVOI_CRITERIA[key]):
-                val = saved.get((key, i), "")
-                val_str = f"{val:g}" if val != "" else ""
-                crit_rows += f"""
-      <div class="crit-row">
-        <span>{esc(crit)}</span>
-        <input name="raw_{key}_{i}" type="number" min="0" max="{CVOI_CRITERION_MAX}" step="1" value="{val_str}" required>
-      </div>"""
-            area_fields += f"""
-    <fieldset class="cvoi-area-block">
-      <legend>{n}) {esc(label)} &middot; peso {int(w*100)}% &middot; max {int(mx)} &middot; soglia {int(thr)}</legend>
-      {crit_rows}
-    </fieldset>"""
-        summary = ""
-        if report:
-            doc_link = (
-                f'<a class="button tiny" href="{rel_url("/documents/" + str(report["generated_document_id"]) + "/download", ctx)}">Apri verbale CVOI</a>'
-                if report["generated_document_id"] else ""
-            )
-            wf = report["workflow_status"] if "workflow_status" in report.keys() else "bozza"
-            validated = (report["review_status"] == "validato") if "review_status" in report.keys() else False
-            validate_btn = (
-                '<span class="badge success">Validato</span>' if validated else
-                f'''<form method="post" action="/pariter/practices/{pid}/cvoi" style="display:inline">
-                    {hidden_ctx(ctx)}<input type="hidden" name="action" value="validate">
-                    <button class="button tiny" type="submit">Valida verbale</button></form>'''
-            )
-            summary = f"""
+        locked = bool(practice["closed_at"])
+        is_admin = ctx["user"]["role"] == "admin"
+        with connect() as conn:
+            c = compute_cvoi_collegial(conn, practice)
+            report = conn.execute("SELECT * FROM cvoi_reports WHERE practice_id = ? ORDER BY id DESC LIMIT 1", (pid,)).fetchone()
+        evaluators = c["evaluators"]
+        ev_ids = [e["id"] for e in evaluators]
+        # valutatore da compilare: admin sceglie (?ev=), altrimenti se stesso
+        sel = None
+        q = self.get_query_param("ev")
+        if is_admin and q and q.isdigit() and int(q) in ev_ids:
+            sel = int(q)
+        elif ctx["user_id"] in ev_ids:
+            sel = ctx["user_id"]
+        elif is_admin and ev_ids:
+            sel = ev_ids[0]
+        can_fill = (not locked) and (sel is not None) and (is_admin or sel == ctx["user_id"])
+
+        # --- Stato valutatori (fatto/fatto/fatto) ---
+        st_badge = {"da_compilare": '<span class="badge neutral">Da compilare</span>',
+                    "salvato": '<span class="badge warning">Salvato (da validare)</span>',
+                    "validato": '<span class="badge success">Validato &check;</span>',
+                    "astenuto": '<span class="badge neutral">Astenuto</span>'}
+        st_rows = "".join(
+            f'<tr><td>{esc(e["name"])}</td><td>{st_badge.get(c["ev_status"][e["id"]], c["ev_status"][e["id"]])}</td></tr>'
+            for e in evaluators)
+        status_panel = f"""
 <section class="panel">
-  <div class="section-head"><h2>Esito CVOI</h2><span class="badge {badge_class(CVOI_OUTCOME_LABELS.get(report['outcome'], report['outcome']))}">{esc(CVOI_OUTCOME_LABELS.get(report['outcome'], report['outcome']))}</span></div>
+  <div class="section-head"><h2>Stato della valutazione collegiale</h2>
+    <span class="badge {"success" if c["all_done"] else "warning"}">{c["n_confirmed"]} validati su {len(evaluators)}</span></div>
+  <p class="muted">Ogni componente compila i propri punteggi, li salva e li <strong>valida</strong>. Quando tutti hanno validato (salvo astensioni) la scheda e' completa e si mette agli atti.</p>
+  <table class="data-table compact"><thead><tr><th>Valutatore</th><th>Stato</th></tr></thead><tbody>{st_rows}</tbody></table>
+</section>"""
+
+        # --- Esito collegiale ---
+        outcome_lbl = CVOI_OUTCOME_LABELS.get(c["outcome"], c["outcome"]) if c["valid"] else "Da completare (min. 2 valutatori)"
+        area_lines = ""
+        for key, label, w, mx, thr in CVOI_AREAS:
+            raw = c["area_totals"].get(key, 0)
+            wsc = round(raw * w, 2)
+            minw = CVOI_AREA_MIN_WEIGHTED[key]
+            ok_badge = ('<span class="badge success">ok</span>' if wsc >= minw
+                        else '<span class="badge danger">sotto soglia</span>')
+            area_lines += (f'<tr><td>{esc(label)}</td><td>{raw:g}/{int(mx)}</td><td>{wsc:g}</td>'
+                           f'<td>{minw:g}</td><td>{ok_badge}</td></tr>')
+        valbadge = (f'<span class="badge success">{c["n_val"]} valutatori</span>' if c["valid"]
+                    else f'<span class="badge warning">{c["n_val"]} valutatori (min. 2)</span>')
+        summary = f"""
+<section class="panel">
+  <div class="section-head"><h2>Esito collegiale CVOI (M6)</h2><span class="badge {badge_class(outcome_lbl)}">{esc(outcome_lbl)}</span></div>
   <div class="meta-grid">
-    <div><span class="muted">Punteggio ponderato</span><br><strong>{report['weighted_score']:g}</strong> / soglia {CVOI_OVERALL_THRESHOLD:g}</div>
-    <div><span class="muted">Stato redazione</span><br>{esc(wf)}</div>
+    <div><span class="muted">Media ponderata</span><br><strong>{c['weighted']:g}</strong> / soglia {CVOI_OVERALL_THRESHOLD:g}</div>
+    <div><span class="muted">Partecipazione</span><br>{valbadge}</div>
   </div>
-  <div class="form-actions">{doc_link} {validate_btn}</div>
+  <table class="data-table compact"><thead><tr><th>Area</th><th>Punteggio (somma medie)</th><th>Ponderato</th><th>Min. ponderato</th><th></th></tr></thead><tbody>{area_lines}</tbody></table>
+  <p class="muted">La valutazione e' collegiale: il punteggio e' la <strong>media dei valutatori, criterio per criterio</strong> (esclusi gli astenuti). Non si vota a maggioranza. Soglia complessiva {CVOI_OVERALL_THRESHOLD:g}/95; minimi per area 6,30 / 7,35 / 5,40.</p>
 </section>"""
-        rv = lambda k: esc(report[k]) if report and k in report.keys() and report[k] else ""
-        form = f"""
+
+        # --- Tabella collegiale: criteri x valutatori + media + astenuti ---
+        head_ev = "".join(f"<th>{esc((e['name'] or '').split()[0])}</th>" for e in evaluators)
+        body = ""
+        for n, (key, label, w, mx, thr) in enumerate(CVOI_AREAS, start=1):
+            body += f'<tr class="group-row"><td colspan="{len(evaluators)+3}"><strong>{n}) {esc(label)}</strong> &middot; peso {int(w*100)}% &middot; min ponderato {CVOI_AREA_MIN_WEIGHTED[key]:g}</td></tr>'
+            for i, crit in enumerate(CVOI_CRITERIA[key]):
+                d = c["detail"][(key, i)]
+                cells = ""
+                for e in evaluators:
+                    if e["id"] in c["abstained"]:
+                        cells += '<td class="muted">ast.</td>'
+                    else:
+                        v = d["per"].get(e["id"])
+                        cells += f"<td>{(f'{v:g}' if v is not None else '–')}</td>"
+                n_abst = sum(1 for e in evaluators if e["id"] in c["abstained"])
+                body += (f'<tr><td>{esc(crit)}</td>{cells}'
+                         f'<td><strong>{d["media"]:g}</strong></td><td class="muted">{n_abst}</td></tr>')
+        table = f"""
 <section class="panel">
-  <div class="section-head"><h2>Verbale CVOI - scoring per criterio</h2></div>
-  <form method="post" action="/pariter/practices/{pid}/cvoi">
-    {hidden_ctx(ctx)}<input type="hidden" name="action" value="save">
-    <div class="form-grid">
-      <label>Mail proponente<input name="mail" value="{rv('mail')}"></label>
-      <label>Data caricamento<input name="data_caricamento" type="date" value="{rv('data_caricamento')}"></label>
-      <label>Data valutazione<input name="data_valutazione" type="date" value="{rv('data_valutazione')}"></label>
-    </div>
-    {area_fields}
-    <label>Note di valutazione (qualitative)<textarea name="notes_qualitative" rows="5">{rv('notes_qualitative')}</textarea></label>
-    <label>Clausola di chiusura per il CdA<textarea name="closing_note" rows="3">{rv('closing_note')}</textarea></label>
-    <label>Condizioni / note di sintesi<textarea name="conditions" rows="2">{rv('conditions')}</textarea></label>
-    <div class="form-actions"><button class="button primary" type="submit">Calcola e genera verbale</button></div>
-  </form>
-  <p class="muted">Soglia minima complessiva: {CVOI_OVERALL_THRESHOLD:g} = (18&times;0,35)+(21&times;0,35)+(18&times;0,30). Ogni criterio 0-{CVOI_CRITERION_MAX}.</p>
+  <div class="section-head"><h2>Punteggi collegiali (per valutatore)</h2></div>
+  <table class="data-table compact"><thead><tr><th>Criterio</th>{head_ev}<th>Media</th><th>Astenuti</th></tr></thead><tbody>{body}</tbody></table>
+  <p class="muted">I punteggi individuali, le astensioni motivate e le note restano tracciati nel fascicolo: la media non cancella il dettaglio.</p>
 </section>"""
-        members_panel = self.cvoi_members_panel(ctx, practice, report) if report else ""
+
+        # --- Form di compilazione del singolo valutatore ---
+        fill = ""
+        if evaluators:
+            ev_pick = ""
+            if is_admin:
+                opts = "".join(f'<option value="{e["id"]}"{" selected" if e["id"]==sel else ""}>{esc(e["name"])}</option>' for e in evaluators)
+                ev_pick = (f'<form method="get" class="inline-form" style="margin-bottom:8px"><input type="hidden" name="platform" value="{ctx["platform_id"]}">'
+                           f'<input type="hidden" name="user" value="{ctx["user_id"]}"><input type="hidden" name="fase" value="fase3"><input type="hidden" name="sub" value="scoring">'
+                           f'<label>Compila per (admin): <select name="ev" data-autosubmit>{opts}</select></label></form>')
+            if can_fill:
+                sel_name = next((e["name"] for e in evaluators if e["id"] == sel), "")
+                is_abst = sel in c["abstained"]
+                reason = c["status"].get(sel, {})
+                reason_v = reason["reason"] if reason else ""
+                sel_state = c["ev_status"].get(sel, "da_compilare")
+                state_lbl = st_badge.get(sel_state, sel_state)
+                if is_abst:
+                    inner_fill = '<p class="muted">Valutatore astenuto su questo progetto: nessun punteggio conteggiato.</p>'
+                else:
+                    crit_inputs = ""
+                    for n, (key, label, w, mx, thr) in enumerate(CVOI_AREAS, start=1):
+                        rows_in = ""
+                        for i, crit in enumerate(CVOI_CRITERIA[key]):
+                            v = c["scores"].get((sel, key, i))
+                            vs = f"{v:g}" if v is not None else ""
+                            rows_in += (f'<div class="crit-row"><span>{esc(crit)}</span>'
+                                        f'<input name="raw_{key}_{i}" type="number" min="0" max="{CVOI_CRITERION_MAX}" step="1" value="{vs}"></div>')
+                        crit_inputs += f'<fieldset class="cvoi-area-block"><legend>{n}) {esc(label)}</legend>{rows_in}</fieldset>'
+                    # form sempre disponibile, dietro una voce esplicita "Compila"; aperto se non ancora validato
+                    summary_txt = ("Modifica i punteggi (gia' validati)" if sel_state == "validato"
+                                   else f"Compila i punteggi di {sel_name}")
+                    open_attr = "" if sel_state == "validato" else " open"
+                    note = ('<p class="muted">Punteggi gia\' validati: modificandoli dovrai rivalidare.</p>'
+                            if sel_state == "validato" else
+                            f'<p class="muted">Assegna 0-{CVOI_CRITERION_MAX} a ogni criterio, <strong>Salva</strong> e poi <strong>Valida</strong>. La media tra i valutatori e\' calcolata automaticamente.</p>')
+                    inner_fill = f"""
+  <details class="comm-block"{open_attr}>
+    <summary><strong>{esc(summary_txt)}</strong></summary>
+    {note}
+    <form method="post" action="/pariter/practices/{pid}/cvoi">
+      {hidden_ctx(ctx)}<input type="hidden" name="evaluator_id" value="{sel}">
+      {crit_inputs}
+      <div class="form-actions left">
+        <button class="button secondary" type="submit" name="action" value="save_scores">Salva i punteggi</button>
+        <button class="button primary" type="submit" name="action" value="confirm_scores">Valida i punteggi</button>
+      </div>
+    </form>
+  </details>"""
+                abst_form = f"""
+  <form class="form-grid" method="post" action="/pariter/practices/{pid}/cvoi" style="margin-top:10px">
+    {hidden_ctx(ctx)}<input type="hidden" name="action" value="abstain"><input type="hidden" name="evaluator_id" value="{sel}">
+    <label class="span2">Astensione motivata (solo per causa legittima: conflitto/impedimento)<input name="reason" value="{esc(reason_v)}" placeholder="motivo a verbale"></label>
+    <div class="form-actions"><button class="button secondary" type="submit">{'Revoca astensione' if is_abst else 'Astieniti su questo progetto'}</button></div>
+  </form>"""
+                fill = f"""
+<section class="panel">
+  <div class="section-head"><h2>Punteggi - {esc(sel_name)}</h2>{state_lbl}</div>
+  {ev_pick}
+  {inner_fill}
+  {abst_form}
+</section>"""
+            elif is_admin:
+                fill = f'<section class="panel"><div class="section-head"><h2>Punteggi valutatore</h2></div>{ev_pick}</section>'
+
+        # --- Scheda completa: tutti hanno validato -> metti agli atti e procedi ---
+        completa = ""
+        dl = (f'<a class="button tiny" href="{rel_url("/documents/" + str(report["generated_document_id"]) + "/download", ctx)}">Apri scheda M6</a>'
+              if report and report["generated_document_id"] else "")
+        if c["all_done"]:
+            genera = ""
+            if not locked:
+                genera = (f'<form method="post" action="/pariter/practices/{pid}/cvoi" style="display:inline">'
+                          f'{hidden_ctx(ctx)}<input type="hidden" name="action" value="genera">'
+                          f'<button class="button primary" type="submit">Metti agli atti (genera scheda M6)</button></form>')
+            avanti = f'<a class="button tiny" href="{rel_url("/pariter/practices/" + str(pid), ctx, {"fase": "fase3", "sub": "fascicolo"})}">Vai a 3.3 - Fascicolo (M7)</a>'
+            completa = f"""
+<section class="panel">
+  <div class="section-head"><h2>Scheda di valutazione completa</h2><span class="badge success">fatto &times;{c["n_confirmed"]}</span></div>
+  <p>Tutti i valutatori hanno validato (salvo astensioni). La scheda M6 e' completa: mettila agli atti e prosegui alla redazione del fascicolo (M7), che sara' firmato e trasmesso all'Advisory.</p>
+  <p class="muted">La scheda M6 non viene "formata"/firmata qui: e' solo costruita e messa agli atti. L'unica firma e' quella del fascicolo M7 che va all'Advisory.</p>
+  <div class="form-actions">{genera} {dl} {avanti}</div>
+</section>"""
+        elif c["valid"]:
+            completa = (f'<section class="panel"><div class="section-head"><h2>Scheda di valutazione</h2>'
+                        f'<span class="badge warning">in corso</span></div>'
+                        f'<p class="muted">La scheda sara\' completa quando tutti i valutatori avranno validato i propri punteggi '
+                        f'(attuali validati: {c["n_confirmed"]}/{len(evaluators)}, esclusi gli astenuti).</p>{dl}</section>')
         log_panel = self.cvoi_log_panel(report) if report else ""
-        return summary + members_panel + log_panel + form
+        # Punteggi in chiaro degli altri solo a valutazione conclusa (scoring "alla cieca"); l'admin vede sempre.
+        reveal = is_admin or c["all_done"]
+        if reveal:
+            scores_block = summary + table
+        else:
+            scores_block = ('<section class="panel"><div class="section-head"><h2>Punteggi degli altri valutatori</h2>'
+                            '<span class="badge neutral">Riservati</span></div>'
+                            '<p class="muted">I punteggi e la media in chiaro degli altri valutatori compaiono solo quando '
+                            'tutti hanno completato e validato (valutazione collegiale senza reciproca influenza). Tu vedi la tua scheda qui sopra.</p></section>')
+        return status_panel + fill + scores_block + completa + log_panel
 
     def cvoi_members_panel(self, ctx, practice, report):
         pid = practice["id"]
@@ -7323,6 +7616,127 @@ document.querySelectorAll('[data-campaign-form]').forEach((form) => {
   {gate}
 </section>"""
 
+    def render_fascicolo_m7(self, ctx, practice):
+        """3.3: dashboard di recap + fascicolo M7 (genera/modifica/salva) + firma per ogni membro +
+        invio all'Advisory (solo se idoneo) oppure comunicazione di non accoglimento (C6)."""
+        pid = practice["id"]
+        locked = bool(practice["closed_at"])
+        is_admin = ctx["user"]["role"] == "admin"
+        url = f"/pariter/practices/{pid}/internal-review"
+        with connect() as conn:
+            c = compute_cvoi_collegial(conn, practice)
+            fasc = conn.execute("SELECT * FROM internal_reviews WHERE practice_id = ? AND review_type = 'fascicolo'", (pid,)).fetchone()
+            evals = cvoi_committee_members(conn)
+            sigs = {r["member_id"]: r["signed_at"] for r in
+                    conn.execute("SELECT member_id, signed_at FROM m7_signatures WHERE practice_id = ?", (pid,)).fetchall()}
+            ndocs = conn.execute("SELECT COUNT(*) FROM documents WHERE practice_id = ? AND origin IN ('CVOI','KIIS','Verifiche interne')", (pid,)).fetchone()[0]
+        outcome = c["outcome"]
+        esito_pos = outcome in ("superato", "superato_condizioni")
+        esito_lbl = CVOI_OUTCOME_LABELS.get(outcome, outcome)
+        kc_lbl = KIIS_COERENZA_LABELS.get(_practice_val(practice, "m_kiis_coerenza"), "non verificata")
+        cf_lbl = CONFLITTI_MERITO_LABELS.get(_practice_val(practice, "m_conflitti"), "non valutato")
+
+        # --- Dashboard recap ---
+        dash = f"""
+<section class="panel">
+  <div class="section-head"><h2>3.3 Fascicolo di valutazione (M7) - recap</h2>
+    <span class="badge {badge_class(esito_lbl)}">{esc(esito_lbl)}</span></div>
+  <div class="meta-grid">
+    <div><span class="muted">Scoring CVOI (M6)</span><br><strong>{c['weighted']:g}</strong>/{CVOI_OVERALL_THRESHOLD:g} &middot; {c['n_confirmed']} validati</div>
+    <div><span class="muted">Verifica KIIS (M5)</span><br>{esc(kc_lbl)}</div>
+    <div><span class="muted">Conflitti</span><br>{esc(cf_lbl)}</div>
+    <div><span class="muted">Documenti richiamati</span><br>{ndocs}</div>
+  </div>
+</section>"""
+
+        # --- Documento M7: genera (IA) / modifica / salva / scarica ---
+        has_doc = bool(fasc and (fasc["body"] or fasc["generated_document_id"]))
+        doc_id = fasc["generated_document_id"] if fasc else None
+        dl = (f'<a class="button tiny" href="{rel_url("/documents/" + str(doc_id) + "/download", ctx)}">Scarica</a>'
+              if doc_id else "")
+        if locked:
+            docpanel = f'<section class="panel"><div class="section-head"><h2>Documento M7</h2></div>{dl}</section>'
+        elif not has_doc:
+            docpanel = f"""
+<section class="panel">
+  <div class="section-head"><h2>Documento M7</h2><span class="badge neutral">Da generare</span></div>
+  <p class="muted">Genera la bozza descrittiva (IA) a 8 sezioni dai dati di 3.1 e 3.2, poi modificala e falla firmare ai membri.</p>
+  <form method="post" action="{url}" style="display:inline">{hidden_ctx(ctx)}<input type="hidden" name="review_type" value="fascicolo"><input type="hidden" name="action" value="generate">
+    <button class="button primary" type="submit">Genera bozza M7 (IA)</button></form>
+</section>"""
+        else:
+            body_val = esc(fasc["body"] or compose_internal_review_draft(practice, "fascicolo"))
+            docpanel = f"""
+<section class="panel">
+  <div class="section-head"><h2>Documento M7</h2><span class="badge warning">Bozza modificabile</span></div>
+  <form class="form-grid" method="post" action="{url}">
+    {hidden_ctx(ctx)}<input type="hidden" name="review_type" value="fascicolo"><input type="hidden" name="action" value="save_body">
+    <label class="full-span">Testo del fascicolo (modificabile)<textarea name="body" rows="14" class="doc-draft">{body_val}</textarea></label>
+    <div class="form-actions left"><button class="button secondary" type="submit">Salva</button>{dl}</div>
+  </form>
+</section>"""
+
+        # --- Firme dei membri ---
+        signers = [e for e in evals if e["id"] not in c["abstained"]]
+        all_signed = bool(signers) and all(e["id"] in sigs for e in signers)
+        sig_rows = ""
+        for e in evals:
+            if e["id"] in c["abstained"]:
+                sig_rows += f'<tr><td>{esc(e["name"])}</td><td><span class="badge neutral">Astenuto</span></td><td></td></tr>'
+                continue
+            signed = sigs.get(e["id"])
+            can_act = has_doc and not locked and (is_admin or e["id"] == ctx["user_id"])
+            if signed:
+                badge = f'<span class="badge success">Firmato &middot; {esc(signed[:16])}</span>'
+                btn = (f'<form method="post" action="/pariter/practices/{pid}/fascicolo-firma" style="display:inline"><input type="hidden" name="action" value="unsign"><input type="hidden" name="member_id" value="{e["id"]}">{hidden_ctx(ctx)}<button class="button tiny" type="submit">Annulla firma</button></form>'
+                       if can_act else "")
+            else:
+                badge = '<span class="badge warning">Da firmare</span>'
+                btn = (f'<form method="post" action="/pariter/practices/{pid}/fascicolo-firma" style="display:inline"><input type="hidden" name="action" value="sign"><input type="hidden" name="member_id" value="{e["id"]}">{hidden_ctx(ctx)}<button class="button tiny primary" type="submit">Firma</button></form>'
+                       if can_act else "")
+            sig_rows += f'<tr><td>{esc(e["name"])}</td><td>{badge}</td><td>{btn}</td></tr>'
+        sigpanel = f"""
+<section class="panel">
+  <div class="section-head"><h2>Firme del fascicolo (Comitato Tecnico)</h2>
+    <span class="badge {"success" if all_signed else "warning"}">{sum(1 for e in signers if e["id"] in sigs)}/{len(signers)} firme</span></div>
+  <p class="muted">Ogni membro firma il fascicolo M7 (gli astenuti sono esclusi). L'admin puo' firmare per ogni membro. Serve generare il documento prima di firmare.</p>
+  <table class="data-table compact"><thead><tr><th>Membro</th><th>Stato</th><th></th></tr></thead><tbody>{sig_rows}</tbody></table>
+</section>"""
+
+        # --- Trasmissione Advisory (idoneo) oppure non accoglimento (C6) ---
+        gia = _practice_val(practice, "m_advisory_trasmesso")
+        if esito_pos:
+            reasons = []
+            if not has_doc:
+                reasons.append("documento M7 non ancora generato")
+            if not all_signed:
+                reasons.append("mancano le firme dei membri")
+            if gia:
+                trasm = (f'<p><span class="badge success">Trasmesso il {esc(gia[:16])}</span> '
+                         f'<a class="button tiny" href="{rel_url("/pariter/practices/" + str(pid), ctx, {"fase": "fase4"})}">Vai all\'Advisory (Fase 4)</a></p>')
+            elif reasons:
+                lis = "".join(f"<li>{esc(r)}</li>" for r in reasons)
+                trasm = (f'<p class="muted">Per trasmettere mancano:</p><ul class="clean-list">{lis}</ul>'
+                         f'<div class="form-actions"><button class="button primary" disabled>Invia all\'Advisory Committee</button></div>')
+            else:
+                btn = (f'<form method="post" action="/pariter/practices/{pid}/trasmetti-advisory">{hidden_ctx(ctx)}'
+                       f'<div class="form-actions"><button class="button primary" type="submit">Invia all\'Advisory Committee</button></div></form>'
+                       if not locked else "")
+                trasm = f'<p>Esito idoneo, documento firmato da tutti: trasmissibile. Nessuna comunicazione di esito al proponente in questa fase.</p>{btn}'
+            trasmpanel = f"""<section class="panel"><div class="section-head"><h2>Trasmissione all'Advisory Committee</h2></div>{trasm}</section>"""
+        else:
+            c6 = self.phase_emails_html(ctx, practice, ["C6"], "fase3",
+                                        title="Comunicazione al proponente - pratica non accolta (C6)",
+                                        intro="Esito CVOI non idoneo: il progetto non supera la valutazione di merito. Comunica al proponente che la pratica non e' stata accolta.",
+                                        back_sub="fascicolo")
+            trasmpanel = f"""
+<section class="panel">
+  <div class="section-head"><h2>Trasmissione all'Advisory Committee</h2><span class="badge danger">Esito non idoneo</span></div>
+  <p class="muted">Lo scoring e' sotto soglia: non si trasmette all'Advisory.</p>
+  <div class="form-actions"><button class="button primary" disabled>Invia all'Advisory Committee</button></div>
+</section>{c6}"""
+        return dash + docpanel + sigpanel + trasmpanel
+
     def render_trasmissione_advisory(self, ctx, practice):
         """3.3: trasmissione del fascicolo (CVOI + tabella + bozza KIIS) all'Advisory Committee."""
         pid = practice["id"]
@@ -7330,14 +7744,20 @@ document.querySelectorAll('[data-campaign-form]').forEach((form) => {
         can = user_can(ctx["user"], "manage_practice") and not locked
         with connect() as conn:
             cvoi = cvoi_summary_for(conn, pid)
+            fasc = conn.execute(
+                "SELECT review_status FROM internal_reviews WHERE practice_id = ? AND review_type = 'fascicolo'", (pid,)
+            ).fetchone()
         esito_pos = bool(cvoi and cvoi.get("outcome") in ("superato", "superato_condizioni"))
         # sez. 7 e 8 del fascicolo obbligatorie: esiti conflitti e KIIS dalla 3.1
         sez7 = _practice_val(practice, "m_conflitti") in ("nessuno", "gestibile")
         sez8 = _practice_val(practice, "m_kiis_coerenza") == "coerente"
+        fasc_ok = bool(fasc and fasc["review_status"] in ("firmata", "caricata", "validata"))
         gia = _practice_val(practice, "m_advisory_trasmesso")
         reasons = []
         if not esito_pos:
-            reasons.append("scoring CVOI senza esito positivo (sotto soglia o non redatto)")
+            reasons.append("scoring CVOI (M6) senza esito positivo (sotto soglia o non redatto)")
+        if not fasc_ok:
+            reasons.append("fascicolo di valutazione (M7) non ancora firmato/prodotto")
         if not sez7:
             reasons.append("sez. 7 fascicolo: esito conflitti mancante")
         if not sez8:
@@ -7412,7 +7832,7 @@ document.querySelectorAll('[data-campaign-form]').forEach((form) => {
                 msg = "Bozza KIIS generata dal template."
             log_audit(conn, ctx["platform_id"], ctx["user_id"], "practice", practice_id, "Bozza KIIS", action)
             conn.commit()
-        self.redirect(f"/pariter/practices/{practice_id}", ctx, msg, {"fase": "fase3", "sub": "kiis"})
+        self.redirect(f"/pariter/practices/{practice_id}", ctx, msg, {"fase": "fase3", "sub": "verifiche"})
 
     def post_practice_merito(self, practice_id, form):
         ctx = self.ctx_from_form(form)
@@ -7444,7 +7864,29 @@ document.querySelectorAll('[data-campaign-form]').forEach((form) => {
                 msg = "Azione non riconosciuta."
             log_audit(conn, ctx["platform_id"], ctx["user_id"], "practice", practice_id, "Verifiche di merito", f"{action}={val}")
             conn.commit()
-        self.redirect(f"/pariter/practices/{practice_id}", ctx, msg, {"fase": "fase3", "sub": "kiis"})
+        self.redirect(f"/pariter/practices/{practice_id}", ctx, msg, {"fase": "fase3", "sub": "verifiche"})
+
+    def post_practice_fascicolo_firma(self, practice_id, form):
+        ctx = self.ctx_from_form(form)
+        practice = self._practice_guard(ctx, practice_id, "fase3", perm="cvoi_draft")
+        if not practice:
+            return
+        is_admin = ctx["user"]["role"] == "admin"
+        action = form.get("action", "sign")
+        raw = (form.get("member_id", "") or "").strip()
+        mid = int(raw) if raw.isdigit() else ctx["user_id"]
+        with connect() as conn:
+            evals = {e["id"] for e in cvoi_committee_members(conn)}
+            if mid not in evals or (not is_admin and mid != ctx["user_id"]):
+                self.redirect(f"/pariter/practices/{practice_id}", ctx, "Firma non consentita.", {"fase": "fase3", "sub": "fascicolo"}); return
+            conn.execute("DELETE FROM m7_signatures WHERE practice_id = ? AND member_id = ?", (practice_id, mid))
+            if action == "sign":
+                conn.execute("INSERT INTO m7_signatures(practice_id, member_id, signed_at) VALUES (?, ?, ?)",
+                             (practice_id, mid, now_iso()))
+            log_audit(conn, ctx["platform_id"], ctx["user_id"], "practice", practice_id, "Firma fascicolo M7", f"{action} membro {mid}")
+            conn.commit()
+        self.redirect(f"/pariter/practices/{practice_id}", ctx,
+                      "Firma registrata." if action == "sign" else "Firma annullata.", {"fase": "fase3", "sub": "fascicolo"})
 
     def post_practice_trasmetti_advisory(self, practice_id, form):
         ctx = self.ctx_from_form(form)
@@ -7453,16 +7895,33 @@ document.querySelectorAll('[data-campaign-form]').forEach((form) => {
             return
         passed, reasons = fase3_gate(practice)
         with connect() as conn:
-            cvoi = cvoi_summary_for(conn, practice_id)
-        esito_pos = bool(cvoi and cvoi.get("outcome") in ("superato", "superato_condizioni"))
+            c = compute_cvoi_collegial(conn, practice)
+            fasc = conn.execute(
+                "SELECT body, generated_document_id FROM internal_reviews WHERE practice_id = ? AND review_type = 'fascicolo'", (practice_id,)
+            ).fetchone()
+            sigs = {r["member_id"] for r in conn.execute("SELECT member_id FROM m7_signatures WHERE practice_id = ?", (practice_id,)).fetchall()}
+            signers = [e["id"] for e in cvoi_committee_members(conn) if e["id"] not in c["abstained"]]
+        esito_pos = c["outcome"] in ("superato", "superato_condizioni")
+        has_doc = bool(fasc and (fasc["body"] or fasc["generated_document_id"]))
+        all_signed = bool(signers) and all(mid in sigs for mid in signers)
         if not passed:
             self.redirect(f"/pariter/practices/{practice_id}", ctx,
-                          "Non trasmissibile: " + "; ".join(reasons) + ".", {"fase": "fase3", "sub": "scoring"})
+                          "Non trasmissibile: " + "; ".join(reasons) + ".", {"fase": "fase3", "sub": "fascicolo"})
             return
         if not esito_pos:
             self.redirect(f"/pariter/practices/{practice_id}", ctx,
-                          "Non trasmissibile: il fascicolo CVOI non ha esito positivo (scoring sotto soglia o incompleto).",
-                          {"fase": "fase3", "sub": "scoring"})
+                          "Non trasmissibile: lo scoring CVOI (M6) non ha esito positivo (sotto soglia o non redatto).",
+                          {"fase": "fase3", "sub": "fascicolo"})
+            return
+        if not has_doc:
+            self.redirect(f"/pariter/practices/{practice_id}", ctx,
+                          "Non trasmissibile: il fascicolo di valutazione (M7) non e' ancora generato.",
+                          {"fase": "fase3", "sub": "fascicolo"})
+            return
+        if not all_signed:
+            self.redirect(f"/pariter/practices/{practice_id}", ctx,
+                          "Non trasmissibile: mancano le firme dei membri sul fascicolo M7.",
+                          {"fase": "fase3", "sub": "fascicolo"})
             return
         with connect() as conn:
             conn.execute("UPDATE practices SET m_advisory_trasmesso = ?, updated_at = ? WHERE id = ?",
@@ -8346,7 +8805,8 @@ document.querySelectorAll('[data-campaign-form]').forEach((form) => {
         action = form.get("action", "generate")
         # ogni relazione vive nella sua fase: AML->fase2, coerenza KIIS->fase3, conflitti->fase5
         back = {"aml_art5": {"fase": "fase2", "sub": "ammissibilita"},
-                "coerenza_kiis": {"fase": "fase3", "sub": "kiis"},
+                "coerenza_kiis": {"fase": "fase3", "sub": "verifiche"},
+                "fascicolo": {"fase": "fase3", "sub": "fascicolo"},
                 "conflitti": {"fase": "fase5"}}.get(rtype, {"fase": "fase2"})
         if rtype not in INTERNAL_REVIEW_LABELS:
             self.redirect(f"/pariter/practices/{practice_id}", ctx, "Tipo relazione non valido.", back)
@@ -8574,87 +9034,107 @@ document.querySelectorAll('[data-campaign-form]').forEach((form) => {
         practice = self._practice_guard(ctx, practice_id, "cvoi", perm="cvoi_draft")
         if not practice:
             return
-        action = form.get("action", "save")
+        action = form.get("action", "save_scores")
+        is_admin = ctx["user"]["role"] == "admin"
+        back = {"fase": "fase3", "sub": "scoring"}
+        now = now_iso()
         with connect() as conn:
-            report = conn.execute(
-                "SELECT * FROM cvoi_reports WHERE practice_id = ? ORDER BY id DESC LIMIT 1", (practice_id,)
-            ).fetchone()
-            if action == "validate":
-                if report:
-                    conn.execute(
-                        "UPDATE cvoi_reports SET review_status = 'validato', updated_at = ? WHERE id = ?",
-                        (now_iso(), report["id"]),
-                    )
-                msg = "Report CVOI validato."
-            else:
-                # punteggi per criterio
-                criteria_scores = {}
-                for key, label, w, mx, thr in CVOI_AREAS:
-                    vals = []
+            evaluators = {e["id"]: e["name"] for e in cvoi_committee_members(conn)}
+
+            def _ev_from_form():
+                raw = (form.get("evaluator_id", "") or "").strip()
+                eid = int(raw) if raw.isdigit() else ctx["user_id"]
+                return eid
+
+            def _set_confirmed(eid, val):
+                cur = conn.execute("SELECT id FROM cvoi_eval_status WHERE practice_id = ? AND evaluator_id = ?", (practice_id, eid)).fetchone()
+                if cur:
+                    conn.execute("UPDATE cvoi_eval_status SET confirmed = ?, updated_at = ? WHERE id = ?", (val, now, cur["id"]))
+                else:
+                    conn.execute("INSERT INTO cvoi_eval_status(practice_id, evaluator_id, abstained, confirmed, updated_at) VALUES (?, ?, 0, ?, ?)",
+                                 (practice_id, eid, val, now))
+
+            if action in ("save_scores", "confirm_scores"):
+                eid = _ev_from_form()
+                if eid not in evaluators:
+                    self.redirect(f"/pariter/practices/{practice_id}", ctx, "Valutatore non valido.", back); return
+                if not is_admin and eid != ctx["user_id"]:
+                    self.redirect(f"/pariter/practices/{practice_id}", ctx, "Puoi inserire solo i tuoi punteggi.", back); return
+                conn.execute("DELETE FROM cvoi_eval_scores WHERE practice_id = ? AND evaluator_id = ?", (practice_id, eid))
+                for key, _l, _w, _m, _t in CVOI_AREAS:
                     for i in range(len(CVOI_CRITERIA[key])):
+                        raw = (form.get(f"raw_{key}_{i}", "") or "").strip()
+                        if raw == "":
+                            continue
                         try:
-                            v = float(form.get(f"raw_{key}_{i}", 0) or 0)
+                            v = max(0.0, min(float(raw), CVOI_CRITERION_MAX))
                         except ValueError:
-                            v = 0.0
-                        vals.append(max(0.0, min(v, CVOI_CRITERION_MAX)))
-                    criteria_scores[key] = vals
-                area_totals, weighted, outcome, _tr, _tm = compute_cvoi_from_criteria(criteria_scores)
-                conditions = form.get("conditions", "")
-                report_fields = {
-                    "mail": form.get("mail", ""),
-                    "data_caricamento": form.get("data_caricamento", ""),
-                    "data_valutazione": form.get("data_valutazione", ""),
-                    "notes_qualitative": form.get("notes_qualitative", ""),
-                    "closing_note": form.get("closing_note", ""),
-                }
-                html_doc = build_cvoi_html(practice, report_fields, criteria_scores)
+                            continue
+                        conn.execute("INSERT INTO cvoi_eval_scores(practice_id, evaluator_id, area_key, idx, score) VALUES (?, ?, ?, ?, ?)",
+                                     (practice_id, eid, key, i, v))
+                confirmed = 1 if action == "confirm_scores" else 0
+                _set_confirmed(eid, confirmed)
+                rid, c = save_cvoi_collegial(conn, practice, ctx["user_id"])
+                az = "validazione punteggi" if confirmed else "punteggi"
+                conn.execute("INSERT INTO cvoi_edit_log(cvoi_report_id, actor_user_id, actor_name, action, summary, created_at) VALUES (?, ?, ?, ?, ?, ?)",
+                             (rid, ctx["user_id"], ctx["user"]["name"], az, f"{evaluators[eid]} - media ponderata {c['weighted']:g} ({c['n_val']} valutatori)", now))
+                msg = (f"Punteggi di {evaluators[eid]} {'validati' if confirmed else 'salvati'}. Media ponderata {c['weighted']:g}/{CVOI_OVERALL_THRESHOLD:g}.")
+            elif action == "unconfirm":
+                eid = _ev_from_form()
+                if eid not in evaluators or (not is_admin and eid != ctx["user_id"]):
+                    self.redirect(f"/pariter/practices/{practice_id}", ctx, "Azione non consentita.", back); return
+                _set_confirmed(eid, 0)
+                save_cvoi_collegial(conn, practice, ctx["user_id"])
+                msg = f"Validazione di {evaluators[eid]} annullata: puoi modificare i punteggi."
+            elif action == "abstain":
+                eid = _ev_from_form()
+                if eid not in evaluators or (not is_admin and eid != ctx["user_id"]):
+                    self.redirect(f"/pariter/practices/{practice_id}", ctx, "Azione non consentita.", back); return
+                cur = conn.execute("SELECT id, abstained FROM cvoi_eval_status WHERE practice_id = ? AND evaluator_id = ?", (practice_id, eid)).fetchone()
+                new_abst = 0 if (cur and cur["abstained"]) else 1
+                reason = (form.get("reason", "") or "").strip()
+                if cur:
+                    conn.execute("UPDATE cvoi_eval_status SET abstained = ?, reason = ?, updated_at = ? WHERE id = ?",
+                                 (new_abst, reason, now, cur["id"]))
+                else:
+                    conn.execute("INSERT INTO cvoi_eval_status(practice_id, evaluator_id, abstained, reason, updated_at) VALUES (?, ?, ?, ?, ?)",
+                                 (practice_id, eid, new_abst, reason, now))
+                rid, c = save_cvoi_collegial(conn, practice, ctx["user_id"])
+                conn.execute("INSERT INTO cvoi_edit_log(cvoi_report_id, actor_user_id, actor_name, action, summary, created_at) VALUES (?, ?, ?, 'astensione', ?, ?)",
+                             (rid, ctx["user_id"], ctx["user"]["name"], f"{evaluators[eid]}: {'astensione' if new_abst else 'revoca astensione'}{(' - ' + reason) if (new_abst and reason) else ''}", now))
+                msg = f"{evaluators[eid]}: {'astensione registrata' if new_abst else 'astensione revocata'}."
+            elif action == "save_meta":
+                rid, _c = save_cvoi_collegial(conn, practice, ctx["user_id"])
+                conn.execute("""UPDATE cvoi_reports SET mail = ?, data_caricamento = ?, data_valutazione = ?,
+                                notes_qualitative = ?, updated_at = ? WHERE id = ?""",
+                             (form.get("mail", ""), form.get("data_caricamento", ""), form.get("data_valutazione", ""),
+                              form.get("notes_qualitative", ""), now, rid))
+                msg = "Dati di scoring salvati."
+            elif action == "genera":
+                rid, c = save_cvoi_collegial(conn, practice, ctx["user_id"])
+                if not c["valid"]:
+                    self.redirect(f"/pariter/practices/{practice_id}", ctx,
+                                  "Servono almeno 2 valutatori non astenuti per generare la scheda M6.", back); return
+                rep = conn.execute("SELECT * FROM cvoi_reports WHERE id = ?", (rid,)).fetchone()
+                report_fields = {"mail": rep["mail"] if "mail" in rep.keys() else "",
+                                 "data_caricamento": rep["data_caricamento"] if "data_caricamento" in rep.keys() else "",
+                                 "data_valutazione": rep["data_valutazione"] if "data_valutazione" in rep.keys() else "",
+                                 "notes_qualitative": rep["notes_qualitative"] if "notes_qualitative" in rep.keys() else ""}
+                html_doc = build_cvoi_html(practice, report_fields, c["criteria_scores"])
                 document_id = generated_document(
                     conn, ctx["platform_id"], None, practice["proponent_id"],
-                    "CVOI", "verbale", f"Verbale CVOI - {practice['project_title']}",
-                    "verbale_cvoi.html", html_doc, ctx["user_id"],
-                )
+                    "CVOI", "verbale", f"Scheda di scoring CVOI (M6) - {practice['project_title']}",
+                    "scoring_m6.html", html_doc, ctx["user_id"])
                 link_document_practice(conn, document_id, practice_id)
-                now = now_iso()
-                if report:
-                    conn.execute(
-                        """UPDATE cvoi_reports SET weighted_score = ?, outcome = ?, conditions = ?,
-                           notes_qualitative = ?, closing_note = ?, mail = ?, data_caricamento = ?, data_valutazione = ?,
-                           generated_document_id = ?, drafter_user_id = ?, updated_at = ? WHERE id = ?""",
-                        (weighted, outcome, conditions, report_fields["notes_qualitative"], report_fields["closing_note"],
-                         report_fields["mail"], report_fields["data_caricamento"], report_fields["data_valutazione"],
-                         document_id, ctx["user_id"], now, report["id"]),
-                    )
-                    conn.execute("DELETE FROM cvoi_criteria_scores WHERE cvoi_report_id = ?", (report["id"],))
-                    report_id = report["id"]
-                else:
-                    cur = conn.execute(
-                        """INSERT INTO cvoi_reports(practice_id, weighted_score, outcome, conditions, review_status, workflow_status,
-                           notes_qualitative, closing_note, mail, data_caricamento, data_valutazione,
-                           generated_document_id, drafter_user_id, created_by, created_at, updated_at)
-                           VALUES (?, ?, ?, ?, 'bozza', 'bozza', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-                        (practice_id, weighted, outcome, conditions, report_fields["notes_qualitative"], report_fields["closing_note"],
-                         report_fields["mail"], report_fields["data_caricamento"], report_fields["data_valutazione"],
-                         document_id, ctx["user_id"], ctx["user_id"], now, now),
-                    )
-                    report_id = cur.lastrowid
-                for key, _label, _w, _mx, _thr in CVOI_AREAS:
-                    for i, v in enumerate(criteria_scores[key]):
-                        conn.execute(
-                            "INSERT INTO cvoi_criteria_scores(cvoi_report_id, area_key, idx, raw_score) VALUES (?, ?, ?, ?)",
-                            (report_id, key, i, v),
-                        )
-                conn.execute(
-                    "INSERT INTO cvoi_edit_log(cvoi_report_id, actor_user_id, actor_name, action, summary, created_at) VALUES (?, ?, ?, 'redazione', ?, ?)",
-                    (report_id, ctx["user_id"], ctx["user"]["name"], f"Bozza aggiornata: {CVOI_OUTCOME_LABELS.get(outcome, outcome)} ({weighted:g})", now),
-                )
-                # una nuova versione invalida le approvazioni precedenti: torna in revisione
-                conn.execute("UPDATE cvoi_reports SET workflow_status = 'in_revisione' WHERE id = ?", (report_id,))
-                conn.execute("DELETE FROM cvoi_member_reviews WHERE cvoi_report_id = ?", (report_id,))
-                msg = f"Verbale CVOI generato: {CVOI_OUTCOME_LABELS.get(outcome, outcome)} ({weighted:g}). Approvazioni dei membri azzerate."
-            conn.execute("UPDATE practices SET updated_at = ? WHERE id = ?", (now_iso(), practice_id))
+                conn.execute("UPDATE cvoi_reports SET generated_document_id = ?, updated_at = ? WHERE id = ?",
+                             (document_id, now, rid))
+                msg = "Scheda di scoring (M6) generata (non firmata)."
+            else:
+                self.redirect(f"/pariter/practices/{practice_id}", ctx, "Azione non riconosciuta.", back); return
+            conn.execute("UPDATE practices SET updated_at = ? WHERE id = ?", (now, practice_id))
             log_audit(conn, ctx["platform_id"], ctx["user_id"], "practice", practice_id, "CVOI", action)
             conn.commit()
-        self.redirect(f"/pariter/practices/{practice_id}", ctx, msg, {"fase": "fase3", "sub": "scoring"})
+        self.redirect(f"/pariter/practices/{practice_id}", ctx, msg, back)
 
     def post_practice_close(self, practice_id, form):
         ctx = self.ctx_from_form(form)
