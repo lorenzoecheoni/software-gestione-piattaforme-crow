@@ -504,8 +504,9 @@ DOC_STATUS_LABELS = {
 }
 
 
-# LEI di Pariter Equity (ISO 17442). Da confermare con il valore reale.
-PARITER_LEI = "815600PARITEREQUITY0"
+# LEI di Pariter Equity (ISO 17442). Valore reale (InfoCamere, rinnovo 03/06/2026).
+# CF/P.IVA 02551670223 - rif. transazione LEII_957610.
+PARITER_LEI = "8156000666ABF6D29B78"
 
 
 def offer_identifier(practice):
@@ -4853,6 +4854,106 @@ th {{ background: #edf3f2; }}
 class App(BaseHTTPRequestHandler):
     server_version = "ECSPSuite/0.1"
 
+    def _send_json(self, obj, code=200):
+        data = json.dumps(obj, ensure_ascii=False).encode("utf-8")
+        self.send_response(code)
+        self.send_header("Content-Type", "application/json; charset=utf-8")
+        self.send_header("Content-Length", str(len(data)))
+        self.end_headers()
+        self.wfile.write(data)
+
+    def api_create_practice(self):
+        """API JSON: presa in carico di una candidatura dal portale proponente (pariter-equity).
+
+        Crea una pratica (riusando ingest_practice), assegna il numero pratica e registra
+        le comunicazioni C1 (PEC interna) e C2 (al proponente). Autenticazione opzionale via
+        header X-Api-Key se la variabile d'ambiente OMNICROWD_API_KEY e' impostata."""
+        try:
+            length = int(self.headers.get("Content-Length") or 0)
+            raw = self.rfile.read(length) if length else b""
+            payload = json.loads(raw.decode("utf-8")) if raw else {}
+        except (ValueError, TypeError, UnicodeDecodeError):
+            self._send_json({"error": "corpo JSON non valido"}, 400)
+            return
+        expected = os.environ.get("OMNICROWD_API_KEY", "")
+        if expected and self.headers.get("X-Api-Key", "") != expected:
+            self._send_json({"error": "non autorizzato"}, 401)
+            return
+        societa = payload.get("societa") or {}
+        rep = payload.get("legale_rappresentante") or {}
+        off = payload.get("offerta") or {}
+        denom = (societa.get("denominazione") or "").strip()
+        if not denom:
+            self._send_json({"error": "denominazione mancante"}, 400)
+            return
+        dossier = {"jsons": {"dati_struttura": {
+            "meta": {"piattaforma": "Pariter Equity (onboarding)"},
+            "societa": {
+                "denominazione": denom,
+                "forma": societa.get("forma_giuridica", ""),
+                "sedeLegale": societa.get("sede_legale", ""),
+                "pIva": societa.get("partita_iva", ""),
+                "pec": societa.get("pec", ""),
+                "cap": societa.get("cap", ""),
+                "citta": societa.get("citta", ""),
+                "rea": societa.get("rea", ""),
+                "codiceFiscale": societa.get("codice_fiscale", ""),
+            },
+            "legaleRappresentante": {"nome": rep.get("nome", ""), "carica": rep.get("carica", "")},
+            "offertaFase1": {
+                "importoTarget": off.get("importo_target", ""),
+                "importoMax": off.get("importo_massimo", ""),
+                "preMoney": off.get("pre_money", ""),
+                "equity": off.get("percentuale_equity", ""),
+                "strumento": off.get("strumento", ""),
+            },
+            "_pariter": payload,
+        }}, "files": []}
+        try:
+            with connect() as conn:
+                urow = conn.execute("SELECT id FROM users ORDER BY id LIMIT 1").fetchone()
+                actor_id = urow["id"] if urow else None
+                mapped = map_dossier_to_practice(dossier, 1, f"Offerta {denom}")
+                practice_id = ingest_practice(conn, dossier, mapped, 1, actor_id)
+                nr = f"{int(uuid.uuid4().int % 100000000):08d}"
+                conn.execute("UPDATE practices SET pratica_no = ?, updated_at = ? WHERE id = ?",
+                             (nr, now_iso(), practice_id))
+                practice = conn.execute("SELECT * FROM practices WHERE id = ?", (practice_id,)).fetchone()
+                comunicazioni = []
+                for code in ("C1", "C2"):
+                    d = self.practice_email_defaults(practice, code)
+                    conn.execute(
+                        """INSERT INTO practice_emails(practice_id, step_key, code, recipient, subject, body, sent_at, sent_by)
+                           VALUES (?, 'fase1', ?, ?, ?, ?, ?, ?)""",
+                        (practice_id, code, d["recipient"], d["subject"], d["body"], now_iso(), actor_id))
+                    comunicazioni.append(code)
+                conn.commit()
+        except Exception as exc:
+            print("[api_create_practice] errore:", repr(exc))
+            self._send_json({"error": "errore nella creazione della pratica"}, 500)
+            return
+        self._send_json({
+            "id": practice_id,
+            "numero_pratica": nr,
+            "status": "dossier_ricevuto",
+            "comunicazioni": comunicazioni,
+        }, 201)
+
+    def api_get_practice(self, practice_id):
+        """API JSON: stato sintetico di una pratica."""
+        with connect() as conn:
+            practice = conn.execute("SELECT * FROM practices WHERE id = ?", (practice_id,)).fetchone()
+        if not practice:
+            self._send_json({"error": "pratica non trovata"}, 404)
+            return
+        self._send_json({
+            "id": practice["id"],
+            "numero_pratica": practice["pratica_no"] or "",
+            "status": practice["status"],
+            "project_title": practice["project_title"],
+            "proponent_name": practice["proponent_name"],
+        })
+
     def do_GET(self):
         parsed = urlparse(self.path)
         path = parsed.path
@@ -4919,12 +5020,18 @@ class App(BaseHTTPRequestHandler):
             self.page_assistant()
         elif path == "/architecture":
             self.page_architecture()
+        elif re.fullmatch(r"/api/practices/\d+", path):
+            self.api_get_practice(int(path.rsplit("/", 1)[1]))
         else:
             self.not_found()
 
     def do_POST(self):
         parsed = urlparse(self.path)
         path = parsed.path
+        if path == "/api/practices":
+            # API JSON dal portale proponente: il body e' JSON, non form -> gestire prima di parse_post()
+            self.api_create_practice()
+            return
         form, files = self.parse_post()
         try:
             if path == "/deals/create":
