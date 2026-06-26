@@ -4954,6 +4954,107 @@ class App(BaseHTTPRequestHandler):
             "proponent_name": practice["proponent_name"],
         })
 
+    def _api_read_json(self):
+        """Legge e valida il body JSON + X-Api-Key opzionale. Ritorna il dict o None
+        (avendo gia' inviato la risposta d'errore)."""
+        try:
+            length = int(self.headers.get("Content-Length") or 0)
+            raw = self.rfile.read(length) if length else b""
+            payload = json.loads(raw.decode("utf-8")) if raw else {}
+        except (ValueError, TypeError, UnicodeDecodeError):
+            self._send_json({"error": "corpo JSON non valido"}, 400)
+            return None
+        expected = os.environ.get("OMNICROWD_API_KEY", "")
+        if expected and self.headers.get("X-Api-Key", "") != expected:
+            self._send_json({"error": "non autorizzato"}, 401)
+            return None
+        return payload
+
+    def _api_upsert_investor(self, conn, inv, amount=0.0):
+        """Crea o aggiorna un investitore (classificazione Allegato 19). Ritorna l'id."""
+        name = (inv.get("name") or "").strip()
+        email = (inv.get("email") or "").strip()
+        itype = inv.get("investor_type") or "Non sofisticato"
+        entry = inv.get("entry_test_status") or "Superato"
+        loss = inv.get("loss_simulation_status") or "Completata"
+        row = conn.execute(
+            "SELECT id FROM investors WHERE platform_id=1 AND email=?", (email,)).fetchone()
+        if row:
+            inv_id = row["id"]
+            conn.execute(
+                """UPDATE investors SET name=?, investor_type=?, entry_test_status=?,
+                   loss_simulation_status=?, total_invested=total_invested+?,
+                   source_system='adapter:pariter', last_synced_at=? WHERE id=?""",
+                (name, itype, entry, loss, float(amount or 0), now_iso(), inv_id))
+        else:
+            cur = conn.execute(
+                """INSERT INTO investors(platform_id, name, email, phone, investor_type, total_invested,
+                       entry_test_status, loss_simulation_status, threshold_status, crm_status,
+                       source_system, external_investor_id, last_synced_at, created_at)
+                   VALUES (1, ?, ?, ?, ?, ?, ?, ?, 'Verificato', 'Attivo', 'adapter:pariter', ?, ?, ?)""",
+                (name, email, (inv.get("phone") or ""), itype, float(amount or 0), entry, loss,
+                 (inv.get("external_investor_id") or ""), now_iso(), now_iso()))
+            inv_id = cur.lastrowid
+        return inv_id
+
+    def api_create_investor(self):
+        """API JSON: registra/aggiorna un investitore (classificazione Allegato 19)."""
+        payload = self._api_read_json()
+        if payload is None:
+            return
+        inv = payload.get("investor") or payload
+        if not (inv.get("name") and inv.get("email")):
+            self._send_json({"error": "nome ed email obbligatori"}, 400)
+            return
+        try:
+            with connect() as conn:
+                inv_id = self._api_upsert_investor(conn, inv)
+                log_audit(conn, 1, None, "investor", inv_id, "Investitore via API", inv.get("name", ""))
+                conn.commit()
+        except Exception as exc:
+            print("[api_create_investor] errore:", repr(exc))
+            self._send_json({"error": "errore registrazione investitore"}, 500)
+            return
+        self._send_json({"investor_id": inv_id}, 201)
+
+    def api_create_order(self):
+        """API JSON: registra un ordine (investitore + importo + offerta) e la comunicazione C8."""
+        payload = self._api_read_json()
+        if payload is None:
+            return
+        inv = payload.get("investor") or {}
+        if not (inv.get("name") and inv.get("email")):
+            self._send_json({"error": "investor.name e investor.email obbligatori"}, 400)
+            return
+        amount = float(payload.get("amount") or 0)
+        practice_id = payload.get("practice_id")
+        comunicazioni = []
+        try:
+            with connect() as conn:
+                urow = conn.execute("SELECT id FROM users ORDER BY id LIMIT 1").fetchone()
+                actor_id = urow["id"] if urow else None
+                inv_id = self._api_upsert_investor(conn, inv, amount)
+                if practice_id:
+                    practice = conn.execute("SELECT * FROM practices WHERE id=?", (practice_id,)).fetchone()
+                    if practice:
+                        t = EMAIL_TEMPLATES["C8"]
+                        nr = practice["pratica_no"] if practice["pratica_no"] else ""
+                        pratica = ("PRA" + nr) if nr else f"PRA-{practice['id']:04d}"
+                        fill = lambda s: s.format(proponente=practice["proponent_name"] or "-",
+                                                  progetto=practice["project_title"], pratica=pratica)
+                        conn.execute(
+                            """INSERT INTO practice_emails(practice_id, step_key, code, recipient, subject, body, sent_at, sent_by)
+                               VALUES (?, 'fase7', 'C8', ?, ?, ?, ?, ?)""",
+                            (practice_id, inv.get("email", ""), fill(t["subject"]), fill(t["body"]), now_iso(), actor_id))
+                        comunicazioni.append("C8")
+                log_audit(conn, 1, actor_id, "investor", inv_id, "Ordine via API", f"{inv.get('name','')} {amount}")
+                conn.commit()
+        except Exception as exc:
+            print("[api_create_order] errore:", repr(exc))
+            self._send_json({"error": "errore registrazione ordine"}, 500)
+            return
+        self._send_json({"investor_id": inv_id, "amount": amount, "comunicazioni": comunicazioni}, 201)
+
     def do_GET(self):
         parsed = urlparse(self.path)
         path = parsed.path
@@ -5031,6 +5132,12 @@ class App(BaseHTTPRequestHandler):
         if path == "/api/practices":
             # API JSON dal portale proponente: il body e' JSON, non form -> gestire prima di parse_post()
             self.api_create_practice()
+            return
+        if path == "/api/investors":
+            self.api_create_investor()
+            return
+        if path == "/api/orders":
+            self.api_create_order()
             return
         form, files = self.parse_post()
         try:
