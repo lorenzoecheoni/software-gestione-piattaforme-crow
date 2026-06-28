@@ -5086,6 +5086,39 @@ class App(BaseHTTPRequestHandler):
             return
         self._send_json({"investor_id": inv_id, "amount": amount, "comunicazioni": comunicazioni}, 201)
 
+    def api_create_complaint(self):
+        """API JSON: registra una voce nel registro reclami (M12) dal portale pubblico (pariter).
+        Additivo: inserisce in complaints con stato 'pendente', da classificare dal Responsabile.
+        Body: {protocollo, complainant, channel, object, received_at}."""
+        payload = self._api_read_json()
+        if payload is None:
+            return
+        complainant = (payload.get("complainant") or "").strip()
+        if not complainant:
+            self._send_json({"error": "complainant obbligatorio"}, 400)
+            return
+        obj = (payload.get("object") or "").strip()
+        channel = payload.get("channel") or "Portale"
+        protocollo = payload.get("protocollo") or ""
+        received_at = payload.get("received_at") or now_iso()
+        try:
+            with connect() as conn:
+                urow = conn.execute("SELECT id FROM users ORDER BY id LIMIT 1").fetchone()
+                actor_id = urow["id"] if urow else None
+                cur = conn.execute(
+                    """INSERT INTO complaints(platform_id, received_at, complainant, channel, object, status, outcome,
+                           owner_user_id, protocollo, classificazione, motivi_danno)
+                       VALUES (1, ?, ?, ?, ?, 'pendente', '', ?, ?, 'Da classificare', ?)""",
+                    (received_at, complainant, channel, obj, actor_id, protocollo, obj))
+                log_audit(conn, 1, actor_id, "complaint", cur.lastrowid, "Reclamo via API (portale)", complainant)
+                conn.commit()
+                new_id = cur.lastrowid
+        except Exception as exc:
+            print("[api_create_complaint] errore:", repr(exc))
+            self._send_json({"error": "errore registrazione reclamo"}, 500)
+            return
+        self._send_json({"id": new_id, "status": "registrato"}, 201)
+
     def do_GET(self):
         parsed = urlparse(self.path)
         path = parsed.path
@@ -5171,6 +5204,9 @@ class App(BaseHTTPRequestHandler):
             return
         if path == "/api/orders":
             self.api_create_order()
+            return
+        if path == "/api/complaints":
+            self.api_create_complaint()
             return
         m_em = re.fullmatch(r"/api/practices/(\d+)/emails", path)
         if m_em:
