@@ -4954,6 +4954,53 @@ class App(BaseHTTPRequestHandler):
             "proponent_name": practice["proponent_name"],
         })
 
+    def api_list_practice_emails(self, practice_id):
+        """API JSON: storico comunicazioni (practice_emails) di una pratica.
+
+        Additivo: il portale proponente (pariter) sincronizza nel proprio thread le
+        comunicazioni ufficiali C1-C9 generate qui. Non tocca il flusso CdA."""
+        expected = os.environ.get("OMNICROWD_API_KEY", "")
+        if expected and self.headers.get("X-Api-Key", "") != expected:
+            self._send_json({"error": "non autorizzato"}, 401)
+            return
+        with connect() as conn:
+            practice = conn.execute("SELECT id FROM practices WHERE id = ?", (practice_id,)).fetchone()
+            if not practice:
+                self._send_json({"error": "pratica non trovata"}, 404)
+                return
+            ems = conn.execute(
+                """SELECT id, step_key, code, recipient, subject, body, sent_at
+                   FROM practice_emails WHERE practice_id = ? ORDER BY id""",
+                (practice_id,)).fetchall()
+        self._send_json({"emails": [{
+            "id": e["id"], "step_key": e["step_key"], "code": e["code"],
+            "recipient": e["recipient"], "subject": e["subject"],
+            "body": e["body"], "sent_at": e["sent_at"],
+        } for e in ems]})
+
+    def api_create_practice_email(self, practice_id):
+        """API JSON: registra una comunicazione inviata dalla piattaforma proponente.
+
+        Body: {code, recipient, subject, body, step_key}. Additivo (practice_emails),
+        non altera lo stato della pratica ne' il flusso CdA."""
+        payload = self._api_read_json()
+        if payload is None:
+            return
+        with connect() as conn:
+            practice = conn.execute("SELECT id FROM practices WHERE id = ?", (practice_id,)).fetchone()
+            if not practice:
+                self._send_json({"error": "pratica non trovata"}, 404)
+                return
+            cur = conn.execute(
+                """INSERT INTO practice_emails(practice_id, step_key, code, recipient, subject, body, sent_at, sent_by)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, NULL)""",
+                (practice_id, (payload.get("step_key") or ""), (payload.get("code") or ""),
+                 (payload.get("recipient") or ""), (payload.get("subject") or ""),
+                 (payload.get("body") or ""), now_iso()))
+            conn.commit()
+            new_id = cur.lastrowid
+        self._send_json({"id": new_id, "status": "registrata"}, 201)
+
     def _api_read_json(self):
         """Legge e valida il body JSON + X-Api-Key opzionale. Ritorna il dict o None
         (avendo gia' inviato la risposta d'errore)."""
@@ -5121,6 +5168,8 @@ class App(BaseHTTPRequestHandler):
             self.page_assistant()
         elif path == "/architecture":
             self.page_architecture()
+        elif re.fullmatch(r"/api/practices/\d+/emails", path):
+            self.api_list_practice_emails(int(path.split("/")[3]))
         elif re.fullmatch(r"/api/practices/\d+", path):
             self.api_get_practice(int(path.rsplit("/", 1)[1]))
         else:
@@ -5138,6 +5187,11 @@ class App(BaseHTTPRequestHandler):
             return
         if path == "/api/orders":
             self.api_create_order()
+            return
+        m_em = re.fullmatch(r"/api/practices/(\d+)/emails", path)
+        if m_em:
+            # JSON dal portale proponente (pariter): comunicazione inviata dalla piattaforma
+            self.api_create_practice_email(int(m_em.group(1)))
             return
         form, files = self.parse_post()
         try:
