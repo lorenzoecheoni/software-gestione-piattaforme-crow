@@ -4217,11 +4217,10 @@ def fascicolo_completezza(conn, practice):
 
     - SEMPRE DOVUTI (presentazione, visura, statuto, informazioni operazione, key manager):
       la loro assenza rende il fascicolo incompleto -> richiesta di integrazione (C3).
-    - CONDIZIONATI "se disponibili" (ultimi due bilanci, piano finanziario storico, sito web):
-      l'assenza per indisponibilita' oggettiva NON e' bloccante ("non disponibile").
-    - BILANCI: bilanci_dovuti = min(2, esercizi_chiusi); completi se presenti >= dovuti.
-      Neo costituita (0 esercizi chiusi) -> 0 dovuti -> completi anche senza bilanci.
-    - fascicolo_completo = tutti i sempre dovuti presenti AND bilanci_completi.
+    - SE DISPONIBILI (ultimi due bilanci, piano finanziario storico, sito web): l'assenza
+      per indisponibilita' oggettiva NON e' bloccante ("non disponibile"); i bilanci sono
+      un documento tra questi, senza alcuna regola sugli esercizi chiusi.
+    - fascicolo_completo = tutti i sempre dovuti presenti.
     """
     pid = practice["id"]
     docs = {d["label"]: d for d in conn.execute(
@@ -4233,27 +4232,12 @@ def fascicolo_completezza(conn, practice):
 
     sempre = [{"label": l, "present": present(l)} for l in DOCS_SEMPRE_DOVUTI]
     missing_sempre = [s["label"] for s in sempre if not s["present"]]
+    cond = [{"label": l, "present": present(l)} for l in DOCS_SE_DISPONIBILI]
 
-    keys = practice.keys()
-    esercizi = practice["esercizi_chiusi"] if "esercizi_chiusi" in keys else None
-    bil_pres = (practice["bilanci_presenti"] if "bilanci_presenti" in keys else 0) or 0
-    bil_dovuti = min(2, esercizi) if esercizi is not None else None
-    bilanci_completi = (bil_dovuti is not None) and (bil_pres >= bil_dovuti)
-
-    cond = [{"label": l, "present": present(l)}
-            for l in ("Piano finanziario storico + proiezioni a 3 anni", "Sito web")]
-
-    fascicolo_completo = (not missing_sempre) and bilanci_completi
+    fascicolo_completo = not missing_sempre
     integrazione = list(missing_sempre)
-    if bil_dovuti is not None and bil_pres < bil_dovuti:
-        manca = bil_dovuti - bil_pres
-        integrazione.append(
-            f"Ultimi {bil_dovuti} bilanci depositati (manca{'no' if manca != 1 else ''} {manca} di {bil_dovuti})")
     return {
         "sempre": sempre, "missing_sempre": missing_sempre, "condizionati": cond,
-        "esercizi": esercizi, "esercizi_set": esercizi is not None,
-        "bilanci_dovuti": bil_dovuti, "bilanci_presenti": bil_pres,
-        "bilanci_completi": bilanci_completi,
         "fascicolo_completo": fascicolo_completo, "integrazione": integrazione,
     }
 
@@ -6726,12 +6710,12 @@ document.querySelectorAll('[data-campaign-form]').forEach((form) => {
                   "investitore": "", "consob": ""}
         body = fill(t["body"])
         if code == "C3":
-            # precompila l'elenco con la completezza del fascicolo (sempre dovuti + regola bilanci)
+            # precompila l'elenco con la completezza del fascicolo (documenti sempre dovuti mancanti)
             # piu' i documenti di onorabilita' (autodichiarazioni/casellari) ancora mancanti.
             items = []
             with connect() as conn:
                 comp = fascicolo_completezza(conn, practice)
-                items.extend(comp["integrazione"])  # sempre dovuti mancanti + "Bilanci depositati: X su Y dovuti"
+                items.extend(comp["integrazione"])  # solo i documenti sempre dovuti mancanti
                 ob = onorabilita_status(conn, practice["id"])
             if ob["configured"]:
                 for s in ob["subjects"]:
@@ -7146,9 +7130,7 @@ document.querySelectorAll('[data-campaign-form]').forEach((form) => {
 </section>"""
 
     def render_completezza_panel(self, ctx, practice):
-        """Completezza del fascicolo in Fase 2: sempre dovuti vs 'se disponibili' + regola bilanci."""
-        pid = practice["id"]
-        locked = bool(practice["closed_at"])
+        """Completezza del fascicolo in Fase 2: sempre dovuti vs 'se disponibili'."""
         with connect() as conn:
             comp = fascicolo_completezza(conn, practice)
 
@@ -7158,57 +7140,22 @@ document.querySelectorAll('[data-campaign-form]').forEach((form) => {
             return f'<tr><td>{esc(label)}</td><td>{b}</td></tr>'
 
         sempre_rows = "".join(line(s["label"], s["present"]) for s in comp["sempre"])
-        # condizionati non-bilanci: assenza = "non disponibile", mai bloccante
+        # "se disponibili" (bilanci inclusi): assenza = "non disponibile", mai bloccante
         cond_rows = "".join(
             line(c["label"], c["present"], absent_txt="Non disponibile", absent_cls="neutral")
             for c in comp["condizionati"])
-
-        # blocco bilanci: si chiedono gli ultimi due bilanci, ma solo per gli esercizi gia' chiusi e depositati
-        if comp["esercizi_set"]:
-            dov = comp["bilanci_dovuti"]
-            pres = comp["bilanci_presenti"]
-            if dov == 0:
-                bil_badge = '<span class="badge success">Nessun bilancio richiesto</span>'
-                bil_state = ('<p><strong>Bilanci richiesti: 0.</strong> La societa\' non ha ancora esercizi chiusi e depositati '
-                             '(neo costituita): nessun bilancio dovuto.</p>')
-            else:
-                manca = max(0, dov - pres)
-                if comp["bilanci_completi"]:
-                    bil_badge = '<span class="badge success">Completo</span>'
-                    stato_txt = "tutti presenti."
-                else:
-                    bil_badge = f'<span class="badge danger">Manca{"no" if manca != 1 else ""} {manca}</span>'
-                    stato_txt = f"ne manca{'no' if manca != 1 else ''} {manca}."
-                quanti = f"ultimi {dov} esercizi chiusi e depositati" if dov > 1 else "ultimo esercizio chiuso e depositato"
-                bil_state = (f'<p><strong>Bilanci richiesti: {dov}</strong> ({quanti}, su {comp["esercizi"]} totali). '
-                             f'Presenti: <strong>{pres}</strong> &mdash; {stato_txt} {bil_badge}</p>')
-        else:
-            bil_badge = ""
-            bil_state = ('<p><span class="badge warning">Da indicare</span> Inserisci quanti esercizi sono gia\' chiusi e depositati '
-                         'e quanti bilanci sono stati prodotti: si richiedono gli ultimi due bilanci (meno se la societa\' e\' piu\' giovane).</p>')
-
-        bil_form = ""
-        if not locked:
-            bil_form = (f'<form method="post" action="/pariter/practices/{pid}/completezza" class="inline-form" style="margin-top:8px">'
-                        f'{hidden_ctx(ctx)}<input type="hidden" name="back_fase" value="fase2">'
-                        f'<label>Esercizi chiusi e depositati '
-                        f'<input type="number" min="0" max="50" name="esercizi_chiusi" value="{comp["esercizi"] if comp["esercizi_set"] else ""}" style="width:80px"></label> '
-                        f'<label>Bilanci presenti '
-                        f'<input type="number" min="0" max="2" name="bilanci_presenti" value="{comp["bilanci_presenti"]}" style="width:80px"></label> '
-                        f'<button class="button tiny" type="submit">Salva</button></form>')
 
         if comp["fascicolo_completo"]:
             head_badge = '<span class="badge success">Fascicolo completo &mdash; procedibile</span>'
         else:
             head_badge = '<span class="badge danger">Fascicolo incompleto</span>'
 
-        integr = ""
         if comp["integrazione"]:
             lis = "".join(f"<li>{esc(x)}</li>" for x in comp["integrazione"])
-            integr = (f'<p class="muted">Integrazione (C3) dovuta solo per i <strong>sempre dovuti</strong> mancanti e per i bilanci dovuti:</p>'
+            integr = (f'<p class="muted">Integrazione (C3) dovuta solo per i <strong>sempre dovuti</strong> mancanti:</p>'
                       f'<ul class="clean-list">{lis}</ul>')
         else:
-            integr = '<p class="muted">Nessuna integrazione necessaria: i documenti sempre dovuti sono presenti e la regola bilanci e\' soddisfatta. I documenti "se disponibili" assenti non sono bloccanti.</p>'
+            integr = '<p class="muted">Nessuna integrazione necessaria: i documenti sempre dovuti sono presenti. I documenti "se disponibili" assenti (bilanci inclusi) non sono bloccanti.</p>'
 
         return f"""
 <section class="panel">
@@ -7216,9 +7163,6 @@ document.querySelectorAll('[data-campaign-form]').forEach((form) => {
   <p class="muted">Distingue i documenti <strong>sempre dovuti</strong> (la cui assenza richiede integrazione) dai documenti <strong>"se disponibili"</strong> (la cui assenza per indisponibilita' oggettiva non e' bloccante). Una neo costituita priva di bilanci, piano storico e sito risulta comunque completa.</p>
   <h3>Documenti sempre dovuti</h3>
   <table class="data-table compact"><thead><tr><th>Documento</th><th>Stato</th></tr></thead><tbody>{sempre_rows}</tbody></table>
-  <h3>Bilanci (regola sugli esercizi chiusi)</h3>
-  {bil_state}
-  {bil_form}
   <h3>Documenti "se disponibili" (non bloccanti)</h3>
   <table class="data-table compact"><thead><tr><th>Documento</th><th>Stato</th></tr></thead><tbody>{cond_rows}</tbody></table>
   {integr}
@@ -7230,12 +7174,8 @@ document.querySelectorAll('[data-campaign-form]').forEach((form) => {
         reasons = []
         with connect() as conn:
             comp = fascicolo_completezza(conn, practice)
-        if not comp["esercizi_set"]:
-            reasons.append("indicare il numero di esercizi chiusi e depositati (regola bilanci)")
         if comp["missing_sempre"]:
             reasons.append(f"{len(comp['missing_sempre'])} documenti sempre dovuti mancanti")
-        if comp["esercizi_set"] and not comp["bilanci_completi"]:
-            reasons.append(f"bilanci depositati: {comp['bilanci_presenti']} su {comp['bilanci_dovuti']} dovuti")
         # altri documenti obbligatori di Fase 2 (es. KYC), distinti dai sempre dovuti di Fase 1
         missing_f2 = rows(
             """SELECT label FROM practice_documents WHERE practice_id = ? AND required = 1
