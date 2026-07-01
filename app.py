@@ -4985,6 +4985,47 @@ class App(BaseHTTPRequestHandler):
             new_id = cur.lastrowid
         self._send_json({"id": new_id, "status": "registrata"}, 201)
 
+    def api_create_practice_decision(self, practice_id):
+        """API JSON: recepisce una decisione d'istruttoria sincronizzata dalla piattaforma
+        proponente (pariter). Body: {status|decision, note}. ADDITIVO: aggiorna solo
+        practices.status via set_practice_status (che scrive practices.status +
+        practice_status_history + audit). NON tocca il flusso CdA/CVOI/Advisory."""
+        payload = self._api_read_json()
+        if payload is None:
+            return
+        to_status = (payload.get("status") or payload.get("decision") or "").strip()
+        if not to_status:
+            self._send_json({"error": "status mancante"}, 400)
+            return
+        with connect() as conn:
+            practice = conn.execute("SELECT * FROM practices WHERE id = ?", (practice_id,)).fetchone()
+            if not practice:
+                self._send_json({"error": "pratica non trovata"}, 404)
+                return
+            urow = conn.execute("SELECT id FROM users ORDER BY id LIMIT 1").fetchone()
+            actor_id = urow["id"] if urow else None
+            prev = practice["status"]
+            # ADDITIVO: solo practices.status + practice_status_history; NON tocca CdA/CVOI/Advisory
+            set_practice_status(conn, practice, to_status, actor_id,
+                                notes=(payload.get("note") or "Decisione sincronizzata da Pariter"))
+            conn.commit()
+        self._send_json({"id": practice_id, "status_prima": prev, "status": to_status}, 200)
+
+    def api_get_practice_decision(self, practice_id):
+        """API JSON (sola lettura): stato e esito delibera di una pratica.
+        Replica il check X-Api-Key di _api_read_json. Additivo, non modifica nulla."""
+        expected = os.environ.get("OMNICROWD_API_KEY", "")
+        if expected and self.headers.get("X-Api-Key", "") != expected:
+            self._send_json({"error": "non autorizzato"}, 401)
+            return
+        with connect() as conn:
+            practice = conn.execute("SELECT * FROM practices WHERE id = ?", (practice_id,)).fetchone()
+            if not practice:
+                self._send_json({"error": "pratica non trovata"}, 404)
+                return
+            outcome = board_decision_outcome(conn, practice_id, 1)  # sola lettura
+        self._send_json({"id": practice_id, "status": practice["status"], "decision_outcome": outcome or ""}, 200)
+
     def _api_read_json(self):
         """Legge e valida il body JSON + X-Api-Key opzionale. Ritorna il dict o None
         (avendo gia' inviato la risposta d'errore)."""
@@ -5187,6 +5228,8 @@ class App(BaseHTTPRequestHandler):
             self.page_architecture()
         elif re.fullmatch(r"/api/practices/\d+/emails", path):
             self.api_list_practice_emails(int(path.split("/")[3]))
+        elif re.fullmatch(r"/api/practices/\d+/decision", path):
+            self.api_get_practice_decision(int(path.split("/")[3]))
         elif re.fullmatch(r"/api/practices/\d+", path):
             self.api_get_practice(int(path.rsplit("/", 1)[1]))
         else:
@@ -5207,6 +5250,12 @@ class App(BaseHTTPRequestHandler):
             return
         if path == "/api/complaints":
             self.api_create_complaint()
+            return
+        m_dec = re.fullmatch(r"/api/practices/(\d+)/decision", path)
+        if m_dec:
+            # JSON dal portale proponente (pariter): decisione d'istruttoria sincronizzata.
+            # ADDITIVO: scrive solo practices.status via set_practice_status; NON tocca il CdA.
+            self.api_create_practice_decision(int(m_dec.group(1)))
             return
         m_em = re.fullmatch(r"/api/practices/(\d+)/emails", path)
         if m_em:
